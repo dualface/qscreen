@@ -486,28 +486,22 @@ async fn handle_attach<R, W>(
         return;
     }
 
-    let frame_payload = match serde_json::to_vec(&screen_frame) {
-        Ok(payload) => payload,
+    let frame_event = Message {
+        kind: MessageKind::Event,
+        event: Some(EventType::Frame),
+        session_id: session_id.clone(),
+        frame: Some(screen_frame),
+        ..Default::default()
+    };
+    let frame_bytes = match frame_event.to_json_line() {
+        Ok(bytes) => bytes,
         Err(e) => {
             tracing::warn!(session_id = %session_id, error = %e, "serialize screen frame failed");
             sess.detach(client_id);
             return;
         }
     };
-    let frame_event = Message {
-        kind: MessageKind::Event,
-        event: Some(EventType::Frame),
-        session_id: session_id.clone(),
-        payload: frame_payload,
-        ..Default::default()
-    };
-    if writer
-        .lock()
-        .await
-        .write_all(&frame_event.to_json_line().unwrap_or_default())
-        .await
-        .is_err()
-    {
+    if writer.lock().await.write_all(&frame_bytes).await.is_err() {
         sess.detach(client_id);
         return;
     }
@@ -521,11 +515,11 @@ async fn handle_attach<R, W>(
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 let msg = match event {
-                    SessionEvent::Output(data) => Message {
+                    SessionEvent::Frame(frame) => Message {
                         kind: MessageKind::Event,
-                        event: Some(EventType::Output),
+                        event: Some(EventType::Frame),
                         session_id: session_id_c.clone(),
-                        payload: data.to_vec(),
+                        frame: Some(frame),
                         ..Default::default()
                     },
                     SessionEvent::Exit(code) => Message {
@@ -536,7 +530,13 @@ async fn handle_attach<R, W>(
                         ..Default::default()
                     },
                 };
-                let bytes = msg.to_json_line().unwrap_or_default();
+                let bytes = match msg.to_json_line() {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        tracing::warn!(session_id = %session_id_c, error = %e, "serialize attach event failed");
+                        break;
+                    }
+                };
                 if writer_c.lock().await.write_all(&bytes).await.is_err() {
                     break;
                 }
@@ -711,7 +711,7 @@ mod tests {
     fn recv_exit(rx: &mut mpsc::UnboundedReceiver<SessionEvent>) -> i32 {
         for _ in 0..16 {
             match rx.try_recv().expect("expected session event") {
-                SessionEvent::Output(_) => {}
+                SessionEvent::Frame(_) => {}
                 SessionEvent::Exit(code) => return code,
             }
         }
@@ -1004,6 +1004,8 @@ mod tests {
         let screen_event = Message::from_json(&line).unwrap();
         assert_eq!(screen_event.kind, MessageKind::Event);
         assert_eq!(screen_event.event, Some(EventType::Frame));
+        assert!(screen_event.frame.is_some());
+        assert!(screen_event.payload.is_empty());
 
         line.clear();
         let resize = Message {

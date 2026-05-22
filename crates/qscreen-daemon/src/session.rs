@@ -1,15 +1,17 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use qscreen_protocol::{
-    FRAME_FLAG_BOLD, FRAME_FLAG_INVERSE, FRAME_FLAG_ITALIC, FRAME_FLAG_UNDERLINE, FrameColor,
-    ScreenFrame, ScreenRun,
+    FRAME_FLAG_BLINK, FRAME_FLAG_BOLD, FRAME_FLAG_DIM, FRAME_FLAG_HIDDEN, FRAME_FLAG_INVERSE,
+    FRAME_FLAG_ITALIC, FRAME_FLAG_STRIKETHROUGH, FRAME_FLAG_UNDERLINE, FrameColor, ScreenFrame,
+    ScreenRun,
 };
 use tokio::sync::mpsc;
 
@@ -25,10 +27,9 @@ const COLOR_TERM_TRUECOLOR: &str = "truecolor";
 
 pub type ClientId = u64;
 
-/// PTY 输出事件，通过 attached_clients 发给当前 attach 的客户端
 #[derive(Debug)]
 pub enum SessionEvent {
-    Output(Bytes),
+    Frame(ScreenFrame),
     Exit(i32),
 }
 
@@ -158,31 +159,17 @@ impl Session {
             next_client_id,
         });
 
-        // PTY output 读取任务（阻塞 IO，放在 spawn_blocking）
+        // PTY output 读取任务：先 coalesce，再原子更新 parser，避免 reattach 捕获半帧。
         {
-            let scrollback_r = scrollback.clone();
-            let screen_r = screen.clone();
-            let attached_r = attached_clients.clone();
-            let active_client_r = active_client_id.clone();
-            let exited_r = exited.clone();
-            let name_r = name.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut reader = pty_reader;
-                let mut buf = vec![0u8; 32 * 1024];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            let data = Bytes::copy_from_slice(&buf[..n]);
-                            scrollback_r.lock().unwrap().append(&data);
-                            screen_r.lock().unwrap().process(&data);
-                            broadcast_output(&attached_r, &active_client_r, data);
-                        }
-                    }
-                }
-                tracing::debug!(session = %name_r, "pty reader ended");
-                exited_r.store(true, Ordering::SeqCst);
-            });
+            spawn_coalesced_reader(
+                pty_reader,
+                scrollback.clone(),
+                screen.clone(),
+                attached_clients.clone(),
+                active_client_id.clone(),
+                exited.clone(),
+                name.clone(),
+            );
         }
 
         // 子进程退出等待任务
@@ -253,7 +240,11 @@ impl Session {
         drop(guard);
         *self.width.lock().unwrap() = width;
         *self.height.lock().unwrap() = height;
-        self.screen.lock().unwrap().set_size(height, width);
+        self.screen
+            .lock()
+            .unwrap()
+            .screen_mut()
+            .set_size(height, width);
         Ok(())
     }
 
@@ -322,55 +313,7 @@ impl Session {
 
     fn screen_frame(&self) -> ScreenFrame {
         let parser = self.screen.lock().unwrap();
-        let screen = parser.screen();
-        let (rows, cols) = screen.size();
-        let (cursor_row, cursor_col) = screen.cursor_position();
-        let mut rows_v2 = Vec::with_capacity(rows as usize);
-
-        for row in 0..rows {
-            let mut runs = Vec::new();
-            let mut current: Option<ScreenRun> = None;
-
-            for col in 0..cols {
-                let Some(cell) = screen.cell(row, col) else {
-                    push_cell_run(
-                        &mut runs,
-                        &mut current,
-                        " ".to_string(),
-                        1,
-                        default_run_attrs(),
-                    );
-                    continue;
-                };
-                if cell.is_wide_continuation() {
-                    continue;
-                }
-
-                let text = if cell.has_contents() {
-                    cell.contents()
-                } else {
-                    " ".to_string()
-                };
-                let width = if cell.is_wide() { 2 } else { 1 };
-                let attrs = cell_run_attrs(cell);
-                push_cell_run(&mut runs, &mut current, text, width, attrs);
-            }
-
-            if let Some(run) = current.take() {
-                runs.push(run);
-            }
-            rows_v2.push(runs);
-        }
-
-        ScreenFrame {
-            rows,
-            cols,
-            cursor_row,
-            cursor_col,
-            hide_cursor: screen.hide_cursor(),
-            alternate_screen: screen.alternate_screen(),
-            rows_v2,
-        }
+        screen_frame_from_parser(&parser)
     }
 
     pub fn focus_client(&self, client_id: ClientId) -> anyhow::Result<()> {
@@ -463,12 +406,67 @@ fn push_cell_run(
     }
 }
 
+fn screen_frame_from_parser(parser: &vt100::Parser) -> ScreenFrame {
+    let screen = parser.screen();
+    let (rows, cols) = screen.size();
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    let mut rows_v2 = Vec::with_capacity(rows as usize);
+
+    for row in 0..rows {
+        let mut runs = Vec::new();
+        let mut current: Option<ScreenRun> = None;
+
+        for col in 0..cols {
+            let Some(cell) = screen.cell(row, col) else {
+                push_cell_run(
+                    &mut runs,
+                    &mut current,
+                    " ".to_string(),
+                    1,
+                    default_run_attrs(),
+                );
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+
+            let text = if cell.has_contents() {
+                cell.contents().to_string()
+            } else {
+                " ".to_string()
+            };
+            let width = if cell.is_wide() { 2 } else { 1 };
+            let attrs = cell_run_attrs(cell);
+            push_cell_run(&mut runs, &mut current, text, width, attrs);
+        }
+
+        if let Some(run) = current.take() {
+            runs.push(run);
+        }
+        rows_v2.push(runs);
+    }
+
+    ScreenFrame {
+        rows,
+        cols,
+        cursor_row,
+        cursor_col,
+        hide_cursor: screen.hide_cursor(),
+        alternate_screen: screen.alternate_screen() || last_row_has_content(screen, rows, cols),
+        rows_v2,
+    }
+}
+
 fn default_run_attrs() -> (FrameColor, FrameColor, u8) {
     (FrameColor::Default, FrameColor::Default, 0)
 }
 
 fn cell_run_attrs(cell: &vt100::Cell) -> (FrameColor, FrameColor, u8) {
     let mut flags = 0;
+    if cell.dim() {
+        flags |= FRAME_FLAG_DIM;
+    }
     if cell.bold() {
         flags |= FRAME_FLAG_BOLD;
     }
@@ -480,6 +478,15 @@ fn cell_run_attrs(cell: &vt100::Cell) -> (FrameColor, FrameColor, u8) {
     }
     if cell.inverse() {
         flags |= FRAME_FLAG_INVERSE;
+    }
+    if cell.blink() {
+        flags |= FRAME_FLAG_BLINK;
+    }
+    if cell.hidden() {
+        flags |= FRAME_FLAG_HIDDEN;
+    }
+    if cell.strikethrough() {
+        flags |= FRAME_FLAG_STRIKETHROUGH;
     }
     (
         frame_color(cell.fgcolor()),
@@ -496,10 +503,121 @@ fn frame_color(color: vt100::Color) -> FrameColor {
     }
 }
 
-fn broadcast_output(
+fn last_row_has_content(screen: &vt100::Screen, rows: u16, cols: u16) -> bool {
+    let row = rows.saturating_sub(1);
+    for col in 0..cols {
+        if let Some(cell) = screen.cell(row, col) {
+            let text = cell.contents();
+            if !text.is_empty() && text != " " {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn spawn_coalesced_reader(
+    mut reader: Box<dyn Read + Send>,
+    scrollback: Arc<Mutex<ScrollbackBuf>>,
+    screen: Arc<Mutex<vt100::Parser>>,
+    attached_clients: Arc<Mutex<HashMap<ClientId, AttachedClient>>>,
+    active_client_id: Arc<Mutex<Option<ClientId>>>,
+    exited: Arc<AtomicBool>,
+    name: String,
+) {
+    const COALESCE_TICK_MS: u64 = 1;
+    const COALESCE_MAX_MS: u128 = 8;
+
+    let staging = Arc::new((
+        Mutex::new(Vec::<u8>::with_capacity(128 * 1024)),
+        Condvar::new(),
+    ));
+    let reader_done = Arc::new(AtomicBool::new(false));
+
+    {
+        let staging_r = staging.clone();
+        let reader_done_r = reader_done.clone();
+        thread::spawn(move || {
+            let mut local = vec![0u8; 64 * 1024];
+            loop {
+                match reader.read(&mut local) {
+                    Ok(n) if n > 0 => {
+                        let (lock, cv) = &*staging_r;
+                        if let Ok(mut buf) = lock.lock() {
+                            buf.extend_from_slice(&local[..n]);
+                            cv.notify_one();
+                        }
+                    }
+                    Ok(_) | Err(_) => break,
+                }
+            }
+            reader_done_r.store(true, Ordering::Release);
+            let (_, cv) = &*staging_r;
+            cv.notify_all();
+        });
+    }
+
+    thread::spawn(move || {
+        loop {
+            {
+                let (lock, cv) = &*staging;
+                let mut buf = match lock.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => break,
+                };
+                while buf.is_empty() {
+                    if reader_done.load(Ordering::Acquire) {
+                        tracing::debug!(session = %name, "pty reader ended");
+                        exited.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    match cv.wait_timeout(buf, Duration::from_millis(100)) {
+                        Ok((guard, _)) => buf = guard,
+                        Err(_) => return,
+                    }
+                }
+            }
+
+            let start = Instant::now();
+            let mut last_len = staging.0.lock().map(|buf| buf.len()).unwrap_or(0);
+            loop {
+                if start.elapsed().as_millis() >= COALESCE_MAX_MS {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(COALESCE_TICK_MS));
+                let current_len = staging.0.lock().map(|buf| buf.len()).unwrap_or(0);
+                if current_len == last_len {
+                    break;
+                }
+                last_len = current_len;
+            }
+
+            let bytes = match staging.0.lock() {
+                Ok(mut buf) => std::mem::take(&mut *buf),
+                Err(_) => break,
+            };
+            if bytes.is_empty() {
+                continue;
+            }
+
+            scrollback.lock().unwrap().append(&bytes);
+            let frame = {
+                let mut parser = screen.lock().unwrap();
+                parser.process(&bytes);
+                screen_frame_from_parser(&parser)
+            };
+            broadcast_frame(&attached_clients, &active_client_id, frame);
+        }
+
+        tracing::debug!(session = %name, "pty parser ended");
+        exited.store(true, Ordering::SeqCst);
+    });
+}
+
+fn broadcast_frame(
     attached_clients: &Arc<Mutex<HashMap<ClientId, AttachedClient>>>,
     active_client_id: &Arc<Mutex<Option<ClientId>>>,
-    data: Bytes,
+    frame: ScreenFrame,
 ) {
     let failed_clients = {
         let attached = attached_clients.lock().unwrap();
@@ -508,7 +626,7 @@ fn broadcast_output(
             .filter_map(|(client_id, client)| {
                 client
                     .tx
-                    .send(SessionEvent::Output(data.clone()))
+                    .send(SessionEvent::Frame(frame.clone()))
                     .err()
                     .map(|_| *client_id)
             })
@@ -632,21 +750,29 @@ mod tests {
         );
     }
 
-    fn recv_output_matching(rx: &mut mpsc::UnboundedReceiver<SessionEvent>, expected: &[u8]) {
+    fn recv_frame_matching(rx: &mut mpsc::UnboundedReceiver<SessionEvent>, expected: &str) {
         for _ in 0..16 {
             match rx.try_recv().expect("expected session event") {
-                SessionEvent::Output(data) if data == expected => return,
-                SessionEvent::Output(_) => {}
-                SessionEvent::Exit(code) => panic!("expected output, got exit {code}"),
+                SessionEvent::Frame(frame)
+                    if frame
+                        .rows_v2
+                        .iter()
+                        .flat_map(|row| row.iter())
+                        .any(|run| run.text.contains(expected)) =>
+                {
+                    return;
+                }
+                SessionEvent::Frame(_) => {}
+                SessionEvent::Exit(code) => panic!("expected frame, got exit {code}"),
             }
         }
-        panic!("expected matching output");
+        panic!("expected matching frame");
     }
 
     fn recv_exit(rx: &mut mpsc::UnboundedReceiver<SessionEvent>) -> i32 {
         for _ in 0..16 {
             match rx.try_recv().expect("expected session event") {
-                SessionEvent::Output(_) => {}
+                SessionEvent::Frame(_) => {}
                 SessionEvent::Exit(code) => return code,
             }
         }
@@ -685,7 +811,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broadcast_output_reaches_all_clients_and_removes_only_failed_senders() {
+    async fn broadcast_frame_reaches_all_clients_and_removes_only_failed_senders() {
         let session =
             Session::new("1".to_string(), "multi-broadcast".to_string(), 80, 24, None).unwrap();
         let (tx1, mut rx1) = mpsc::unbounded_channel();
@@ -697,14 +823,22 @@ mod tests {
         let (client3, _) = session.attach(tx3, 80, 24).unwrap();
         drop(rx2);
 
-        broadcast_output(
-            &session.attached_clients,
-            &session.active_client_id,
-            Bytes::from_static(b"chunk"),
-        );
+        let frame = ScreenFrame {
+            rows: 1,
+            cols: 5,
+            rows_v2: vec![vec![ScreenRun {
+                text: "chunk".to_string(),
+                fg: FrameColor::Default,
+                bg: FrameColor::Default,
+                flags: 0,
+                width: 5,
+            }]],
+            ..Default::default()
+        };
+        broadcast_frame(&session.attached_clients, &session.active_client_id, frame);
 
-        recv_output_matching(&mut rx1, b"chunk");
-        recv_output_matching(&mut rx3, b"chunk");
+        recv_frame_matching(&mut rx1, "chunk");
+        recv_frame_matching(&mut rx3, "chunk");
         let attached = session.attached_clients.lock().unwrap();
         assert!(attached.contains_key(&client1));
         assert!(!attached.contains_key(&failed_client));

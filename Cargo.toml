@@ -4,6 +4,7 @@ members = [
     "crates/qscreen-shared",
     "crates/qscreen-daemon",
     "crates/qscreen-client",
+    "crates/vt100-psmux",
 ]
 resolver = "2"
 
@@ -24,7 +25,7 @@ portable-pty = "0.8"
 crossterm = "0.28"
 anyhow = "1"
 bytes = "1"
-vt100 = "0.15"
+vt100 = { path = "crates/vt100-psmux", package = "vt100-psmux" }
 unicode-width = "0.2"
 qscreen-protocol = { path = "crates/qscreen-protocol" }
 qscreen-shared = { path = "crates/qscreen-shared" }

@@ -1,8 +1,8 @@
 use std::io::Write;
 
 use qscreen_protocol::{
-    FRAME_FLAG_BOLD, FRAME_FLAG_INVERSE, FRAME_FLAG_ITALIC, FRAME_FLAG_UNDERLINE, FrameColor,
-    ScreenFrame,
+    FRAME_FLAG_BLINK, FRAME_FLAG_BOLD, FRAME_FLAG_DIM, FRAME_FLAG_HIDDEN, FRAME_FLAG_INVERSE,
+    FRAME_FLAG_ITALIC, FRAME_FLAG_STRIKETHROUGH, FRAME_FLAG_UNDERLINE, FrameColor, ScreenFrame,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -35,8 +35,13 @@ pub fn render_screen_frame<W: Write>(out: &mut W, frame: &ScreenFrame) -> std::i
         let mut col: u16 = 0;
         for run in row {
             write_run_attrs(out, run.flags, run.fg, run.bg)?;
-            out.write_all(run.text.as_bytes())?;
-            let text_width = text_cell_width(&run.text);
+            let text = if run.flags & FRAME_FLAG_HIDDEN != 0 {
+                " "
+            } else {
+                run.text.as_str()
+            };
+            out.write_all(text.as_bytes())?;
+            let text_width = text_cell_width(text);
             if run.width > text_width {
                 write_spaces(out, run.width - text_width)?;
             }
@@ -72,6 +77,9 @@ fn write_run_attrs<W: Write>(
     bg: FrameColor,
 ) -> std::io::Result<()> {
     let mut params = vec!["0".to_string()];
+    if flags & FRAME_FLAG_DIM != 0 {
+        params.push("2".to_string());
+    }
     if flags & FRAME_FLAG_BOLD != 0 {
         params.push("1".to_string());
     }
@@ -83,6 +91,12 @@ fn write_run_attrs<W: Write>(
     }
     if flags & FRAME_FLAG_INVERSE != 0 {
         params.push("7".to_string());
+    }
+    if flags & FRAME_FLAG_BLINK != 0 {
+        params.push("5".to_string());
+    }
+    if flags & FRAME_FLAG_STRIKETHROUGH != 0 {
+        params.push("9".to_string());
     }
     push_color_params(&mut params, true, fg);
     push_color_params(&mut params, false, bg);

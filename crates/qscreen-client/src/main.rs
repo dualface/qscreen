@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::Context;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use qscreen_protocol::{
-    Command, EventType, Message, MessageKind, ScreenFrame, SessionInfo, exited_session_error,
+    Command, EventType, Message, MessageKind, SessionInfo, exited_session_error,
     validate_session_id, validate_session_name,
 };
 use qscreen_shared::{daemon_log_path, pipe_name};
@@ -911,7 +911,7 @@ async fn run_attach_loop(
                             let _ = stdout.flush();
                         }
                         Some(EventType::Frame) => {
-                            if let Ok(frame) = serde_json::from_slice::<ScreenFrame>(&msg.payload) {
+                            if let Some(frame) = msg.frame.as_ref() {
                                 let _ = term::render_screen_frame(&mut stdout, &frame);
                             }
                         }

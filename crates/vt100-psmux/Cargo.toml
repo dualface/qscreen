@@ -1,0 +1,17 @@
+[package]
+name = "vt100-psmux"
+version = "0.16.6"
+edition = "2021"
+rust-version = "1.70"
+authors = ["Jesse Luehrs <doy@tozt.net>"]
+description = "Library for parsing terminal data (psmux fork with extra SGR attrs)"
+license = "MIT"
+
+[lib]
+name = "vt100_psmux"
+path = "src/lib.rs"
+
+[dependencies]
+itoa = "1"
+unicode-width = { workspace = true }
+vte = "0.15"

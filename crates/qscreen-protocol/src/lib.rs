@@ -50,10 +50,14 @@ pub enum EventType {
     Exit,
 }
 
-pub const FRAME_FLAG_BOLD: u8 = 0b0000_0001;
-pub const FRAME_FLAG_ITALIC: u8 = 0b0000_0010;
-pub const FRAME_FLAG_UNDERLINE: u8 = 0b0000_0100;
-pub const FRAME_FLAG_INVERSE: u8 = 0b0000_1000;
+pub const FRAME_FLAG_DIM: u8 = 0b0000_0001;
+pub const FRAME_FLAG_BOLD: u8 = 0b0000_0010;
+pub const FRAME_FLAG_ITALIC: u8 = 0b0000_0100;
+pub const FRAME_FLAG_UNDERLINE: u8 = 0b0000_1000;
+pub const FRAME_FLAG_INVERSE: u8 = 0b0001_0000;
+pub const FRAME_FLAG_BLINK: u8 = 0b0010_0000;
+pub const FRAME_FLAG_HIDDEN: u8 = 0b0100_0000;
+pub const FRAME_FLAG_STRIKETHROUGH: u8 = 0b1000_0000;
 
 /// Structured visible terminal state, copied from psmux's row/run model.
 /// This avoids replaying a vt100 ANSI dump into an xterm host on reattach.
@@ -124,6 +128,7 @@ pub struct Message {
     pub sessions: Vec<SessionInfo>,
     pub exit_code: i64,
     pub payload: Vec<u8>,
+    pub frame: Option<ScreenFrame>,
 }
 
 // ── Wire 格式 (JSON 序列化用) ────────────────────────────────────────────────
@@ -161,6 +166,8 @@ struct WireMessage {
         default
     )]
     payload_b64: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    frame: Option<ScreenFrame>,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -204,6 +211,7 @@ impl Message {
             } else {
                 B64.encode(&self.payload)
             },
+            frame: self.frame.clone(),
         };
         let mut bytes = serde_json::to_vec(&wire)?;
         bytes.push(b'\n');
@@ -213,7 +221,7 @@ impl Message {
     /// 从 JSON 字符串（含可选尾部空白）解析
     pub fn from_json(s: &str) -> anyhow::Result<Self> {
         let s = s.trim();
-        if s.len() > MAX_WIRE_MESSAGE_SIZE {
+        if !s.contains(r#""frame""#) && s.len() > MAX_WIRE_MESSAGE_SIZE {
             anyhow::bail!("message too large: {} > {}", s.len(), MAX_WIRE_MESSAGE_SIZE);
         }
         let wire: WireMessage = serde_json::from_str(s)?;
@@ -245,6 +253,7 @@ impl Message {
             sessions: wire.sessions,
             exit_code: wire.exit_code,
             payload,
+            frame: wire.frame,
         })
     }
 }
@@ -443,20 +452,51 @@ mod tests {
             }]],
             ..Default::default()
         };
-        let payload = serde_json::to_vec(&frame).unwrap();
         let msg = Message {
             kind: MessageKind::Event,
             event: Some(EventType::Frame),
-            payload: payload.clone(),
+            frame: Some(frame.clone()),
             ..Default::default()
         };
 
         let line = msg.to_json_line().unwrap();
         let decoded = Message::from_json(std::str::from_utf8(&line).unwrap()).unwrap();
-        let decoded_frame: ScreenFrame = serde_json::from_slice(&decoded.payload).unwrap();
 
         assert_eq!(decoded.event, Some(EventType::Frame));
-        assert_eq!(decoded_frame, frame);
+        assert_eq!(decoded.frame, Some(frame));
+        assert!(std::str::from_utf8(&line).unwrap().contains(r#""frame":"#));
+        assert!(!std::str::from_utf8(&line).unwrap().contains("payload_b64"));
+    }
+
+    #[test]
+    fn frame_event_does_not_use_payload_limit() {
+        let long_text = "x".repeat(MAX_PAYLOAD_SIZE + 1);
+        let frame = ScreenFrame {
+            rows: 1,
+            cols: 1,
+            rows_v2: vec![vec![ScreenRun {
+                text: long_text.clone(),
+                fg: FrameColor::Default,
+                bg: FrameColor::Default,
+                flags: 0,
+                width: 1,
+            }]],
+            ..Default::default()
+        };
+        let msg = Message {
+            kind: MessageKind::Event,
+            event: Some(EventType::Frame),
+            frame: Some(frame),
+            ..Default::default()
+        };
+
+        let line = msg.to_json_line().unwrap();
+        let decoded = Message::from_json(std::str::from_utf8(&line).unwrap()).unwrap();
+
+        assert_eq!(
+            decoded.frame.unwrap().rows_v2[0][0].text.len(),
+            long_text.len()
+        );
     }
 
     #[test]
