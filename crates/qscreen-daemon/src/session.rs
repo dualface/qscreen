@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use tokio::sync::mpsc;
 
 pub const SCROLLBACK_LIMIT: usize = 256 * 1024;
@@ -16,6 +16,8 @@ const DEFAULT_HEIGHT: u16 = 24;
 const DEFAULT_WINDOWS_SHELL: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
 #[cfg(any(windows, test))]
 const CMD_WINDOWS_SHELL: &str = r"C:\Windows\System32\cmd.exe";
+const TERM_XTERM_256COLOR: &str = "xterm-256color";
+const COLOR_TERM_TRUECOLOR: &str = "truecolor";
 
 pub type ClientId = u64;
 
@@ -74,6 +76,7 @@ pub struct Session {
     pty_master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
     /// PTY writer：写 input
     pty_writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
+    child_killer: Arc<Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>>,
     pub scrollback: Arc<Mutex<ScrollbackBuf>>,
     /// 已 attach 客户端；空 map = detached
     pub attached_clients: Arc<Mutex<HashMap<ClientId, AttachedClient>>>,
@@ -116,6 +119,7 @@ impl Session {
 
         let cmd = default_shell_command(shell).context("resolve shell command")?;
         let child = pair.slave.spawn_command(cmd).context("spawn shell")?;
+        let child_killer = Arc::new(Mutex::new(Some(child.clone_killer())));
         drop(pair.slave);
 
         let scrollback = Arc::new(Mutex::new(ScrollbackBuf::new()));
@@ -140,6 +144,7 @@ impl Session {
             closed: closed.clone(),
             pty_master: pty_master.clone(),
             pty_writer: pty_writer_arc.clone(),
+            child_killer: child_killer.clone(),
             scrollback: scrollback.clone(),
             attached_clients: attached_clients.clone(),
             active_client_id: active_client_id.clone(),
@@ -348,6 +353,9 @@ impl Session {
     /// 关闭 session（kill PTY）
     pub fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
+        if let Some(mut killer) = self.child_killer.lock().unwrap().take() {
+            let _ = killer.kill();
+        }
         // 丢弃 writer 和 master → PTY 管道关闭 → reader task 结束
         self.pty_writer.lock().unwrap().take();
         self.pty_master.lock().unwrap().take();
@@ -415,7 +423,10 @@ fn default_shell_command(shell: Option<&str>) -> anyhow::Result<CommandBuilder> 
             .filter(|value| !value.is_empty())
             .or(env_preference.as_deref());
         let shell_path = resolve_windows_shell_preference(preference)?;
-        Ok(CommandBuilder::new(shell_path))
+        let mut cmd = CommandBuilder::new(shell_path);
+        cmd.env("TERM", TERM_XTERM_256COLOR);
+        cmd.env("COLORTERM", COLOR_TERM_TRUECOLOR);
+        Ok(cmd)
     }
     #[cfg(unix)]
     {
@@ -426,6 +437,8 @@ fn default_shell_command(shell: Option<&str>) -> anyhow::Result<CommandBuilder> 
             .or_else(|| std::env::var("SHELL").ok())
             .unwrap_or_else(|| "/bin/sh".to_string());
         let mut cmd = CommandBuilder::new(shell_path);
+        cmd.env("TERM", TERM_XTERM_256COLOR);
+        cmd.env("COLORTERM", COLOR_TERM_TRUECOLOR);
         cmd.arg("-l");
         Ok(cmd)
     }
@@ -434,6 +447,7 @@ fn default_shell_command(shell: Option<&str>) -> anyhow::Result<CommandBuilder> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     #[test]
     fn windows_shell_preference_defaults_to_powershell_for_unset_or_empty() {
@@ -482,6 +496,16 @@ mod tests {
             .to_string();
 
         assert!(err.contains("unsupported Windows shell value: pwsh"));
+    }
+
+    #[test]
+    fn default_shell_command_sets_xterm_256color_env() {
+        let cmd = default_shell_command(None).expect("default shell command should build");
+        assert_eq!(cmd.get_env("TERM"), Some(OsStr::new(TERM_XTERM_256COLOR)));
+        assert_eq!(
+            cmd.get_env("COLORTERM"),
+            Some(OsStr::new(COLOR_TERM_TRUECOLOR))
+        );
     }
 
     fn recv_output_matching(rx: &mut mpsc::UnboundedReceiver<SessionEvent>, expected: &[u8]) {

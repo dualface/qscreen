@@ -654,6 +654,7 @@ fn move_session_list_selection(selected: usize, len: usize, delta: isize) -> usi
 
 async fn attach_session_loop(initial_session_id: &str, config: ClientConfig) -> anyhow::Result<()> {
     let mut session_id = initial_session_id.to_string();
+    let _terminal = TerminalCleanupGuard::enter()?;
 
     loop {
         validate_session_id(&session_id)?;
@@ -698,7 +699,7 @@ async fn attach_session_once(
     let resp = recv_msg(&mut conn).await?;
     check_response(&resp, attach_id)?;
 
-    let _terminal = TerminalCleanupGuard::enter()?;
+    term::prepare_attach_terminal(&mut std::io::stdout())?;
 
     let session_id_owned = session_id.to_string();
     run_attach_loop(conn, session_id_owned, term_size, config.prefix).await
@@ -710,7 +711,7 @@ impl TerminalCleanupGuard {
     fn enter() -> anyhow::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
         let mut stdout = std::io::stdout();
-        term::enable_focus_reporting(&mut stdout)?;
+        term::prepare_attach_terminal(&mut stdout)?;
 
         #[cfg(windows)]
         {
@@ -906,8 +907,8 @@ async fn run_attach_loop(
                 match msg.kind {
                     MessageKind::Event => match msg.event {
                         Some(EventType::Output) => {
-                            screen.process(&msg.payload);
-                            let _ = screen.render(&mut stdout);
+                            let _ = stdout.write_all(&msg.payload);
+                            let _ = stdout.flush();
                         }
                         Some(EventType::Exit) => break AttachOutcome::Ended,
                         _ => {}
@@ -985,13 +986,25 @@ async fn run_attach_loop(
                         stop_input.store(true, Ordering::Relaxed);
                         let _ = input_handle.await;
 
-                        match run_session_list_mode(&session_id_c, screen.size(), &mut stdout, &mut screen).await? {
+                        match run_session_list_mode(&session_id_c, screen.size(), &mut stdout).await? {
                             SessionListSelection::Switch(next_session_id) => {
                                 break AttachOutcome::SwitchTo(next_session_id);
                             }
                             SessionListSelection::Close | SessionListSelection::Error(_) => {
-                                screen.force_redraw();
-                                let _ = screen.render(&mut stdout);
+                                let (w, h) = screen.size();
+                                msg_id += 1;
+                                let resize_msg = Message {
+                                    kind: MessageKind::Request,
+                                    id: msg_id.to_string(),
+                                    command: Some(Command::Resize),
+                                    session_id: session_id_c.clone(),
+                                    width: w as u32,
+                                    height: h as u32,
+                                    ..Default::default()
+                                };
+                                if let Ok(bytes) = resize_msg.to_json_line() {
+                                    let _ = writer_c.lock().await.write_all(&bytes).await;
+                                }
                                 stop_input.store(false, Ordering::Relaxed);
                                 input_handle = spawn_attach_input_reader(
                                     action_tx.clone(),
@@ -1059,7 +1072,6 @@ async fn run_session_list_mode<W: Write>(
     current_session_id: &str,
     term_size: (u16, u16),
     stdout: &mut W,
-    screen: &mut term::TermScreen,
 ) -> anyhow::Result<SessionListSelection> {
     let mut rows = build_session_list_rows(&list_sessions().await?, current_session_id);
     let mut selected = rows
@@ -1110,7 +1122,6 @@ async fn run_session_list_mode<W: Write>(
                 }
             }
         }
-        screen.force_redraw();
     }
 }
 
