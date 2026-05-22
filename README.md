@@ -49,10 +49,33 @@ qscn kill work               # terminate a session
 qscn shutdown                # stop daemon and close sessions
 ```
 
+Custom prefix keys:
+
+```sh
+qscn --prefix C-b attach work # attach with Ctrl+B as the session prefix
+qscn --prefix C-b new work    # create and attach with Ctrl+B as the session prefix
+qscn --prefix C-b             # smart launch with Ctrl+B as the session prefix
+```
+
+Prefix values accept `C-a` through `C-z` or `Ctrl+A` through `Ctrl+Z`.
+`QSCREEN_PREFIX` sets a fallback prefix for every command:
+
+```sh
+QSCREEN_PREFIX=C-b qscn attach work
+```
+
+When both are set, `--prefix` takes precedence over `QSCREEN_PREFIX`.
+When neither is set, `qscn` uses `Ctrl+A`.
+
 Inside a session:
 
-- `Ctrl+A D`: detach, leaving the session running.
-- `Ctrl+A Ctrl+A`: send a literal `Ctrl+A` to the shell.
+- `<prefix> d`: detach, leaving the session running.
+- `<prefix> <prefix>`: send a literal prefix key to the shell.
+- `<prefix> s`: open the session list; choose a detached session to switch attaches.
+
+With the default prefix, those controls are `Ctrl+A d`, `Ctrl+A Ctrl+A`, and
+`Ctrl+A s`. With `qscn --prefix C-b ...`, they are `Ctrl+B d`,
+`Ctrl+B Ctrl+B`, and `Ctrl+B s`.
 
 `qscn ls` prints:
 

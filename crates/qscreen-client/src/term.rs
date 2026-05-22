@@ -7,6 +7,8 @@ use std::io::Write;
 pub struct TermScreen {
     parser: vt100::Parser,
     prev_contents: Vec<u8>,
+    rows: u16,
+    cols: u16,
 }
 
 impl TermScreen {
@@ -14,6 +16,8 @@ impl TermScreen {
         TermScreen {
             parser: vt100::Parser::new(rows, cols, 0),
             prev_contents: Vec::new(),
+            rows,
+            cols,
         }
     }
 
@@ -43,5 +47,15 @@ impl TermScreen {
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.parser.set_size(rows, cols);
         self.prev_contents.clear();
+        self.rows = rows;
+        self.cols = cols;
+    }
+
+    pub fn force_redraw(&mut self) {
+        self.prev_contents.clear();
+    }
+
+    pub fn size(&self) -> (u16, u16) {
+        (self.cols, self.rows)
     }
 }
