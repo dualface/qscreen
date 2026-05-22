@@ -17,6 +17,7 @@ use tokio::sync::Notify;
 
 pub const SCROLLBACK_LIMIT: usize = 256 * 1024;
 const FRAME_CHANNEL_CAPACITY: usize = 16;
+const CURSOR_SHAPE_DEFAULT: u8 = 0;
 const DEFAULT_WIDTH: u16 = 80;
 const DEFAULT_HEIGHT: u16 = 24;
 #[cfg(any(windows, test))]
@@ -129,6 +130,7 @@ pub struct Session {
     /// PTY writer：写 input
     pty_writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     child_killer: Arc<Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>>,
+    cursor_shape: Arc<Mutex<u8>>,
     pub scrollback: Arc<Mutex<ScrollbackBuf>>,
     screen: Arc<Mutex<vt100::Parser>>,
     /// 已 attach 客户端；空 map = detached
@@ -185,6 +187,7 @@ impl Session {
         let closed = Arc::new(AtomicBool::new(false));
         let pty_master = Arc::new(Mutex::new(Some(pair.master)));
         let pty_writer_arc = Arc::new(Mutex::new(Some(pty_writer)));
+        let cursor_shape = Arc::new(Mutex::new(CURSOR_SHAPE_DEFAULT));
         let screen = Arc::new(Mutex::new(vt100::Parser::new(h, w, 0)));
 
         let sess = Arc::new(Session {
@@ -199,6 +202,7 @@ impl Session {
             pty_master: pty_master.clone(),
             pty_writer: pty_writer_arc.clone(),
             child_killer: child_killer.clone(),
+            cursor_shape: cursor_shape.clone(),
             scrollback: scrollback.clone(),
             screen: screen.clone(),
             attached_clients: attached_clients.clone(),
@@ -212,6 +216,7 @@ impl Session {
                 pty_reader,
                 scrollback.clone(),
                 screen.clone(),
+                cursor_shape.clone(),
                 attached_clients.clone(),
                 active_client_id.clone(),
                 exited.clone(),
@@ -360,7 +365,7 @@ impl Session {
 
     fn screen_frame(&self) -> ScreenFrame {
         let parser = self.screen.lock().unwrap();
-        screen_frame_from_parser(&parser)
+        screen_frame_from_parser(&parser, *self.cursor_shape.lock().unwrap())
     }
 
     pub fn focus_client(&self, client_id: ClientId) -> anyhow::Result<()> {
@@ -453,7 +458,7 @@ fn push_cell_run(
     }
 }
 
-fn screen_frame_from_parser(parser: &vt100::Parser) -> ScreenFrame {
+fn screen_frame_from_parser(parser: &vt100::Parser, cursor_shape: u8) -> ScreenFrame {
     let screen = parser.screen();
     let (rows, cols) = screen.size();
     let (cursor_row, cursor_col) = screen.cursor_position();
@@ -501,16 +506,50 @@ fn screen_frame_from_parser(parser: &vt100::Parser) -> ScreenFrame {
         cursor_col,
         hide_cursor: screen.hide_cursor(),
         alternate_screen: screen.alternate_screen() || last_row_has_content(screen, rows, cols),
+        cursor_shape,
         rows_v2,
     }
 }
 
-fn cleanup_alt_screen_frame(parser: &mut vt100::Parser) -> Option<ScreenFrame> {
+fn cleanup_alt_screen_frame(
+    parser: &mut vt100::Parser,
+    cursor_shape: &Arc<Mutex<u8>>,
+) -> Option<ScreenFrame> {
     if !parser.screen().alternate_screen() {
         return None;
     }
     parser.process(b"\x1b[?25h\x1b[?1049l");
-    Some(screen_frame_from_parser(parser))
+    *cursor_shape.lock().unwrap() = CURSOR_SHAPE_DEFAULT;
+    Some(screen_frame_from_parser(parser, CURSOR_SHAPE_DEFAULT))
+}
+
+fn scan_cursor_shape(data: &[u8]) -> Option<u8> {
+    let mut last_shape = None;
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b'[' {
+            let mut j = i + 2;
+            let mut param = 0u8;
+            while j < data.len() && data[j].is_ascii_digit() {
+                param = param.saturating_mul(10).saturating_add(data[j] - b'0');
+                j += 1;
+            }
+            if j + 1 < data.len() && data[j] == b' ' && data[j + 1] == b'q' {
+                if param <= 6 {
+                    last_shape = Some(param);
+                }
+                i = j + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    last_shape
+}
+
+fn scan_rmcup(data: &[u8]) -> bool {
+    const RMCUP: &[u8] = b"\x1b[?1049l";
+    data.windows(RMCUP.len()).any(|window| window == RMCUP)
 }
 
 fn default_run_attrs() -> (FrameColor, FrameColor, u8) {
@@ -575,6 +614,7 @@ fn spawn_coalesced_reader(
     mut reader: Box<dyn Read + Send>,
     scrollback: Arc<Mutex<ScrollbackBuf>>,
     screen: Arc<Mutex<vt100::Parser>>,
+    cursor_shape: Arc<Mutex<u8>>,
     attached_clients: Arc<Mutex<HashMap<ClientId, AttachedClient>>>,
     active_client_id: Arc<Mutex<Option<ClientId>>>,
     exited: Arc<AtomicBool>,
@@ -625,7 +665,7 @@ fn spawn_coalesced_reader(
                         tracing::debug!(session = %name, "pty reader ended");
                         let cleanup_frame = {
                             let mut parser = screen.lock().unwrap();
-                            cleanup_alt_screen_frame(&mut parser)
+                            cleanup_alt_screen_frame(&mut parser, &cursor_shape)
                         };
                         if let Some(frame) = cleanup_frame {
                             broadcast_frame(&attached_clients, &active_client_id, frame);
@@ -663,10 +703,20 @@ fn spawn_coalesced_reader(
             }
 
             scrollback.lock().unwrap().append(&bytes);
+            let current_cursor_shape = {
+                let mut cursor_shape = cursor_shape.lock().unwrap();
+                if let Some(shape) = scan_cursor_shape(&bytes) {
+                    *cursor_shape = shape;
+                }
+                if scan_rmcup(&bytes) {
+                    *cursor_shape = CURSOR_SHAPE_DEFAULT;
+                }
+                *cursor_shape
+            };
             let frame = {
                 let mut parser = screen.lock().unwrap();
                 parser.process(&bytes);
-                screen_frame_from_parser(&parser)
+                screen_frame_from_parser(&parser, current_cursor_shape)
             };
             broadcast_frame(&attached_clients, &active_client_id, frame);
         }
@@ -916,13 +966,30 @@ mod tests {
     #[test]
     fn cleanup_alt_screen_frame_exits_alternate_screen() {
         let mut parser = vt100::Parser::new(2, 8, 0);
+        let cursor_shape = Arc::new(Mutex::new(5));
         parser.process(b"main\x1b[?1049halt");
         assert!(parser.screen().alternate_screen());
 
-        let frame = cleanup_alt_screen_frame(&mut parser).expect("expected cleanup frame");
+        let frame =
+            cleanup_alt_screen_frame(&mut parser, &cursor_shape).expect("expected cleanup frame");
 
         assert!(!parser.screen().alternate_screen());
         assert!(!frame.alternate_screen);
+        assert_eq!(frame.cursor_shape, CURSOR_SHAPE_DEFAULT);
+        assert_eq!(*cursor_shape.lock().unwrap(), CURSOR_SHAPE_DEFAULT);
+    }
+
+    #[test]
+    fn scan_cursor_shape_returns_last_valid_shape() {
+        assert_eq!(scan_cursor_shape(b"\x1b[2 qtext\x1b[5 q"), Some(5));
+        assert_eq!(scan_cursor_shape(b"\x1b[9 q"), None);
+        assert_eq!(scan_cursor_shape(b"plain"), None);
+    }
+
+    #[test]
+    fn scan_rmcup_detects_alternate_screen_exit() {
+        assert!(scan_rmcup(b"before\x1b[?1049lafter"));
+        assert!(!scan_rmcup(b"\x1b[?1049h"));
     }
 
     #[tokio::test]

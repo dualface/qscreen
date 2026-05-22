@@ -69,6 +69,8 @@ pub struct ScreenFrame {
     pub cursor_col: u16,
     pub hide_cursor: bool,
     pub alternate_screen: bool,
+    #[serde(skip_serializing_if = "is_zero_u8", default)]
+    pub cursor_shape: u8,
     pub rows_v2: Vec<Vec<ScreenRun>>,
 }
 
@@ -174,6 +176,9 @@ fn is_false(v: &bool) -> bool {
     !v
 }
 fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+fn is_zero_u8(v: &u8) -> bool {
     *v == 0
 }
 fn is_zero_i64(v: &i64) -> bool {
@@ -443,6 +448,7 @@ mod tests {
         let frame = ScreenFrame {
             rows: 1,
             cols: 5,
+            cursor_shape: 5,
             rows_v2: vec![vec![ScreenRun {
                 text: "hello".to_string(),
                 fg: FrameColor::Default,
@@ -464,8 +470,10 @@ mod tests {
 
         assert_eq!(decoded.event, Some(EventType::Frame));
         assert_eq!(decoded.frame, Some(frame));
-        assert!(std::str::from_utf8(&line).unwrap().contains(r#""frame":"#));
-        assert!(!std::str::from_utf8(&line).unwrap().contains("payload_b64"));
+        let json = std::str::from_utf8(&line).unwrap();
+        assert!(json.contains(r#""frame":"#));
+        assert!(json.contains(r#""cursor_shape":5"#));
+        assert!(!json.contains("payload_b64"));
     }
 
     #[test]

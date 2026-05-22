@@ -8,7 +8,7 @@ use unicode_width::UnicodeWidthStr;
 
 const PREPARE_ATTACH: &[u8] = b"\x1b[?1004h\x1b[2J\x1b[H";
 const RESTORE_AFTER_ATTACH: &[u8] =
-    b"\x1b[?2026l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?25h\x1b[0m\x1b[?1049l\x1b[r";
+    b"\x1b[?2026l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?25h\x1b[0m\x1b[0 q\x1b[?1049l\x1b[r";
 
 pub fn prepare_attach_terminal<W: Write>(out: &mut W) -> std::io::Result<()> {
     out.write_all(PREPARE_ATTACH)?;
@@ -65,6 +65,9 @@ pub fn render_screen_frame<W: Write>(out: &mut W, frame: &ScreenFrame) -> std::i
         frame.cursor_row.saturating_add(1),
         frame.cursor_col.saturating_add(1)
     )?;
+    if frame.cursor_shape <= 6 {
+        write!(out, "\x1b[{} q", frame.cursor_shape)?;
+    }
     if !frame.hide_cursor {
         out.write_all(b"\x1b[?25h")?;
     }
@@ -164,9 +167,45 @@ mod tests {
         let text = std::str::from_utf8(RESTORE_AFTER_ATTACH).unwrap();
 
         let sgr_reset = text.find("\x1b[0m").expect("missing sgr reset");
+        let cursor_reset = text.find("\x1b[0 q").expect("missing cursor shape reset");
         let leave_alt = text
             .find("\x1b[?1049l")
             .expect("missing alternate-screen leave");
         assert!(sgr_reset < leave_alt);
+        assert!(cursor_reset < leave_alt);
+    }
+
+    #[test]
+    fn render_screen_frame_applies_cursor_shape() {
+        let frame = ScreenFrame {
+            rows: 1,
+            cols: 1,
+            cursor_shape: 5,
+            rows_v2: vec![vec![]],
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+
+        render_screen_frame(&mut out, &frame).unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\x1b[5 q"));
+    }
+
+    #[test]
+    fn render_screen_frame_resets_default_cursor_shape() {
+        let frame = ScreenFrame {
+            rows: 1,
+            cols: 1,
+            cursor_shape: 0,
+            rows_v2: vec![vec![]],
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+
+        render_screen_frame(&mut out, &frame).unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\x1b[0 q"));
     }
 }
