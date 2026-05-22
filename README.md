@@ -5,7 +5,7 @@
 ## Features
 
 - Create, list, attach, detach, and kill terminal sessions.
-- Smart default command: create `main`, attach the only session, or list multiple sessions.
+- Smart default command: create a session, attach the only session, or list multiple sessions.
 - Background daemon starts on demand.
 - Scrollback replay when reattaching.
 - Multiple clients can attach to the same session; output is broadcast to all attached clients and each client can detach independently.
@@ -14,9 +14,11 @@
 
 ## Platform Notes
 
-- Windows uses named pipes and starts `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe` by default. Use `qscn new --shell cmd --session work` to start `C:\Windows\System32\cmd.exe` for a single session, or set the daemon environment variable `QSCREEN_WINDOWS_SHELL=cmd` or `QSCREEN_WINDOWS_SHELL=cmd.exe` to make cmd the daemon default. Explicit `powershell` and `powershell.exe` values keep the default PowerShell behavior. Unsupported values return an error and prevent session creation.
+- Windows uses named pipes and starts `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe` by default. Use `qscn new --shell cmd --name work` to start `C:\Windows\System32\cmd.exe` for a single session, or set the daemon environment variable `QSCREEN_WINDOWS_SHELL=cmd` or `QSCREEN_WINDOWS_SHELL=cmd.exe` to make cmd the daemon default. Explicit `powershell` and `powershell.exe` values keep the default PowerShell behavior. Unsupported values return an error and prevent session creation.
 - Linux/macOS use Unix domain sockets and start `$SHELL -l`, falling back to `/bin/sh -l`.
-- Session names must match `[A-Za-z0-9._-]` and be at most 64 characters.
+- Sessions are addressed by daemon-assigned numeric `session_id` values. The
+  session name is only a display name, and custom names must match
+  `[A-Za-z0-9._-]` and be at most 64 characters.
 
 ## Build
 
@@ -41,22 +43,23 @@ make clean
 
 ```sh
 qscn                         # smart launch
-qscn new                     # create a timestamp-named session
-qscn new --session work      # create and attach using an option name
-qscn new --shell cmd         # create a timestamp-named cmd session on Windows
-qscn new --shell cmd --session work
-qscn attach work             # reattach to a session
-qscn -r work                 # alias for attach
+qscn new                     # create a session named after its auto-assigned session_id
+qscn new --name work         # create and attach with display name work
+qscn new --shell cmd         # create an auto-named cmd session on Windows
+qscn new --shell cmd --name work
+qscn attach 1                # reattach to session_id 1
+qscn -r 1                    # alias for attach
 qscn ls                      # list sessions
-qscn kill work               # terminate a session
+qscn rename 1 work           # change the display name for session_id 1
+qscn kill 1                  # terminate session_id 1
 qscn shutdown                # stop daemon and close sessions
 ```
 
 Custom prefix keys:
 
 ```sh
-qscn --prefix C-b attach work # attach with Ctrl+B as the session prefix
-qscn --prefix C-b new work    # create and attach with Ctrl+B as the session prefix
+qscn --prefix C-b attach 1    # attach with Ctrl+B as the session prefix
+qscn --prefix C-b new --name work
 qscn --prefix C-b             # smart launch with Ctrl+B as the session prefix
 ```
 
@@ -64,7 +67,7 @@ Prefix values accept `C-a` through `C-z` or `Ctrl+A` through `Ctrl+Z`.
 `QSCREEN_PREFIX` sets a fallback prefix for every command:
 
 ```sh
-QSCREEN_PREFIX=C-b qscn attach work
+QSCREEN_PREFIX=C-b qscn attach 1
 ```
 
 When both are set, `--prefix` takes precedence over `QSCREEN_PREFIX`.
@@ -74,7 +77,7 @@ Inside a session:
 
 - `<prefix> d`: detach, leaving the session running.
 - `<prefix> <prefix>`: send a literal prefix key to the shell.
-- `<prefix> s`: open the session list; choose a detached session to switch attaches.
+- `<prefix> s`: open the session list; choose a session to switch attaches.
 
 With the default prefix, those controls are `Ctrl+A d`, `Ctrl+A Ctrl+A`, and
 `Ctrl+A s`. With `qscn --prefix C-b ...`, they are `Ctrl+B d`,
@@ -83,7 +86,7 @@ With the default prefix, those controls are `Ctrl+A d`, `Ctrl+A Ctrl+A`, and
 `qscn ls` prints:
 
 ```text
-<name>  <state>  <created-at>  <terminal-size>
+<session_id>  <name>  <state>  <created-at>  <terminal-size>
 ```
 
 States are `attached`, `detached`, or `exited(<code>)`.

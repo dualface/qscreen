@@ -62,7 +62,8 @@ impl ScrollbackBuf {
 }
 
 pub struct Session {
-    pub name: String,
+    pub session_id: String,
+    name: Arc<Mutex<String>>,
     pub created_at: DateTime<Utc>,
     width: Arc<Mutex<u16>>,
     height: Arc<Mutex<u16>>,
@@ -82,6 +83,7 @@ pub struct Session {
 
 impl Session {
     pub fn new(
+        session_id: String,
         name: String,
         width: u32,
         height: u32,
@@ -128,7 +130,8 @@ impl Session {
         let pty_writer_arc = Arc::new(Mutex::new(Some(pty_writer)));
 
         let sess = Arc::new(Session {
-            name: name.clone(),
+            session_id,
+            name: Arc::new(Mutex::new(name.clone())),
             created_at: Utc::now(),
             width: Arc::new(Mutex::new(w)),
             height: Arc::new(Mutex::new(h)),
@@ -193,6 +196,14 @@ impl Session {
         }
 
         Ok(sess)
+    }
+
+    pub fn name(&self) -> String {
+        self.name.lock().unwrap().clone()
+    }
+
+    pub fn rename(&self, name: String) {
+        *self.name.lock().unwrap() = name;
     }
 
     pub fn width(&self) -> u16 {
@@ -496,7 +507,8 @@ mod tests {
 
     #[tokio::test]
     async fn attach_multiple_clients_and_detach_independently() {
-        let session = Session::new("multi-detach".to_string(), 80, 24, None).unwrap();
+        let session =
+            Session::new("1".to_string(), "multi-detach".to_string(), 80, 24, None).unwrap();
         let (tx1, _rx1) = mpsc::unbounded_channel();
         let (tx2, _rx2) = mpsc::unbounded_channel();
 
@@ -525,7 +537,8 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_output_reaches_all_clients_and_removes_only_failed_senders() {
-        let session = Session::new("multi-broadcast".to_string(), 80, 24, None).unwrap();
+        let session =
+            Session::new("1".to_string(), "multi-broadcast".to_string(), 80, 24, None).unwrap();
         let (tx1, mut rx1) = mpsc::unbounded_channel();
         let (tx2, rx2) = mpsc::unbounded_channel();
         let (tx3, mut rx3) = mpsc::unbounded_channel();
@@ -554,7 +567,8 @@ mod tests {
 
     #[tokio::test]
     async fn close_notifies_all_attached_clients() {
-        let session = Session::new("multi-close".to_string(), 80, 24, None).unwrap();
+        let session =
+            Session::new("1".to_string(), "multi-close".to_string(), 80, 24, None).unwrap();
         let (tx1, mut rx1) = mpsc::unbounded_channel();
         let (tx2, mut rx2) = mpsc::unbounded_channel();
 
@@ -571,7 +585,8 @@ mod tests {
 
     #[tokio::test]
     async fn inactive_resize_stores_size_without_pty_resize_until_focus_or_input() {
-        let session = Session::new("multi-size".to_string(), 80, 24, None).unwrap();
+        let session =
+            Session::new("1".to_string(), "multi-size".to_string(), 80, 24, None).unwrap();
         let (tx1, _rx1) = mpsc::unbounded_channel();
         let (tx2, _rx2) = mpsc::unbounded_channel();
 
@@ -601,7 +616,14 @@ mod tests {
 
     #[tokio::test]
     async fn input_client_marks_active_and_applies_client_size() {
-        let session = Session::new("multi-input-size".to_string(), 80, 24, None).unwrap();
+        let session = Session::new(
+            "1".to_string(),
+            "multi-input-size".to_string(),
+            80,
+            24,
+            None,
+        )
+        .unwrap();
         let (tx1, _rx1) = mpsc::unbounded_channel();
         let (tx2, _rx2) = mpsc::unbounded_channel();
 

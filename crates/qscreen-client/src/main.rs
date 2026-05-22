@@ -8,7 +8,7 @@ use anyhow::Context;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use qscreen_protocol::{
     Command, EventType, Message, MessageKind, SessionInfo, exited_session_error,
-    validate_session_name,
+    validate_session_id, validate_session_name,
 };
 use qscreen_shared::{daemon_log_path, pipe_name};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -191,8 +191,11 @@ fn run_client(args: Vec<String>) -> anyhow::Result<()> {
                 let opts = parse_new_options(rest)?;
                 cmd_new(opts.name.as_deref(), opts.shell.as_deref(), config).await
             }
-            [cmd, name] if cmd == "attach" || cmd == "-r" => cmd_attach(name, config).await,
-            [cmd, name] if cmd == "kill" => cmd_kill(name).await,
+            [cmd, session_id] if cmd == "attach" || cmd == "-r" => {
+                cmd_attach(session_id, config).await
+            }
+            [cmd, session_id] if cmd == "kill" => cmd_kill(session_id).await,
+            [cmd, session_id, name] if cmd == "rename" => cmd_rename(session_id, name).await,
             _ => {
                 if is_chinese() {
                     anyhow::bail!("未知命令。运行 `qscn --help` 查看帮助")
@@ -202,11 +205,6 @@ fn run_client(args: Vec<String>) -> anyhow::Result<()> {
             }
         }
     })
-}
-
-fn default_new_name() -> String {
-    use chrono::Utc;
-    Utc::now().format("%Y%m%d-%H%M%S").to_string()
 }
 
 #[derive(Debug)]
@@ -222,12 +220,12 @@ fn parse_new_options(args: &[String]) -> anyhow::Result<NewOptions> {
 
     while i < args.len() {
         match args[i].as_str() {
-            "--session" => {
+            "--name" => {
                 i += 1;
                 let value = args
                     .get(i)
-                    .with_context(|| missing_option_value("--session"))?;
-                set_once(&mut name, value.clone(), "--session")?;
+                    .with_context(|| missing_option_value("--name"))?;
+                set_once(&mut name, value.clone(), "--name")?;
             }
             "--shell" => {
                 i += 1;
@@ -236,12 +234,12 @@ fn parse_new_options(args: &[String]) -> anyhow::Result<NewOptions> {
                     .with_context(|| missing_option_value("--shell"))?;
                 set_once(&mut shell, value.clone(), "--shell")?;
             }
-            value if value.starts_with("--session=") => {
-                let value = value.trim_start_matches("--session=");
+            value if value.starts_with("--name=") => {
+                let value = value.trim_start_matches("--name=");
                 if value.is_empty() {
-                    anyhow::bail!("{}", missing_option_value("--session"));
+                    anyhow::bail!("{}", missing_option_value("--name"));
                 }
-                set_once(&mut name, value.to_string(), "--session")?;
+                set_once(&mut name, value.to_string(), "--name")?;
             }
             value if value.starts_with("--shell=") => {
                 let value = value.trim_start_matches("--shell=");
@@ -254,7 +252,7 @@ fn parse_new_options(args: &[String]) -> anyhow::Result<NewOptions> {
                 anyhow::bail!("unknown new option: {value}");
             }
             value => {
-                anyhow::bail!("unexpected argument for new: {value}. Use --session <name>");
+                anyhow::bail!("unexpected argument for new: {value}. Use --name <name>");
             }
         }
         i += 1;
@@ -321,21 +319,23 @@ fn print_help() {
             r#"qscreen — 轻量终端会话管理器
 
 用法:
-  qscn [--prefix C-a]          智能启动：无会话时新建并进入 main，单会话时直接 attach，
+  qscn [--prefix C-a]          智能启动：无会话时新建并进入，单会话时直接 attach，
                             多会话时列出所有会话
   qscn [--prefix C-a] new
                                新建自动命名会话并进入
-  qscn [--prefix C-a] new --session <name>
-                               用参数指定会话名
+  qscn [--prefix C-a] new --name <name>
+                               用参数指定显示名
   qscn [--prefix C-a] new --shell <shell>
                                指定启动 shell（Windows: cmd 或 powershell）
-  qscn [--prefix C-a] attach <name>
+  qscn [--prefix C-a] attach <session_id>
                                进入已有会话
-  qscn [--prefix C-a] -r <name>
+  qscn [--prefix C-a] -r <session_id>
                                同 attach，兼容 tmux 风格
   qscn ls                      列出所有会话（同 list）
   qscn list                    列出所有会话
-  qscn kill <name>             强制终止指定会话
+  qscn kill <session_id>       强制终止指定会话
+  qscn rename <session_id> <name>
+                               修改会话显示名
   qscn shutdown                停止后台 daemon（所有会话将被关闭）
   qscn -h, --help              显示此帮助
 
@@ -347,20 +347,22 @@ fn print_help() {
 会话内热键:
   <prefix> d                  从当前会话 detach（会话继续在后台运行）
   <prefix> <prefix>           向 PTY 发送字面前缀字符
-  <prefix> s                  打开会话列表，选择 detached 会话后切换 attach
+  <prefix> s                  打开会话列表，选择会话后切换 attach
 
 ls 输出格式:
-  <name>  <状态>  <创建时间>  <终端尺寸>
+  <session_id>  <name>  <状态>  <创建时间>  <终端尺寸>
   状态: attached | detached | exited(<退出码>)
 
 示例:
-  qscn                         # 自动进入唯一会话，或新建 main
-  qscn new --session work      # 新建名为 work 的会话
-  qscn new --shell cmd --session work
-  qscn --prefix C-b attach work # 使用 Ctrl+B 作为前缀进入 work
-  qscn attach work             # 重新进入 work 会话
+  qscn                         # 自动进入唯一会话，或新建自动命名会话
+  qscn new                     # 新建自动分配 session_id 的会话
+  qscn new --name work         # 新建显示名为 work 的会话
+  qscn new --shell cmd --name work
+  qscn --prefix C-b attach 1   # 使用 Ctrl+B 作为前缀进入 session_id=1
+  qscn attach 1                # 重新进入 session_id=1
+  qscn rename 1 work           # 修改 session_id=1 的显示名
   qscn ls                      # 查看所有会话状态
-  qscn kill work               # 终止 work 会话
+  qscn kill 1                  # 终止 session_id=1
 "#
         );
     } else {
@@ -368,21 +370,23 @@ ls 输出格式:
             r#"qscreen — lightweight terminal session manager
 
 Usage:
-  qscn [--prefix C-a]          smart launch: create and enter 'main' if no sessions,
+  qscn [--prefix C-a]          smart launch: create and enter a session if no sessions,
                             attach if one session, list all if multiple
   qscn [--prefix C-a] new
                                create an auto-named session and attach
-  qscn [--prefix C-a] new --session <name>
-                               specify the session name as an option
+  qscn [--prefix C-a] new --name <name>
+                               specify the display name as an option
   qscn [--prefix C-a] new --shell <shell>
                                specify the startup shell (Windows: cmd or powershell)
-  qscn [--prefix C-a] attach <name>
+  qscn [--prefix C-a] attach <session_id>
                                attach to an existing session
-  qscn [--prefix C-a] -r <name>
+  qscn [--prefix C-a] -r <session_id>
                                same as attach (tmux-style shorthand)
   qscn ls                      list all sessions (alias: list)
   qscn list                    list all sessions
-  qscn kill <name>             forcibly terminate a session
+  qscn kill <session_id>       forcibly terminate a session
+  qscn rename <session_id> <name>
+                               change a session display name
   qscn shutdown                stop the background daemon (closes all sessions)
   qscn -h, --help              show this help
 
@@ -394,20 +398,22 @@ Prefix:
 Key bindings (inside a session):
   <prefix> d                  detach from session (session keeps running)
   <prefix> <prefix>           send a literal prefix key to the PTY
-  <prefix> s                  open the session list and switch to a detached session
+  <prefix> s                  open the session list and switch to a session
 
 ls output format:
-  <name>  <state>  <created-at>  <terminal-size>
+  <session_id>  <name>  <state>  <created-at>  <terminal-size>
   states: attached | detached | exited(<code>)
 
 Examples:
-  qscn                         # auto-attach or create main
-  qscn new --session work      # create session named 'work'
-  qscn new --shell cmd --session work
-  qscn --prefix C-b attach work # attach using Ctrl+B as the prefix
-  qscn attach work             # reattach to 'work'
+  qscn                         # auto-attach or create an auto-named session
+  qscn new                     # create a session with an auto-assigned session_id
+  qscn new --name work         # create a session with display name 'work'
+  qscn new --shell cmd --name work
+  qscn --prefix C-b attach 1   # attach to session_id=1 using Ctrl+B as the prefix
+  qscn attach 1                # reattach to session_id=1
+  qscn rename 1 work           # change the display name for session_id=1
   qscn ls                      # show all session states
-  qscn kill work               # terminate 'work'
+  qscn kill 1                  # terminate session_id=1
 "#
         );
     }
@@ -418,8 +424,8 @@ Examples:
 async fn cmd_default(config: ClientConfig) -> anyhow::Result<()> {
     let sessions = list_sessions().await?;
     match sessions.len() {
-        0 => cmd_new_and_attach("main", None, config).await,
-        1 => cmd_attach(&sessions[0].name.clone(), config).await,
+        0 => cmd_new_and_attach("", None, config).await,
+        1 => cmd_attach(&sessions[0].session_id.clone(), config).await,
         _ => {
             print_sessions(&sessions);
             Ok(())
@@ -438,8 +444,7 @@ async fn cmd_new(
     shell: Option<&str>,
     config: ClientConfig,
 ) -> anyhow::Result<()> {
-    let name = name.map(str::to_string).unwrap_or_else(default_new_name);
-    cmd_new_and_attach(&name, shell, config).await
+    cmd_new_and_attach(name.unwrap_or_default(), shell, config).await
 }
 
 async fn cmd_new_and_attach(
@@ -447,9 +452,11 @@ async fn cmd_new_and_attach(
     shell: Option<&str>,
     config: ClientConfig,
 ) -> anyhow::Result<()> {
-    validate_session_name(name)?;
+    if !name.is_empty() {
+        validate_session_name(name)?;
+    }
     let mut conn = ensure_and_connect().await?;
-    send_recv_ok(
+    let resp = send_recv_ok(
         &mut conn,
         Message {
             kind: MessageKind::Request,
@@ -461,17 +468,18 @@ async fn cmd_new_and_attach(
         },
     )
     .await?;
+    validate_session_id(&resp.session_id)?;
     drop(conn);
-    attach_session_loop(name, config).await
+    attach_session_loop(&resp.session_id, config).await
 }
 
-async fn cmd_attach(name: &str, config: ClientConfig) -> anyhow::Result<()> {
-    validate_session_name(name)?;
-    attach_session_loop(name, config).await
+async fn cmd_attach(session_id: &str, config: ClientConfig) -> anyhow::Result<()> {
+    validate_session_id(session_id)?;
+    attach_session_loop(session_id, config).await
 }
 
-async fn cmd_kill(name: &str) -> anyhow::Result<()> {
-    validate_session_name(name)?;
+async fn cmd_kill(session_id: &str) -> anyhow::Result<()> {
+    validate_session_id(session_id)?;
     let mut conn = ensure_and_connect().await?;
     send_recv_ok(
         &mut conn,
@@ -479,11 +487,31 @@ async fn cmd_kill(name: &str) -> anyhow::Result<()> {
             kind: MessageKind::Request,
             id: "1".to_string(),
             command: Some(Command::Kill),
+            session_id: session_id.to_string(),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn cmd_rename(session_id: &str, name: &str) -> anyhow::Result<()> {
+    validate_session_id(session_id)?;
+    validate_session_name(name)?;
+    let mut conn = ensure_and_connect().await?;
+    send_recv_ok(
+        &mut conn,
+        Message {
+            kind: MessageKind::Request,
+            id: "1".to_string(),
+            command: Some(Command::Rename),
+            session_id: session_id.to_string(),
             name: name.to_string(),
             ..Default::default()
         },
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 async fn cmd_shutdown() -> anyhow::Result<()> {
@@ -535,7 +563,8 @@ fn format_session_line(s: &SessionInfo) -> String {
         s.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     };
     format!(
-        "{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}",
+        s.session_id,
         s.name,
         session_state_label(s),
         created,
@@ -545,6 +574,7 @@ fn format_session_line(s: &SessionInfo) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionListRow {
+    session_id: String,
     name: String,
     state: String,
     size: String,
@@ -560,19 +590,23 @@ enum SessionListSelection {
     Switch(String),
 }
 
-fn build_session_list_rows(sessions: &[SessionInfo], current_name: &str) -> Vec<SessionListRow> {
+fn build_session_list_rows(
+    sessions: &[SessionInfo],
+    current_session_id: &str,
+) -> Vec<SessionListRow> {
     let mut rows: Vec<SessionListRow> = sessions
         .iter()
         .map(|session| SessionListRow {
+            session_id: session.session_id.clone(),
             name: session.name.clone(),
             state: session_state_label(session),
             size: session_size_label(session),
-            is_current: session.name == current_name,
+            is_current: session.session_id == current_session_id,
             exited: session.exited,
             attached: session.attached,
         })
         .collect();
-    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows.sort_by_key(|row| row.session_id.parse::<u64>().unwrap_or(u64::MAX));
     rows
 }
 
@@ -598,9 +632,9 @@ fn selection_for_session_row(row: &SessionListRow) -> SessionListSelection {
     if row.is_current {
         SessionListSelection::Close
     } else if row.exited {
-        SessionListSelection::Error(exited_session_error(&row.name))
+        SessionListSelection::Error(exited_session_error(&row.session_id))
     } else {
-        SessionListSelection::Switch(row.name.clone())
+        SessionListSelection::Switch(row.session_id.clone())
     }
 }
 
@@ -618,14 +652,14 @@ fn move_session_list_selection(selected: usize, len: usize, delta: isize) -> usi
 
 // ── Attach 实现 ───────────────────────────────────────────────────────────────
 
-async fn attach_session_loop(initial_name: &str, config: ClientConfig) -> anyhow::Result<()> {
-    let mut name = initial_name.to_string();
+async fn attach_session_loop(initial_session_id: &str, config: ClientConfig) -> anyhow::Result<()> {
+    let mut session_id = initial_session_id.to_string();
 
     loop {
-        validate_session_name(&name)?;
-        let outcome = attach_session_once(&name, config).await?;
+        validate_session_id(&session_id)?;
+        let outcome = attach_session_once(&session_id, config).await?;
         match next_attach_target_after_outcome(outcome) {
-            Some(next_name) => name = next_name,
+            Some(next_session_id) => session_id = next_session_id,
             None => return Ok(()),
         }
     }
@@ -633,12 +667,15 @@ async fn attach_session_loop(initial_name: &str, config: ClientConfig) -> anyhow
 
 fn next_attach_target_after_outcome(outcome: AttachOutcome) -> Option<String> {
     match outcome {
-        AttachOutcome::SwitchTo(next_name) => Some(next_name),
+        AttachOutcome::SwitchTo(next_session_id) => Some(next_session_id),
         AttachOutcome::Detached | AttachOutcome::Ended => None,
     }
 }
 
-async fn attach_session_once(name: &str, config: ClientConfig) -> anyhow::Result<AttachOutcome> {
+async fn attach_session_once(
+    session_id: &str,
+    config: ClientConfig,
+) -> anyhow::Result<AttachOutcome> {
     let mut conn = ensure_and_connect().await?;
     let term_size = get_terminal_size().unwrap_or((80, 24));
     let (term_width, term_height) = term_size;
@@ -650,7 +687,7 @@ async fn attach_session_once(name: &str, config: ClientConfig) -> anyhow::Result
             kind: MessageKind::Request,
             id: attach_id.to_string(),
             command: Some(Command::Attach),
-            name: name.to_string(),
+            session_id: session_id.to_string(),
             width: term_width as u32,
             height: term_height as u32,
             ..Default::default()
@@ -663,8 +700,8 @@ async fn attach_session_once(name: &str, config: ClientConfig) -> anyhow::Result
 
     let _terminal = TerminalCleanupGuard::enter()?;
 
-    let name_owned = name.to_string();
-    run_attach_loop(conn, name_owned, term_size, config.prefix).await
+    let session_id_owned = session_id.to_string();
+    run_attach_loop(conn, session_id_owned, term_size, config.prefix).await
 }
 
 struct TerminalCleanupGuard;
@@ -832,7 +869,7 @@ impl PrefixState {
 
 async fn run_attach_loop(
     conn: TcpConn,
-    name: String,
+    session_id: String,
     term_size: (u16, u16),
     prefix: PrefixKey,
 ) -> anyhow::Result<AttachOutcome> {
@@ -844,7 +881,7 @@ async fn run_attach_loop(
     let mut screen = term::TermScreen::new(rows, cols);
 
     let writer_c = writer.clone();
-    let name_c = name.clone();
+    let session_id_c = session_id.clone();
     let mut msg_id: u64 = 10;
 
     let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel::<AttachAction>();
@@ -891,7 +928,7 @@ async fn run_attach_loop(
                             kind: MessageKind::Request,
                             id: msg_id.to_string(),
                             command: Some(Command::Input),
-                            name: name_c.clone(),
+                            session_id: session_id_c.clone(),
                             payload: data,
                             ..Default::default()
                         };
@@ -907,7 +944,7 @@ async fn run_attach_loop(
                             kind: MessageKind::Request,
                             id: msg_id.to_string(),
                             command: Some(Command::Resize),
-                            name: name_c.clone(),
+                            session_id: session_id_c.clone(),
                             width: w as u32,
                             height: h as u32,
                             ..Default::default()
@@ -923,7 +960,7 @@ async fn run_attach_loop(
                             kind: MessageKind::Request,
                             id: msg_id.to_string(),
                             command: Some(Command::Focus),
-                            name: name_c.clone(),
+                            session_id: session_id_c.clone(),
                             ..Default::default()
                         };
                         let bytes = focus_msg.to_json_line()?;
@@ -937,7 +974,7 @@ async fn run_attach_loop(
                             kind: MessageKind::Request,
                             id: msg_id.to_string(),
                             command: Some(Command::Detach),
-                            name: name_c.clone(),
+                            session_id: session_id_c.clone(),
                             ..Default::default()
                         };
                         let bytes = detach_msg.to_json_line()?;
@@ -948,9 +985,9 @@ async fn run_attach_loop(
                         stop_input.store(true, Ordering::Relaxed);
                         let _ = input_handle.await;
 
-                        match run_session_list_mode(&name_c, screen.size(), &mut stdout, &mut screen).await? {
-                            SessionListSelection::Switch(next_name) => {
-                                break AttachOutcome::SwitchTo(next_name);
+                        match run_session_list_mode(&session_id_c, screen.size(), &mut stdout, &mut screen).await? {
+                            SessionListSelection::Switch(next_session_id) => {
+                                break AttachOutcome::SwitchTo(next_session_id);
                             }
                             SessionListSelection::Close | SessionListSelection::Error(_) => {
                                 screen.force_redraw();
@@ -1019,12 +1056,12 @@ fn spawn_attach_input_reader(
 }
 
 async fn run_session_list_mode<W: Write>(
-    current_name: &str,
+    current_session_id: &str,
     term_size: (u16, u16),
     stdout: &mut W,
     screen: &mut term::TermScreen,
 ) -> anyhow::Result<SessionListSelection> {
-    let mut rows = build_session_list_rows(&list_sessions().await?, current_name);
+    let mut rows = build_session_list_rows(&list_sessions().await?, current_session_id);
     let mut selected = rows
         .iter()
         .position(|row| row.is_current)
@@ -1052,7 +1089,7 @@ async fn run_session_list_mode<W: Write>(
                     continue;
                 }
 
-                rows = build_session_list_rows(&list_sessions().await?, current_name);
+                rows = build_session_list_rows(&list_sessions().await?, current_session_id);
                 if rows.is_empty() {
                     selected = 0;
                     status = "no sessions".to_string();
@@ -1119,21 +1156,25 @@ fn render_session_list<W: Write>(
 ) -> std::io::Result<()> {
     let (cols, rows_count) = term_size;
     write!(out, "\x1b[?2026h\x1b[2J\x1b[H")?;
-    writeln!(out, "qscreen sessions")?;
-    writeln!(out, "Use Up/Down or k/j, Enter to switch, Esc/q to cancel")?;
-    writeln!(out)?;
+    write!(out, "qscreen sessions\r\n")?;
+    write!(
+        out,
+        "Use Up/Down or k/j, Enter to switch, Esc/q to cancel\r\n"
+    )?;
+    write!(out, "\r\n")?;
 
     if rows.is_empty() {
-        writeln!(out, "  no sessions")?;
+        write!(out, "  no sessions\r\n")?;
     } else {
         for (idx, row) in rows.iter().enumerate() {
             let selector = if idx == selected { ">" } else { " " };
             let current = if row.is_current { "*" } else { " " };
-            writeln!(
+            write!(
                 out,
-                "{} {} {:<24} {:<14} {:>8}",
+                "{} {} {:<4} {:<24} {:<14} {:>8}\r\n",
                 selector,
                 current,
+                truncate_for_terminal(&row.session_id, 4),
                 truncate_for_terminal(&row.name, 24),
                 truncate_for_terminal(&row.state, 14),
                 truncate_for_terminal(&row.size, 8)
@@ -1145,7 +1186,7 @@ fn render_session_list<W: Write>(
     if rows_count > used_lines + 1 {
         write!(out, "\x1b[{};1H", rows_count)?;
     } else {
-        writeln!(out)?;
+        write!(out, "\r\n")?;
     }
     let mut status_line = if status.is_empty() {
         "* marks current session".to_string()
@@ -1274,11 +1315,12 @@ async fn recv_msg(conn: &mut TcpConn) -> anyhow::Result<Message> {
     Message::from_json(&line).context("parse response")
 }
 
-async fn send_recv_ok(conn: &mut TcpConn, msg: Message) -> anyhow::Result<()> {
+async fn send_recv_ok(conn: &mut TcpConn, msg: Message) -> anyhow::Result<Message> {
     let id = msg.id.clone();
     send_msg(conn, msg).await?;
     let resp = recv_msg(conn).await?;
-    check_response(&resp, &id)
+    check_response(&resp, &id)?;
+    Ok(resp)
 }
 
 fn check_response(resp: &Message, want_id: &str) -> anyhow::Result<()> {
@@ -1430,8 +1472,16 @@ mod tests {
         crossterm::event::KeyEvent::new(KeyCode::Char(byte as char), KeyModifiers::NONE)
     }
 
-    fn session(name: &str, attached: bool, exited: bool, width: u32, height: u32) -> SessionInfo {
+    fn session(
+        session_id: &str,
+        name: &str,
+        attached: bool,
+        exited: bool,
+        width: u32,
+        height: u32,
+    ) -> SessionInfo {
         SessionInfo {
+            session_id: session_id.to_string(),
             name: name.to_string(),
             attached,
             exited,
@@ -1441,6 +1491,26 @@ mod tests {
             height,
             size: String::new(),
         }
+    }
+
+    #[test]
+    fn parse_new_options_accepts_name() {
+        let opts = parse_new_options(&[
+            "--name".to_string(),
+            "work".to_string(),
+            "--shell=cmd".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(opts.name.as_deref(), Some("work"));
+        assert_eq!(opts.shell.as_deref(), Some("cmd"));
+    }
+
+    #[test]
+    fn parse_new_options_rejects_positional_name() {
+        let err = parse_new_options(&["work".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Use --name <name>"), "{err}");
     }
 
     #[test]
@@ -1569,17 +1639,20 @@ mod tests {
     #[test]
     fn session_list_rows_sort_like_list_output_and_mark_current() {
         let sessions = vec![
-            session("zeta", false, false, 100, 40),
-            session("alpha", true, false, 80, 24),
-            session("mid", false, true, 120, 30),
+            session("3", "zeta", false, false, 100, 40),
+            session("1", "alpha", true, false, 80, 24),
+            session("2", "mid", false, true, 120, 30),
         ];
-        let rows = build_session_list_rows(&sessions, "alpha");
+        let rows = build_session_list_rows(&sessions, "1");
 
         assert_eq!(
-            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
-            vec!["alpha", "mid", "zeta"]
+            rows.iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "3"]
         );
         assert!(rows[0].is_current);
+        assert_eq!(rows[0].name, "alpha");
         assert_eq!(rows[0].state, "attached");
         assert_eq!(rows[0].size, "80x24");
         assert_eq!(rows[1].state, "exited(7)");
@@ -1588,9 +1661,9 @@ mod tests {
 
     #[test]
     fn session_list_rows_prefer_protocol_size_label() {
-        let mut info = session("work", false, false, 80, 24);
+        let mut info = session("1", "work", false, false, 80, 24);
         info.size = "132x43".to_string();
-        let rows = build_session_list_rows(&[info], "main");
+        let rows = build_session_list_rows(&[info], "2");
 
         assert_eq!(rows[0].size, "132x43");
     }
@@ -1599,12 +1672,12 @@ mod tests {
     fn selection_rules_cover_current_exited_attached_and_attachable() {
         let rows = build_session_list_rows(
             &[
-                session("current", true, false, 80, 24),
-                session("done", false, true, 80, 24),
-                session("busy", true, false, 80, 24),
-                session("next", false, false, 80, 24),
+                session("1", "current", true, false, 80, 24),
+                session("2", "done", false, true, 80, 24),
+                session("3", "busy", true, false, 80, 24),
+                session("4", "next", false, false, 80, 24),
             ],
-            "current",
+            "1",
         );
 
         assert_eq!(
@@ -1613,27 +1686,27 @@ mod tests {
         );
         assert_eq!(
             selection_for_session_row(rows.iter().find(|row| row.name == "done").unwrap()),
-            SessionListSelection::Error(exited_session_error("done"))
+            SessionListSelection::Error(exited_session_error("2"))
         );
         assert_eq!(
             selection_for_session_row(rows.iter().find(|row| row.name == "busy").unwrap()),
-            SessionListSelection::Switch("busy".to_string())
+            SessionListSelection::Switch("3".to_string())
         );
         assert_eq!(
             selection_for_session_row(rows.iter().find(|row| row.name == "next").unwrap()),
-            SessionListSelection::Switch("next".to_string())
+            SessionListSelection::Switch("4".to_string())
         );
     }
 
     #[test]
     fn format_session_line_uses_attached_bool_for_live_sessions() {
         assert_eq!(
-            format_session_line(&session("work", true, false, 100, 30)),
-            "work\tattached\t-\t100x30"
+            format_session_line(&session("1", "work", true, false, 100, 30)),
+            "1\twork\tattached\t-\t100x30"
         );
         assert_eq!(
-            format_session_line(&session("idle", false, false, 80, 24)),
-            "idle\tdetached\t-\t80x24"
+            format_session_line(&session("2", "idle", false, false, 80, 24)),
+            "2\tidle\tdetached\t-\t80x24"
         );
     }
 
@@ -1650,10 +1723,10 @@ mod tests {
     fn render_session_list_shows_current_marker_selection_and_status() {
         let rows = build_session_list_rows(
             &[
-                session("main", true, false, 80, 24),
-                session("work", false, false, 100, 30),
+                session("1", "main", true, false, 80, 24),
+                session("2", "work", false, false, 100, 30),
             ],
-            "main",
+            "1",
         );
         let mut out = Vec::new();
 
@@ -1661,9 +1734,24 @@ mod tests {
 
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("qscreen sessions"));
-        assert!(text.contains("  * main"));
-        assert!(text.contains(">   work"));
+        assert!(text.contains("  * 1    main"));
+        assert!(text.contains(">   2    work"));
         assert!(text.contains("ready"));
+    }
+
+    #[test]
+    fn render_session_list_uses_crlf_in_raw_mode() {
+        let rows = build_session_list_rows(&[session("1", "main", true, false, 80, 24)], "1");
+        let mut out = Vec::new();
+
+        render_session_list(&mut out, &rows, 0, "", (80, 24)).unwrap();
+
+        for (idx, byte) in out.iter().enumerate() {
+            if *byte == b'\n' {
+                assert_eq!(idx.checked_sub(1).map(|prev| out[prev]), Some(b'\r'));
+            }
+        }
+        assert!(out.windows(2).any(|window| window == b"\r\n"));
     }
 
     #[test]

@@ -2,4 +2,6 @@
 Thumbs.db
 
 /target/
+/worktrees/
+
 

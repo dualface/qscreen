@@ -35,6 +35,7 @@ pub enum Command {
     Attach,
     Detach,
     Focus,
+    Rename,
     Input,
     Resize,
     Kill,
@@ -52,6 +53,8 @@ pub enum EventType {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionInfo {
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub session_id: String,
     pub name: String,
     pub attached: bool,
     pub exited: bool,
@@ -74,6 +77,7 @@ pub struct Message {
     pub id: String,
     pub command: Option<Command>,
     pub event: Option<EventType>,
+    pub session_id: String,
     pub name: String,
     pub shell: String,
     pub width: u32,
@@ -96,6 +100,8 @@ struct WireMessage {
     command: Option<Command>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     event: Option<EventType>,
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    session_id: String,
     #[serde(skip_serializing_if = "String::is_empty", default)]
     name: String,
     #[serde(skip_serializing_if = "String::is_empty", default)]
@@ -147,6 +153,7 @@ impl Message {
             id: self.id.clone(),
             command: self.command.clone(),
             event: self.event.clone(),
+            session_id: self.session_id.clone(),
             name: self.name.clone(),
             shell: self.shell.clone(),
             width: self.width,
@@ -191,6 +198,7 @@ impl Message {
             id: wire.id,
             command: wire.command,
             event: wire.event,
+            session_id: wire.session_id,
             name: wire.name,
             shell: wire.shell,
             width: wire.width,
@@ -218,6 +226,19 @@ pub fn validate_session_name(name: &str) -> anyhow::Result<()> {
             continue;
         }
         anyhow::bail!("session name must match ^[A-Za-z0-9._-]{{1,64}}$");
+    }
+    Ok(())
+}
+
+pub fn validate_session_id(session_id: &str) -> anyhow::Result<()> {
+    if session_id.is_empty() {
+        anyhow::bail!("session_id is required");
+    }
+    if session_id.len() > 20 || !session_id.chars().all(|c| c.is_ascii_digit()) {
+        anyhow::bail!("session_id must match ^[0-9]{{1,20}}$");
+    }
+    if session_id == "0" {
+        anyhow::bail!("session_id must be greater than 0");
     }
     Ok(())
 }
@@ -259,20 +280,16 @@ pub fn validate_new_size(width: u32, height: u32) -> anyhow::Result<()> {
 
 // ── 错误消息 helper（与 Go 版本字符串一致）───────────────────────────────────
 
-pub fn duplicate_session_error(name: &str) -> String {
-    format!("session {:?} already exists", name)
+pub fn missing_session_error(session_id: &str) -> String {
+    format!("session_id {:?} not found", session_id)
 }
 
-pub fn missing_session_error(name: &str) -> String {
-    format!("session {:?} not found", name)
+pub fn exited_session_error(session_id: &str) -> String {
+    format!("session_id {:?} has exited", session_id)
 }
 
-pub fn exited_session_error(name: &str) -> String {
-    format!("session {:?} has exited", name)
-}
-
-pub fn attached_session_error(name: &str) -> String {
-    format!("session {:?} is already attached", name)
+pub fn attached_session_error(session_id: &str) -> String {
+    format!("session_id {:?} is already attached", session_id)
 }
 
 // ── 单元测试 ──────────────────────────────────────────────────────────────────
@@ -287,6 +304,7 @@ mod tests {
             kind: MessageKind::Request,
             id: "1".to_string(),
             command: Some(Command::New),
+            session_id: "42".to_string(),
             name: "test".to_string(),
             shell: "cmd".to_string(),
             width: 80,
@@ -298,6 +316,7 @@ mod tests {
         assert_eq!(decoded.kind, MessageKind::Request);
         assert_eq!(decoded.id, "1");
         assert_eq!(decoded.command, Some(Command::New));
+        assert_eq!(decoded.session_id, "42");
         assert_eq!(decoded.name, "test");
         assert_eq!(decoded.shell, "cmd");
         assert_eq!(decoded.width, 80);
@@ -324,7 +343,7 @@ mod tests {
             kind: MessageKind::Request,
             id: "focus-1".to_string(),
             command: Some(Command::Focus),
-            name: "test".to_string(),
+            session_id: "1".to_string(),
             ..Default::default()
         };
         let line = msg.to_json_line().unwrap();
@@ -332,6 +351,25 @@ mod tests {
         assert!(json_str.contains(r#""command":"focus""#));
         let decoded = Message::from_json(json_str).unwrap();
         assert_eq!(decoded.command, Some(Command::Focus));
+        assert_eq!(decoded.session_id, "1");
+    }
+
+    #[test]
+    fn round_trip_rename_command() {
+        let msg = Message {
+            kind: MessageKind::Request,
+            id: "rename-1".to_string(),
+            command: Some(Command::Rename),
+            session_id: "1".to_string(),
+            name: "work".to_string(),
+            ..Default::default()
+        };
+        let line = msg.to_json_line().unwrap();
+        let decoded = Message::from_json(std::str::from_utf8(&line).unwrap()).unwrap();
+
+        assert_eq!(decoded.command, Some(Command::Rename));
+        assert_eq!(decoded.session_id, "1");
+        assert_eq!(decoded.name, "work");
     }
 
     #[test]
@@ -395,9 +433,24 @@ mod tests {
     }
 
     #[test]
+    fn validate_session_id_ok() {
+        validate_session_id("1").unwrap();
+        validate_session_id("42").unwrap();
+    }
+
+    #[test]
+    fn validate_session_id_err() {
+        assert!(validate_session_id("").is_err());
+        assert!(validate_session_id("0").is_err());
+        assert!(validate_session_id("bad").is_err());
+        assert!(validate_session_id("1.2").is_err());
+        assert!(validate_session_id(&"1".repeat(21)).is_err());
+    }
+
+    #[test]
     fn validate_attach_size_rejects_missing_width() {
         let msg = Message::from_json(
-            r#"{"kind":"request","id":"1","command":"attach","name":"main","height":24}"#,
+            r#"{"kind":"request","id":"1","command":"attach","session_id":"1","height":24}"#,
         )
         .unwrap();
         assert!(validate_attach_size(msg.width, msg.height).is_err());
@@ -406,7 +459,7 @@ mod tests {
     #[test]
     fn validate_attach_size_rejects_missing_height() {
         let msg = Message::from_json(
-            r#"{"kind":"request","id":"1","command":"attach","name":"main","width":80}"#,
+            r#"{"kind":"request","id":"1","command":"attach","session_id":"1","width":80}"#,
         )
         .unwrap();
         assert!(validate_attach_size(msg.width, msg.height).is_err());

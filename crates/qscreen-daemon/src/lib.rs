@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use qscreen_protocol::{
     Command, EventType, MAX_PAYLOAD_SIZE, Message, MessageKind, SessionInfo,
-    attached_session_error, duplicate_session_error, exited_session_error, missing_session_error,
-    validate_attach_size, validate_new_size, validate_resize, validate_session_name,
+    attached_session_error, exited_session_error, missing_session_error, validate_attach_size,
+    validate_new_size, validate_resize, validate_session_id, validate_session_name,
 };
 use qscreen_shared::pipe_name;
 use session::{Session, SessionEvent};
@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 struct State {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    next_session_id: Mutex<u64>,
     stop_tx: watch::Sender<bool>,
 }
 
@@ -25,18 +26,30 @@ impl State {
     fn new(stop_tx: watch::Sender<bool>) -> Self {
         State {
             sessions: Mutex::new(HashMap::new()),
+            next_session_id: Mutex::new(1),
             stop_tx,
         }
     }
 
-    fn get_session(&self, name: &str) -> Option<Arc<Session>> {
-        self.sessions.lock().unwrap().get(name).cloned()
+    fn get_session(&self, session_id: &str) -> Option<Arc<Session>> {
+        self.sessions.lock().unwrap().get(session_id).cloned()
+    }
+
+    fn allocate_session_id(&self) -> String {
+        let mut next = self.next_session_id.lock().unwrap();
+        loop {
+            let session_id = next.to_string();
+            *next = next.saturating_add(1);
+            if !self.sessions.lock().unwrap().contains_key(&session_id) {
+                return session_id;
+            }
+        }
     }
 
     fn list_sessions(&self) -> Vec<SessionInfo> {
         let guard = self.sessions.lock().unwrap();
         let mut infos: Vec<SessionInfo> = guard.values().map(|s| session_info(s)).collect();
-        infos.sort_by(|a, b| a.name.cmp(&b.name));
+        infos.sort_by_key(|info| info.session_id.parse::<u64>().unwrap_or(u64::MAX));
         infos
     }
 
@@ -62,7 +75,8 @@ fn session_info(s: &Session) -> SessionInfo {
     let w = s.width() as u32;
     let h = s.height() as u32;
     SessionInfo {
-        name: s.name.clone(),
+        session_id: s.session_id.clone(),
+        name: s.name(),
         attached: s.is_attached(),
         exited: s.exited.load(std::sync::atomic::Ordering::SeqCst),
         exit_code: s.exit_code.lock().unwrap().unwrap_or(0) as i64,
@@ -235,6 +249,7 @@ async fn dispatch_command(msg: &Message, state: &State) -> Message {
         Err(e) => Message {
             kind: MessageKind::Response,
             id,
+            session_id: msg.session_id.clone(),
             error: e.to_string(),
             ..Default::default()
         },
@@ -244,30 +259,33 @@ async fn dispatch_command(msg: &Message, state: &State) -> Message {
 async fn dispatch_inner(msg: &Message, state: &State) -> anyhow::Result<Message> {
     match &msg.command {
         Some(Command::New) => {
-            validate_session_name(&msg.name)?;
             validate_new_size(msg.width, msg.height)?;
-            {
-                let guard = state.sessions.lock().unwrap();
-                if let Some(existing) = guard.get(&msg.name)
-                    && !existing.exited.load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    anyhow::bail!("{}", duplicate_session_error(&msg.name));
-                }
+            if !msg.name.is_empty() {
+                validate_session_name(&msg.name)?;
             }
+            let session_id = state.allocate_session_id();
+            let session_name = if msg.name.is_empty() {
+                session_id.clone()
+            } else {
+                msg.name.clone()
+            };
             let sess = Session::new(
-                msg.name.clone(),
+                session_id.clone(),
+                session_name.clone(),
                 msg.width,
                 msg.height,
                 Some(msg.shell.as_str()),
             )?;
-            tracing::info!(session = %msg.name, "session created");
+            tracing::info!(session_id = %session_id, session = %session_name, "session created");
             state
                 .sessions
                 .lock()
                 .unwrap()
-                .insert(msg.name.clone(), sess);
+                .insert(session_id.clone(), sess);
             Ok(Message {
                 kind: MessageKind::Response,
+                session_id,
+                name: session_name,
                 ok: true,
                 ..Default::default()
             })
@@ -281,15 +299,34 @@ async fn dispatch_inner(msg: &Message, state: &State) -> anyhow::Result<Message>
         }),
 
         Some(Command::Kill) => {
-            validate_session_name(&msg.name)?;
+            validate_session_id(&msg.session_id)?;
             let sess = state
-                .get_session(&msg.name)
-                .ok_or_else(|| anyhow::anyhow!("{}", missing_session_error(&msg.name)))?;
+                .get_session(&msg.session_id)
+                .ok_or_else(|| anyhow::anyhow!("{}", missing_session_error(&msg.session_id)))?;
+            let session_name = sess.name();
             sess.close();
-            state.sessions.lock().unwrap().remove(&msg.name);
-            tracing::info!(session = %msg.name, "session killed");
+            state.sessions.lock().unwrap().remove(&msg.session_id);
+            tracing::info!(session_id = %msg.session_id, session = %session_name, "session killed");
             Ok(Message {
                 kind: MessageKind::Response,
+                session_id: msg.session_id.clone(),
+                ok: true,
+                ..Default::default()
+            })
+        }
+
+        Some(Command::Rename) => {
+            validate_session_id(&msg.session_id)?;
+            validate_session_name(&msg.name)?;
+            let sess = state
+                .get_session(&msg.session_id)
+                .ok_or_else(|| anyhow::anyhow!("{}", missing_session_error(&msg.session_id)))?;
+            sess.rename(msg.name.clone());
+            tracing::info!(session_id = %msg.session_id, session = %msg.name, "session renamed");
+            Ok(Message {
+                kind: MessageKind::Response,
+                session_id: msg.session_id.clone(),
+                name: msg.name.clone(),
                 ok: true,
                 ..Default::default()
             })
@@ -301,35 +338,37 @@ async fn dispatch_inner(msg: &Message, state: &State) -> anyhow::Result<Message>
             tracing::info!("daemon stop requested");
             Ok(Message {
                 kind: MessageKind::Response,
+                session_id: msg.session_id.clone(),
                 ok: true,
                 ..Default::default()
             })
         }
 
         Some(Command::Input) => {
-            validate_session_name(&msg.name)?;
+            validate_session_id(&msg.session_id)?;
             let sess = state
-                .get_session(&msg.name)
-                .ok_or_else(|| anyhow::anyhow!("{}", missing_session_error(&msg.name)))?;
+                .get_session(&msg.session_id)
+                .ok_or_else(|| anyhow::anyhow!("{}", missing_session_error(&msg.session_id)))?;
             if !msg.payload.is_empty() {
                 sess.write_input(&msg.payload)
-                    .map_err(|e| session_error(&msg.name, e))?;
+                    .map_err(|e| session_error(&msg.session_id, e))?;
             }
             Ok(Message {
                 kind: MessageKind::Response,
+                session_id: msg.session_id.clone(),
                 ok: true,
                 ..Default::default()
             })
         }
 
         Some(Command::Resize) => {
-            validate_session_name(&msg.name)?;
+            validate_session_id(&msg.session_id)?;
             validate_resize(msg.width, msg.height)?;
             let sess = state
-                .get_session(&msg.name)
-                .ok_or_else(|| anyhow::anyhow!("{}", missing_session_error(&msg.name)))?;
+                .get_session(&msg.session_id)
+                .ok_or_else(|| anyhow::anyhow!("{}", missing_session_error(&msg.session_id)))?;
             sess.resize(msg.width, msg.height)
-                .map_err(|e| session_error(&msg.name, e))?;
+                .map_err(|e| session_error(&msg.session_id, e))?;
             Ok(Message {
                 kind: MessageKind::Response,
                 ok: true,
@@ -351,11 +390,11 @@ async fn handle_attach<R, W>(
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let session_name = msg.name.clone();
+    let session_id = msg.session_id.clone();
     let attach_id = msg.id.clone();
 
-    // 校验名称
-    if let Err(e) = validate_session_name(&session_name) {
+    // 校验 session_id
+    if let Err(e) = validate_session_id(&session_id) {
         let resp = Message {
             kind: MessageKind::Response,
             id: attach_id,
@@ -386,13 +425,13 @@ async fn handle_attach<R, W>(
     }
 
     // 获取 session
-    let sess = match state.get_session(&session_name) {
+    let sess = match state.get_session(&session_id) {
         Some(s) => s,
         None => {
             let resp = Message {
                 kind: MessageKind::Response,
                 id: attach_id,
-                error: missing_session_error(&session_name),
+                error: missing_session_error(&session_id),
                 ..Default::default()
             };
             let _ = writer
@@ -412,7 +451,7 @@ async fn handle_attach<R, W>(
             let resp = Message {
                 kind: MessageKind::Response,
                 id: attach_id,
-                error: session_error(&session_name, e).to_string(),
+                error: session_error(&session_id, e).to_string(),
                 ..Default::default()
             };
             let _ = writer
@@ -424,12 +463,15 @@ async fn handle_attach<R, W>(
         }
     };
 
-    tracing::info!(session = %session_name, client_id, "client attached");
+    let attached_name = sess.name();
+    tracing::info!(session_id = %session_id, session = %attached_name, client_id, "client attached");
 
     // 发送 attach 成功响应
     let ok_resp = Message {
         kind: MessageKind::Response,
         id: attach_id,
+        session_id: session_id.clone(),
+        name: attached_name,
         ok: true,
         ..Default::default()
     };
@@ -453,6 +495,7 @@ async fn handle_attach<R, W>(
         let event = Message {
             kind: MessageKind::Event,
             event: Some(EventType::Output),
+            session_id: session_id.clone(),
             payload: chunk,
             ..Default::default()
         };
@@ -472,19 +515,22 @@ async fn handle_attach<R, W>(
     let (writer_done_tx, mut writer_done_rx) = oneshot::channel::<()>();
     let writer_task_handle = {
         let writer_c = writer.clone();
-        let name_c = session_name.clone();
+        let session_id_c = session_id.clone();
+        let name_c = sess.name();
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 let msg = match event {
                     SessionEvent::Output(data) => Message {
                         kind: MessageKind::Event,
                         event: Some(EventType::Output),
+                        session_id: session_id_c.clone(),
                         payload: data.to_vec(),
                         ..Default::default()
                     },
                     SessionEvent::Exit(code) => Message {
                         kind: MessageKind::Event,
                         event: Some(EventType::Exit),
+                        session_id: session_id_c.clone(),
                         exit_code: code as i64,
                         ..Default::default()
                     },
@@ -498,7 +544,7 @@ async fn handle_attach<R, W>(
                     break;
                 }
             }
-            tracing::debug!(session = %name_c, "writer task ended");
+            tracing::debug!(session_id = %session_id_c, session = %name_c, "writer task ended");
             let _ = writer_done_tx.send(());
         })
     };
@@ -520,19 +566,30 @@ async fn handle_attach<R, W>(
         let cmd = match Message::from_json(&line) {
             Ok(m) => m,
             Err(e) => {
-                tracing::debug!(session = %session_name, "parse error: {}", e);
+                tracing::debug!(session_id = %session_id, "parse error: {}", e);
                 break;
             }
         };
 
+        if cmd.session_id != session_id {
+            tracing::debug!(
+                session_id = %session_id,
+                got_session_id = %cmd.session_id,
+                "attach stream command had mismatched session_id"
+            );
+            break;
+        }
+
         match &cmd.command {
             Some(Command::Focus) => {
                 if let Err(e) = sess.focus_client(client_id) {
-                    tracing::debug!(session = %session_name, client_id, "focus error: {}", e);
+                    let session_name = sess.name();
+                    tracing::debug!(session_id = %session_id, session = %session_name, client_id, "focus error: {}", e);
                 }
                 let resp = Message {
                     kind: MessageKind::Response,
                     id: cmd.id.clone(),
+                    session_id: session_id.clone(),
                     ok: true,
                     ..Default::default()
                 };
@@ -548,12 +605,14 @@ async fn handle_attach<R, W>(
             }
             Some(Command::Input) => {
                 if let Err(e) = sess.input_client(client_id, &cmd.payload) {
-                    tracing::debug!(session = %session_name, "write input error: {}", e);
+                    let session_name = sess.name();
+                    tracing::debug!(session_id = %session_id, session = %session_name, "write input error: {}", e);
                 }
                 // 兼容 Go 协议：input 也发 ok 响应
                 let resp = Message {
                     kind: MessageKind::Response,
                     id: cmd.id.clone(),
+                    session_id: session_id.clone(),
                     ok: true,
                     ..Default::default()
                 };
@@ -574,6 +633,7 @@ async fn handle_attach<R, W>(
                 let resp = Message {
                     kind: MessageKind::Response,
                     id: cmd.id.clone(),
+                    session_id: session_id.clone(),
                     ok: true,
                     ..Default::default()
                 };
@@ -592,6 +652,7 @@ async fn handle_attach<R, W>(
                 let resp = Message {
                     kind: MessageKind::Response,
                     id: cmd.id.clone(),
+                    session_id: session_id.clone(),
                     ok: true,
                     ..Default::default()
                 };
@@ -600,7 +661,8 @@ async fn handle_attach<R, W>(
                     .await
                     .write_all(&resp.to_json_line().unwrap_or_default())
                     .await;
-                tracing::info!(session = %session_name, client_id, "client detached");
+                let session_name = sess.name();
+                tracing::info!(session_id = %session_id, session = %session_name, client_id, "client detached");
                 writer_task_handle.abort();
                 return;
             }
@@ -610,15 +672,16 @@ async fn handle_attach<R, W>(
 
     sess.detach(client_id);
     writer_task_handle.abort();
-    tracing::debug!(session = %session_name, client_id, "client disconnected");
+    let session_name = sess.name();
+    tracing::debug!(session_id = %session_id, session = %session_name, client_id, "client disconnected");
 }
 
-fn session_error(name: &str, e: anyhow::Error) -> anyhow::Error {
+fn session_error(session_id: &str, e: anyhow::Error) -> anyhow::Error {
     let msg = e.to_string();
     if msg.contains("already attached") {
-        anyhow::anyhow!("{}", attached_session_error(name))
+        anyhow::anyhow!("{}", attached_session_error(session_id))
     } else if msg.contains("exited") || msg.contains("closed") {
-        anyhow::anyhow!("{}", exited_session_error(name))
+        anyhow::anyhow!("{}", exited_session_error(session_id))
     } else {
         e
     }
@@ -634,13 +697,13 @@ mod tests {
         Arc::new(State::new(stop_tx))
     }
 
-    async fn insert_session(state: &State, name: &str) -> Arc<Session> {
-        let session = Session::new(name.to_string(), 80, 24, None).unwrap();
+    async fn insert_session(state: &State, session_id: &str, name: &str) -> Arc<Session> {
+        let session = Session::new(session_id.to_string(), name.to_string(), 80, 24, None).unwrap();
         state
             .sessions
             .lock()
             .unwrap()
-            .insert(name.to_string(), session.clone());
+            .insert(session_id.to_string(), session.clone());
         session
     }
 
@@ -656,7 +719,7 @@ mod tests {
 
     async fn attach_with_script(
         state: Arc<State>,
-        name: &str,
+        session_id: &str,
         attach_id: &str,
         attach_size: (u32, u32),
         commands: Vec<Message>,
@@ -669,7 +732,7 @@ mod tests {
             kind: MessageKind::Request,
             id: attach_id.to_string(),
             command: Some(Command::Attach),
-            name: name.to_string(),
+            session_id: session_id.to_string(),
             width: attach_size.0,
             height: attach_size.1,
             ..Default::default()
@@ -701,9 +764,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_new_assigns_incrementing_session_ids_and_default_name() {
+        let state = test_state();
+
+        let first = dispatch_command(
+            &Message {
+                kind: MessageKind::Request,
+                id: "new-1".to_string(),
+                command: Some(Command::New),
+                width: 80,
+                height: 24,
+                ..Default::default()
+            },
+            &state,
+        )
+        .await;
+        assert!(first.ok);
+        assert_eq!(first.session_id, "1");
+        assert_eq!(first.name, "1");
+
+        let second = dispatch_command(
+            &Message {
+                kind: MessageKind::Request,
+                id: "new-2".to_string(),
+                command: Some(Command::New),
+                name: "work".to_string(),
+                width: 100,
+                height: 30,
+                ..Default::default()
+            },
+            &state,
+        )
+        .await;
+        assert!(second.ok);
+        assert_eq!(second.session_id, "2");
+        assert_eq!(second.name, "work");
+
+        let third = dispatch_command(
+            &Message {
+                kind: MessageKind::Request,
+                id: "new-3".to_string(),
+                command: Some(Command::New),
+                name: "work".to_string(),
+                width: 120,
+                height: 40,
+                ..Default::default()
+            },
+            &state,
+        )
+        .await;
+        assert!(third.ok);
+        assert_eq!(third.session_id, "3");
+        assert_eq!(third.name, "work");
+
+        let infos = state.list_sessions();
+        assert_eq!(
+            infos
+                .iter()
+                .map(|info| (info.session_id.as_str(), info.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("1", "1"), ("2", "work"), ("3", "work")]
+        );
+
+        state.kill_all();
+    }
+
+    #[tokio::test]
+    async fn dispatch_rename_changes_display_name_by_session_id() {
+        let state = test_state();
+        let session = insert_session(&state, "1", "old").await;
+
+        let response = dispatch_command(
+            &Message {
+                kind: MessageKind::Request,
+                id: "rename-1".to_string(),
+                command: Some(Command::Rename),
+                session_id: "1".to_string(),
+                name: "new".to_string(),
+                ..Default::default()
+            },
+            &state,
+        )
+        .await;
+
+        assert!(response.ok);
+        assert_eq!(response.session_id, "1");
+        assert_eq!(response.name, "new");
+        assert_eq!(session.name(), "new");
+        assert_eq!(state.list_sessions()[0].name, "new");
+
+        session.close();
+    }
+
+    #[tokio::test]
     async fn handle_attach_allows_second_client_and_reports_attached_in_list() {
         let state = test_state();
-        let session = insert_session(&state, "work").await;
+        let session = insert_session(&state, "1", "work").await;
 
         let (client, server) = tokio::io::duplex(4096);
         let handle = tokio::spawn(handle_connection(server, state.clone()));
@@ -713,7 +869,7 @@ mod tests {
             kind: MessageKind::Request,
             id: "attach-1".to_string(),
             command: Some(Command::Attach),
-            name: "work".to_string(),
+            session_id: "1".to_string(),
             width: 80,
             height: 24,
             ..Default::default()
@@ -728,8 +884,7 @@ mod tests {
         let response = Message::from_json(&line).unwrap();
         assert!(response.ok);
 
-        let messages =
-            attach_with_script(state.clone(), "work", "attach-2", (100, 30), vec![]).await;
+        let messages = attach_with_script(state.clone(), "1", "attach-2", (100, 30), vec![]).await;
 
         assert!(messages[0].ok);
         assert_eq!(session.attached_clients.lock().unwrap().len(), 1);
@@ -743,20 +898,20 @@ mod tests {
     #[tokio::test]
     async fn handle_attach_detach_removes_only_that_client() {
         let state = test_state();
-        let session = insert_session(&state, "work").await;
+        let session = insert_session(&state, "1", "work").await;
         let (tx, _rx) = mpsc::unbounded_channel();
         let (kept_client, _) = session.attach(tx, 80, 24).unwrap();
 
         let messages = attach_with_script(
             state.clone(),
-            "work",
+            "1",
             "attach-1",
             (100, 30),
             vec![Message {
                 kind: MessageKind::Request,
                 id: "detach-1".to_string(),
                 command: Some(Command::Detach),
-                name: "work".to_string(),
+                session_id: "1".to_string(),
                 ..Default::default()
             }],
         )
@@ -775,7 +930,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_kill_notifies_all_attached_clients_and_removes_session() {
         let state = test_state();
-        let session = insert_session(&state, "work").await;
+        let session = insert_session(&state, "1", "work").await;
         let (tx1, mut rx1) = mpsc::unbounded_channel();
         let (tx2, mut rx2) = mpsc::unbounded_channel();
 
@@ -787,7 +942,7 @@ mod tests {
                 kind: MessageKind::Request,
                 id: "kill-1".to_string(),
                 command: Some(Command::Kill),
-                name: "work".to_string(),
+                session_id: "1".to_string(),
                 ..Default::default()
             },
             &state,
@@ -796,7 +951,7 @@ mod tests {
 
         assert!(response.ok);
         assert_eq!(response.id, "kill-1");
-        assert!(state.get_session("work").is_none());
+        assert!(state.get_session("1").is_none());
         assert_eq!(recv_exit(&mut rx1), -1);
         assert_eq!(recv_exit(&mut rx2), -1);
         assert!(!session.is_attached());
@@ -805,7 +960,7 @@ mod tests {
     #[tokio::test]
     async fn handle_attach_focus_applies_attached_client_size() {
         let state = test_state();
-        let session = insert_session(&state, "work").await;
+        let session = insert_session(&state, "1", "work").await;
         let (tx, _rx) = mpsc::unbounded_channel();
         let (first_client, _) = session.attach(tx, 80, 24).unwrap();
 
@@ -818,7 +973,7 @@ mod tests {
             kind: MessageKind::Request,
             id: "attach-1".to_string(),
             command: Some(Command::Attach),
-            name: "work".to_string(),
+            session_id: "1".to_string(),
             width: 100,
             height: 30,
             ..Default::default()
@@ -837,7 +992,7 @@ mod tests {
             kind: MessageKind::Request,
             id: "resize-1".to_string(),
             command: Some(Command::Resize),
-            name: "work".to_string(),
+            session_id: "1".to_string(),
             width: 120,
             height: 40,
             ..Default::default()
@@ -863,7 +1018,7 @@ mod tests {
             kind: MessageKind::Request,
             id: "focus-1".to_string(),
             command: Some(Command::Focus),
-            name: "work".to_string(),
+            session_id: "1".to_string(),
             ..Default::default()
         };
         reader
