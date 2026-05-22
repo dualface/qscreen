@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -13,9 +13,10 @@ use qscreen_protocol::{
     FRAME_FLAG_ITALIC, FRAME_FLAG_STRIKETHROUGH, FRAME_FLAG_UNDERLINE, FrameColor, ScreenFrame,
     ScreenRun,
 };
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
 pub const SCROLLBACK_LIMIT: usize = 256 * 1024;
+const FRAME_CHANNEL_CAPACITY: usize = 16;
 const DEFAULT_WIDTH: u16 = 80;
 const DEFAULT_HEIGHT: u16 = 24;
 #[cfg(any(windows, test))]
@@ -34,9 +35,55 @@ pub enum SessionEvent {
 }
 
 pub struct AttachedClient {
-    pub tx: mpsc::UnboundedSender<SessionEvent>,
+    pub queue: Arc<SessionEventQueue>,
     pub width: u16,
     pub height: u16,
+}
+
+pub struct SessionEventQueue {
+    inner: Mutex<VecDeque<SessionEvent>>,
+    notify: Notify,
+}
+
+impl SessionEventQueue {
+    pub fn new() -> Arc<Self> {
+        Arc::new(SessionEventQueue {
+            inner: Mutex::new(VecDeque::with_capacity(FRAME_CHANNEL_CAPACITY)),
+            notify: Notify::new(),
+        })
+    }
+
+    pub async fn recv(&self) -> SessionEvent {
+        loop {
+            if let Some(event) = self.inner.lock().unwrap().pop_front() {
+                return event;
+            }
+            self.notify.notified().await;
+        }
+    }
+
+    fn push_frame(&self, frame: ScreenFrame) {
+        let mut queue = self.inner.lock().unwrap();
+        if queue.len() >= FRAME_CHANNEL_CAPACITY {
+            queue.clear();
+        }
+        queue.push_back(SessionEvent::Frame(frame));
+        drop(queue);
+        self.notify.notify_one();
+    }
+
+    fn push_exit(&self, code: i32) {
+        let mut queue = self.inner.lock().unwrap();
+        queue.clear();
+        queue.push_back(SessionEvent::Exit(code));
+        drop(queue);
+        self.notify.notify_one();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_recv(&self) -> Option<SessionEvent> {
+        self.inner.lock().unwrap().pop_front()
+    }
 }
 
 /// 256KB 环形 scrollback buffer（字节级）
@@ -190,7 +237,7 @@ impl Session {
                 exited_e.store(true, Ordering::SeqCst);
                 let mut attached = attached_e.lock().unwrap();
                 for (_, client) in attached.drain() {
-                    let _ = client.tx.send(SessionEvent::Exit(code));
+                    client.queue.push_exit(code);
                 }
                 *active_client_e.lock().unwrap() = None;
             });
@@ -278,7 +325,7 @@ impl Session {
     /// 返回 Err 如果 session 已退出
     pub fn attach(
         &self,
-        tx: mpsc::UnboundedSender<SessionEvent>,
+        queue: Arc<SessionEventQueue>,
         width: u32,
         height: u32,
     ) -> anyhow::Result<(ClientId, ScreenFrame)> {
@@ -302,7 +349,7 @@ impl Session {
         guard.insert(
             client_id,
             AttachedClient {
-                tx,
+                queue,
                 width: w,
                 height: h,
             },
@@ -368,7 +415,7 @@ impl Session {
         // 通知已 attach 的客户端
         let mut attached = self.attached_clients.lock().unwrap();
         for (_, client) in attached.drain() {
-            let _ = client.tx.send(SessionEvent::Exit(-1));
+            client.queue.push_exit(-1);
         }
         *self.active_client_id.lock().unwrap() = None;
     }
@@ -616,33 +663,12 @@ fn spawn_coalesced_reader(
 
 fn broadcast_frame(
     attached_clients: &Arc<Mutex<HashMap<ClientId, AttachedClient>>>,
-    active_client_id: &Arc<Mutex<Option<ClientId>>>,
+    _active_client_id: &Arc<Mutex<Option<ClientId>>>,
     frame: ScreenFrame,
 ) {
-    let failed_clients = {
-        let attached = attached_clients.lock().unwrap();
-        attached
-            .iter()
-            .filter_map(|(client_id, client)| {
-                client
-                    .tx
-                    .send(SessionEvent::Frame(frame.clone()))
-                    .err()
-                    .map(|_| *client_id)
-            })
-            .collect::<Vec<_>>()
-    };
-    if failed_clients.is_empty() {
-        return;
-    }
-
-    let mut attached = attached_clients.lock().unwrap();
-    let mut active = active_client_id.lock().unwrap();
-    for client_id in failed_clients {
-        attached.remove(&client_id);
-        if *active == Some(client_id) {
-            *active = None;
-        }
+    let attached = attached_clients.lock().unwrap();
+    for client in attached.values() {
+        client.queue.push_frame(frame.clone());
     }
 }
 
@@ -750,9 +776,9 @@ mod tests {
         );
     }
 
-    fn recv_frame_matching(rx: &mut mpsc::UnboundedReceiver<SessionEvent>, expected: &str) {
+    fn recv_frame_matching(queue: &SessionEventQueue, expected: &str) {
         for _ in 0..16 {
-            match rx.try_recv().expect("expected session event") {
+            match queue.try_recv().expect("expected session event") {
                 SessionEvent::Frame(frame)
                     if frame
                         .rows_v2
@@ -769,9 +795,9 @@ mod tests {
         panic!("expected matching frame");
     }
 
-    fn recv_exit(rx: &mut mpsc::UnboundedReceiver<SessionEvent>) -> i32 {
+    fn recv_exit(queue: &SessionEventQueue) -> i32 {
         for _ in 0..16 {
-            match rx.try_recv().expect("expected session event") {
+            match queue.try_recv().expect("expected session event") {
                 SessionEvent::Frame(_) => {}
                 SessionEvent::Exit(code) => return code,
             }
@@ -783,11 +809,11 @@ mod tests {
     async fn attach_multiple_clients_and_detach_independently() {
         let session =
             Session::new("1".to_string(), "multi-detach".to_string(), 80, 24, None).unwrap();
-        let (tx1, _rx1) = mpsc::unbounded_channel();
-        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let queue1 = SessionEventQueue::new();
+        let queue2 = SessionEventQueue::new();
 
-        let (client1, frame1) = session.attach(tx1, 80, 24).unwrap();
-        let (client2, frame2) = session.attach(tx2, 100, 30).unwrap();
+        let (client1, frame1) = session.attach(queue1, 80, 24).unwrap();
+        let (client2, frame2) = session.attach(queue2, 100, 30).unwrap();
 
         assert_ne!(client1, client2);
         assert_eq!((frame1.cols, frame1.rows), (80, 24));
@@ -811,17 +837,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broadcast_frame_reaches_all_clients_and_removes_only_failed_senders() {
+    async fn broadcast_frame_reaches_all_clients() {
         let session =
             Session::new("1".to_string(), "multi-broadcast".to_string(), 80, 24, None).unwrap();
-        let (tx1, mut rx1) = mpsc::unbounded_channel();
-        let (tx2, rx2) = mpsc::unbounded_channel();
-        let (tx3, mut rx3) = mpsc::unbounded_channel();
+        let queue1 = SessionEventQueue::new();
+        let queue2 = SessionEventQueue::new();
+        let queue3 = SessionEventQueue::new();
 
-        let (client1, _) = session.attach(tx1, 80, 24).unwrap();
-        let (failed_client, _) = session.attach(tx2, 80, 24).unwrap();
-        let (client3, _) = session.attach(tx3, 80, 24).unwrap();
-        drop(rx2);
+        let (client1, _) = session.attach(queue1.clone(), 80, 24).unwrap();
+        let (_middle_client, _) = session.attach(queue2, 80, 24).unwrap();
+        let (client3, _) = session.attach(queue3.clone(), 80, 24).unwrap();
 
         let frame = ScreenFrame {
             rows: 1,
@@ -837,31 +862,56 @@ mod tests {
         };
         broadcast_frame(&session.attached_clients, &session.active_client_id, frame);
 
-        recv_frame_matching(&mut rx1, "chunk");
-        recv_frame_matching(&mut rx3, "chunk");
+        recv_frame_matching(&queue1, "chunk");
+        recv_frame_matching(&queue3, "chunk");
         let attached = session.attached_clients.lock().unwrap();
         assert!(attached.contains_key(&client1));
-        assert!(!attached.contains_key(&failed_client));
         assert!(attached.contains_key(&client3));
         drop(attached);
 
         session.close();
     }
 
+    #[test]
+    fn event_queue_drops_old_frames_when_full() {
+        let queue = SessionEventQueue::new();
+        for idx in 0..(FRAME_CHANNEL_CAPACITY + 2) {
+            queue.push_frame(ScreenFrame {
+                rows: 1,
+                cols: 1,
+                rows_v2: vec![vec![ScreenRun {
+                    text: idx.to_string(),
+                    fg: FrameColor::Default,
+                    bg: FrameColor::Default,
+                    flags: 0,
+                    width: 1,
+                }]],
+                ..Default::default()
+            });
+        }
+
+        let first = match queue.try_recv().unwrap() {
+            SessionEvent::Frame(frame) => frame.rows_v2[0][0].text.clone(),
+            SessionEvent::Exit(code) => panic!("expected frame, got exit {code}"),
+        };
+
+        assert_eq!(first, FRAME_CHANNEL_CAPACITY.to_string());
+    }
+
     #[tokio::test]
     async fn close_notifies_all_attached_clients() {
         let session =
             Session::new("1".to_string(), "multi-close".to_string(), 80, 24, None).unwrap();
-        let (tx1, mut rx1) = mpsc::unbounded_channel();
-        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let queue1 = SessionEventQueue::new();
+        let queue2 = SessionEventQueue::new();
 
-        let _ = session.attach(tx1, 80, 24).unwrap();
-        let _ = session.attach(tx2, 80, 24).unwrap();
+        let _ = session.attach(queue1.clone(), 80, 24).unwrap();
+        let _ = session.attach(queue2.clone(), 80, 24).unwrap();
 
         session.close();
 
-        assert_eq!(recv_exit(&mut rx1), -1);
-        assert_eq!(recv_exit(&mut rx2), -1);
+        assert_eq!(recv_exit(&queue1), -1);
+        assert_eq!(recv_exit(&queue2), -1);
         assert!(!session.is_attached());
         assert_eq!(*session.active_client_id.lock().unwrap(), None);
     }
@@ -870,11 +920,11 @@ mod tests {
     async fn inactive_resize_stores_size_without_pty_resize_until_focus_or_input() {
         let session =
             Session::new("1".to_string(), "multi-size".to_string(), 80, 24, None).unwrap();
-        let (tx1, _rx1) = mpsc::unbounded_channel();
-        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let queue1 = SessionEventQueue::new();
+        let queue2 = SessionEventQueue::new();
 
-        let (client1, _) = session.attach(tx1, 80, 24).unwrap();
-        let (client2, _) = session.attach(tx2, 100, 30).unwrap();
+        let (client1, _) = session.attach(queue1, 80, 24).unwrap();
+        let (client2, _) = session.attach(queue2, 100, 30).unwrap();
 
         assert_eq!(*session.active_client_id.lock().unwrap(), Some(client2));
         assert_eq!((session.width(), session.height()), (100, 30));
@@ -907,11 +957,11 @@ mod tests {
             None,
         )
         .unwrap();
-        let (tx1, _rx1) = mpsc::unbounded_channel();
-        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let queue1 = SessionEventQueue::new();
+        let queue2 = SessionEventQueue::new();
 
-        let (client1, _) = session.attach(tx1, 80, 24).unwrap();
-        let (client2, _) = session.attach(tx2, 100, 30).unwrap();
+        let (client1, _) = session.attach(queue1, 80, 24).unwrap();
+        let (client2, _) = session.attach(queue2, 100, 30).unwrap();
         session.resize_client(client1, 90, 20).unwrap();
 
         assert_eq!(*session.active_client_id.lock().unwrap(), Some(client2));
@@ -937,9 +987,9 @@ mod tests {
             let mut screen = session.screen.lock().unwrap();
             screen.process(b"\x1b[2J\x1b[Hcurrent");
         }
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let queue = SessionEventQueue::new();
 
-        let (_, frame) = session.attach(tx, 80, 24).unwrap();
+        let (_, frame) = session.attach(queue, 80, 24).unwrap();
         let frame_text = frame
             .rows_v2
             .iter()

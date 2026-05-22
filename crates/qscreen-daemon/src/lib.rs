@@ -10,9 +10,9 @@ use qscreen_protocol::{
     validate_resize, validate_session_id, validate_session_name,
 };
 use qscreen_shared::pipe_name;
-use session::{Session, SessionEvent};
+use session::{Session, SessionEvent, SessionEventQueue};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{oneshot, watch};
 
 // ── Daemon 共享状态 ───────────────────────────────────────────────────────────
 
@@ -443,9 +443,9 @@ async fn handle_attach<R, W>(
         }
     };
 
-    // 注册事件接收 channel
-    let (tx, mut rx) = mpsc::unbounded_channel::<SessionEvent>();
-    let (client_id, screen_frame) = match sess.attach(tx, msg.width, msg.height) {
+    // 注册事件接收 queue
+    let event_queue = SessionEventQueue::new();
+    let (client_id, screen_frame) = match sess.attach(event_queue.clone(), msg.width, msg.height) {
         Ok(result) => result,
         Err(e) => {
             let resp = Message {
@@ -513,7 +513,8 @@ async fn handle_attach<R, W>(
         let session_id_c = session_id.clone();
         let name_c = sess.name();
         tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
+            loop {
+                let event = event_queue.recv().await;
                 let msg = match event {
                     SessionEvent::Frame(frame) => Message {
                         kind: MessageKind::Event,
@@ -708,9 +709,9 @@ mod tests {
         session
     }
 
-    fn recv_exit(rx: &mut mpsc::UnboundedReceiver<SessionEvent>) -> i32 {
+    fn recv_exit(queue: &SessionEventQueue) -> i32 {
         for _ in 0..16 {
-            match rx.try_recv().expect("expected session event") {
+            match queue.try_recv().expect("expected session event") {
                 SessionEvent::Frame(_) => {}
                 SessionEvent::Exit(code) => return code,
             }
@@ -912,8 +913,8 @@ mod tests {
     async fn handle_attach_detach_removes_only_that_client() {
         let state = test_state();
         let session = insert_session(&state, "1", "work").await;
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let (kept_client, _) = session.attach(tx, 80, 24).unwrap();
+        let queue = SessionEventQueue::new();
+        let (kept_client, _) = session.attach(queue, 80, 24).unwrap();
 
         let messages = attach_with_script(
             state.clone(),
@@ -944,11 +945,11 @@ mod tests {
     async fn dispatch_kill_notifies_all_attached_clients_and_removes_session() {
         let state = test_state();
         let session = insert_session(&state, "1", "work").await;
-        let (tx1, mut rx1) = mpsc::unbounded_channel();
-        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let queue1 = SessionEventQueue::new();
+        let queue2 = SessionEventQueue::new();
 
-        let _ = session.attach(tx1, 80, 24).unwrap();
-        let _ = session.attach(tx2, 100, 30).unwrap();
+        let _ = session.attach(queue1.clone(), 80, 24).unwrap();
+        let _ = session.attach(queue2.clone(), 100, 30).unwrap();
 
         let response = dispatch_command(
             &Message {
@@ -965,8 +966,8 @@ mod tests {
         assert!(response.ok);
         assert_eq!(response.id, "kill-1");
         assert!(state.get_session("1").is_none());
-        assert_eq!(recv_exit(&mut rx1), -1);
-        assert_eq!(recv_exit(&mut rx2), -1);
+        assert_eq!(recv_exit(&queue1), -1);
+        assert_eq!(recv_exit(&queue2), -1);
         assert!(!session.is_attached());
     }
 
@@ -974,8 +975,8 @@ mod tests {
     async fn handle_attach_focus_applies_attached_client_size() {
         let state = test_state();
         let session = insert_session(&state, "1", "work").await;
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let (first_client, _) = session.attach(tx, 80, 24).unwrap();
+        let queue = SessionEventQueue::new();
+        let (first_client, _) = session.attach(queue, 80, 24).unwrap();
 
         let (client, server) = tokio::io::duplex(4096);
         let handle = tokio::spawn(handle_connection(server, state.clone()));

@@ -33,7 +33,9 @@ pub fn render_screen_frame<W: Write>(out: &mut W, frame: &ScreenFrame) -> std::i
     for (row_idx, row) in frame.rows_v2.iter().enumerate().take(frame.rows as usize) {
         write!(out, "\x1b[{};{}H", row_idx + 1, 1)?;
         let mut col: u16 = 0;
+        let mut last_bg = FrameColor::Default;
         for run in row {
+            last_bg = run.bg;
             write_run_attrs(out, run.flags, run.fg, run.bg)?;
             let text = if run.flags & FRAME_FLAG_HIDDEN != 0 {
                 " "
@@ -51,7 +53,7 @@ pub fn render_screen_frame<W: Write>(out: &mut W, frame: &ScreenFrame) -> std::i
             }
         }
         if col < frame.cols {
-            out.write_all(b"\x1b[0m")?;
+            write_run_attrs(out, 0, FrameColor::Default, last_bg)?;
             write_spaces(out, frame.cols - col)?;
         }
     }

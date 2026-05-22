@@ -877,6 +877,23 @@ async fn run_attach_loop(
     let (read_half, write_half) = tokio::io::split(conn.stream);
     let writer = Arc::new(tokio::sync::Mutex::new(write_half));
     let mut reader = BufReader::new(read_half);
+    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    tokio::spawn(async move {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let Ok(msg) = Message::from_json(&line) else {
+                break;
+            };
+            if msg_tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
 
     let (cols, rows) = term_size;
     let mut screen = term::TermScreen::new(rows, cols);
@@ -890,19 +907,12 @@ async fn run_attach_loop(
     let mut input_handle = spawn_attach_input_reader(action_tx.clone(), stop_input.clone(), prefix);
 
     let mut stdout = std::io::stdout();
-    let mut line = String::new();
 
-    let outcome = loop {
-        line.clear();
+    let outcome = 'attach: loop {
         tokio::select! {
-            result = reader.read_line(&mut line) => {
-                match result {
-                    Ok(0) | Err(_) => break AttachOutcome::Ended,
-                    Ok(_) => {}
-                }
-                let msg = match Message::from_json(&line) {
-                    Ok(m) => m,
-                    Err(_) => break AttachOutcome::Ended,
+            msg = msg_rx.recv() => {
+                let Some(msg) = msg else {
+                    break AttachOutcome::Ended;
                 };
                 match msg.kind {
                     MessageKind::Event => match msg.event {
@@ -911,7 +921,23 @@ async fn run_attach_loop(
                             let _ = stdout.flush();
                         }
                         Some(EventType::Frame) => {
-                            if let Some(frame) = msg.frame.as_ref() {
+                            let mut latest_frame = msg.frame;
+                            loop {
+                                match msg_rx.try_recv() {
+                                    Ok(next_msg) if next_msg.event == Some(EventType::Frame) => {
+                                        latest_frame = next_msg.frame;
+                                    }
+                                    Ok(next_msg) if next_msg.event == Some(EventType::Exit) => {
+                                        break 'attach AttachOutcome::Ended;
+                                    }
+                                    Ok(_) => {}
+                                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                        break 'attach AttachOutcome::Ended;
+                                    }
+                                }
+                            }
+                            if let Some(frame) = latest_frame.as_ref() {
                                 let _ = term::render_screen_frame(&mut stdout, &frame);
                             }
                         }
