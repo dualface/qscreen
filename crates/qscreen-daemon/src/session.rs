@@ -505,6 +505,14 @@ fn screen_frame_from_parser(parser: &vt100::Parser) -> ScreenFrame {
     }
 }
 
+fn cleanup_alt_screen_frame(parser: &mut vt100::Parser) -> Option<ScreenFrame> {
+    if !parser.screen().alternate_screen() {
+        return None;
+    }
+    parser.process(b"\x1b[?25h\x1b[?1049l");
+    Some(screen_frame_from_parser(parser))
+}
+
 fn default_run_attrs() -> (FrameColor, FrameColor, u8) {
     (FrameColor::Default, FrameColor::Default, 0)
 }
@@ -615,6 +623,13 @@ fn spawn_coalesced_reader(
                 while buf.is_empty() {
                     if reader_done.load(Ordering::Acquire) {
                         tracing::debug!(session = %name, "pty reader ended");
+                        let cleanup_frame = {
+                            let mut parser = screen.lock().unwrap();
+                            cleanup_alt_screen_frame(&mut parser)
+                        };
+                        if let Some(frame) = cleanup_frame {
+                            broadcast_frame(&attached_clients, &active_client_id, frame);
+                        }
                         exited.store(true, Ordering::SeqCst);
                         return;
                     }
@@ -896,6 +911,18 @@ mod tests {
         };
 
         assert_eq!(first, FRAME_CHANNEL_CAPACITY.to_string());
+    }
+
+    #[test]
+    fn cleanup_alt_screen_frame_exits_alternate_screen() {
+        let mut parser = vt100::Parser::new(2, 8, 0);
+        parser.process(b"main\x1b[?1049halt");
+        assert!(parser.screen().alternate_screen());
+
+        let frame = cleanup_alt_screen_frame(&mut parser).expect("expected cleanup frame");
+
+        assert!(!parser.screen().alternate_screen());
+        assert!(!frame.alternate_screen);
     }
 
     #[tokio::test]

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -907,10 +908,11 @@ async fn run_attach_loop(
     let mut input_handle = spawn_attach_input_reader(action_tx.clone(), stop_input.clone(), prefix);
 
     let mut stdout = std::io::stdout();
+    let mut pending_messages: VecDeque<Message> = VecDeque::new();
 
     let outcome = 'attach: loop {
         tokio::select! {
-            msg = msg_rx.recv() => {
+            msg = next_attach_message(&mut pending_messages, &mut msg_rx) => {
                 let Some(msg) = msg else {
                     break AttachOutcome::Ended;
                 };
@@ -930,7 +932,7 @@ async fn run_attach_loop(
                                     Ok(next_msg) if next_msg.event == Some(EventType::Exit) => {
                                         break 'attach AttachOutcome::Ended;
                                     }
-                                    Ok(_) => {}
+                                    Ok(next_msg) => pending_messages.push_back(next_msg),
                                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                                         break 'attach AttachOutcome::Ended;
@@ -1052,6 +1054,16 @@ async fn run_attach_loop(
 
     stop_input.store(true, Ordering::Relaxed);
     Ok(outcome)
+}
+
+async fn next_attach_message(
+    pending_messages: &mut VecDeque<Message>,
+    msg_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Message>,
+) -> Option<Message> {
+    if let Some(msg) = pending_messages.pop_front() {
+        return Some(msg);
+    }
+    msg_rx.recv().await
 }
 
 fn spawn_attach_input_reader(
@@ -1558,6 +1570,28 @@ mod tests {
     #[test]
     fn focus_action_is_available_for_attach_loop() {
         assert_eq!(AttachAction::Focus, AttachAction::Focus);
+    }
+
+    #[tokio::test]
+    async fn next_attach_message_prioritizes_pending_messages() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(Message {
+            kind: MessageKind::Event,
+            event: Some(EventType::Frame),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut pending = VecDeque::from([Message {
+            kind: MessageKind::Response,
+            id: "resize-1".to_string(),
+            ..Default::default()
+        }]);
+
+        let msg = next_attach_message(&mut pending, &mut rx).await.unwrap();
+
+        assert_eq!(msg.kind, MessageKind::Response);
+        assert_eq!(msg.id, "resize-1");
+        assert!(pending.is_empty());
     }
 
     #[test]
