@@ -254,7 +254,12 @@ async fn dispatch_inner(msg: &Message, state: &State) -> anyhow::Result<Message>
                     anyhow::bail!("{}", duplicate_session_error(&msg.name));
                 }
             }
-            let sess = Session::new(msg.name.clone(), msg.width, msg.height)?;
+            let sess = Session::new(
+                msg.name.clone(),
+                msg.width,
+                msg.height,
+                Some(msg.shell.as_str()),
+            )?;
             tracing::info!(session = %msg.name, "session created");
             state
                 .sessions

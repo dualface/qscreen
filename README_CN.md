@@ -13,7 +13,7 @@
 
 ## 平台说明
 
-- Windows 使用 named pipe，并启动 Windows PowerShell。
+- Windows 使用 named pipe，默认启动 `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`。使用 `qscn new --shell cmd --session work` 可为单个会话启动 `C:\Windows\System32\cmd.exe`；也可以在 daemon 环境中设置 `QSCREEN_WINDOWS_SHELL=cmd` 或 `QSCREEN_WINDOWS_SHELL=cmd.exe`，把 cmd 设为 daemon 默认。显式设置 `powershell` 或 `powershell.exe` 会保持默认 PowerShell 行为。不支持的取值会返回错误并阻止创建会话。
 - Linux/macOS 使用 Unix domain socket，并启动 `$SHELL -l`，缺失时回退 `/bin/sh -l`。
 - 会话名必须匹配 `[A-Za-z0-9._-]`，最长 64 字符。
 
@@ -40,8 +40,10 @@ make clean
 
 ```sh
 qscn                         # 智能启动
-qscn new work                # 创建并进入会话
 qscn new                     # 创建时间戳命名的会话
+qscn new --session work      # 用参数指定会话名并进入
+qscn new --shell cmd         # Windows 上创建时间戳命名的 cmd 会话
+qscn new --shell cmd --session work
 qscn attach work             # 重新进入会话
 qscn -r work                 # attach 的别名
 qscn ls                      # 列出会话

@@ -11,6 +11,10 @@ use tokio::sync::mpsc;
 pub const SCROLLBACK_LIMIT: usize = 256 * 1024;
 const DEFAULT_WIDTH: u16 = 80;
 const DEFAULT_HEIGHT: u16 = 24;
+#[cfg(any(windows, test))]
+const DEFAULT_WINDOWS_SHELL: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+#[cfg(any(windows, test))]
+const CMD_WINDOWS_SHELL: &str = r"C:\Windows\System32\cmd.exe";
 
 /// PTY 输出事件，通过 attached_tx 发给当前 attach 的客户端
 #[derive(Debug)]
@@ -66,7 +70,12 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(name: String, width: u32, height: u32) -> anyhow::Result<Arc<Self>> {
+    pub fn new(
+        name: String,
+        width: u32,
+        height: u32,
+        shell: Option<&str>,
+    ) -> anyhow::Result<Arc<Self>> {
         let w = if width > 0 {
             width as u16
         } else {
@@ -92,7 +101,7 @@ impl Session {
         let pty_reader = pair.master.try_clone_reader().context("try_clone_reader")?;
         let pty_writer = pair.master.take_writer().context("take_writer")?;
 
-        let cmd = default_shell_command();
+        let cmd = default_shell_command(shell).context("resolve shell command")?;
         let child = pair.slave.spawn_command(cmd).context("spawn shell")?;
         drop(pair.slave);
 
@@ -258,16 +267,91 @@ impl Session {
     }
 }
 
-fn default_shell_command() -> CommandBuilder {
+#[cfg(any(windows, test))]
+fn resolve_windows_shell_preference(preference: Option<&str>) -> anyhow::Result<&'static str> {
+    match preference.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(DEFAULT_WINDOWS_SHELL),
+        Some("cmd" | "cmd.exe") => Ok(CMD_WINDOWS_SHELL),
+        Some("powershell" | "powershell.exe") => Ok(DEFAULT_WINDOWS_SHELL),
+        Some(value) => anyhow::bail!("unsupported Windows shell value: {value}"),
+    }
+}
+
+fn default_shell_command(shell: Option<&str>) -> anyhow::Result<CommandBuilder> {
     #[cfg(windows)]
     {
-        CommandBuilder::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+        let env_preference = std::env::var("QSCREEN_WINDOWS_SHELL").ok();
+        let preference = shell
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or(env_preference.as_deref());
+        let shell_path = resolve_windows_shell_preference(preference)?;
+        Ok(CommandBuilder::new(shell_path))
     }
     #[cfg(unix)]
     {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let mut cmd = CommandBuilder::new(shell);
+        let shell_path = shell
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| std::env::var("SHELL").ok())
+            .unwrap_or_else(|| "/bin/sh".to_string());
+        let mut cmd = CommandBuilder::new(shell_path);
         cmd.arg("-l");
-        cmd
+        Ok(cmd)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_shell_preference_defaults_to_powershell_for_unset_or_empty() {
+        assert_eq!(
+            resolve_windows_shell_preference(None).unwrap(),
+            DEFAULT_WINDOWS_SHELL
+        );
+        assert_eq!(
+            resolve_windows_shell_preference(Some("")).unwrap(),
+            DEFAULT_WINDOWS_SHELL
+        );
+        assert_eq!(
+            resolve_windows_shell_preference(Some("  ")).unwrap(),
+            DEFAULT_WINDOWS_SHELL
+        );
+    }
+
+    #[test]
+    fn windows_shell_preference_resolves_cmd_aliases() {
+        assert_eq!(
+            resolve_windows_shell_preference(Some("cmd")).unwrap(),
+            CMD_WINDOWS_SHELL
+        );
+        assert_eq!(
+            resolve_windows_shell_preference(Some("cmd.exe")).unwrap(),
+            CMD_WINDOWS_SHELL
+        );
+    }
+
+    #[test]
+    fn windows_shell_preference_resolves_powershell_aliases() {
+        assert_eq!(
+            resolve_windows_shell_preference(Some("powershell")).unwrap(),
+            DEFAULT_WINDOWS_SHELL
+        );
+        assert_eq!(
+            resolve_windows_shell_preference(Some("powershell.exe")).unwrap(),
+            DEFAULT_WINDOWS_SHELL
+        );
+    }
+
+    #[test]
+    fn windows_shell_preference_rejects_unsupported_values() {
+        let err = resolve_windows_shell_preference(Some("pwsh"))
+            .expect_err("unsupported shell should fail")
+            .to_string();
+
+        assert!(err.contains("unsupported Windows shell value: pwsh"));
     }
 }

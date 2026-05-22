@@ -75,13 +75,12 @@ fn run_client(args: Vec<String>) -> anyhow::Result<()> {
             }
             [cmd] if cmd == "ls" || cmd == "list" => cmd_list().await,
             [cmd] if cmd == "shutdown" => cmd_shutdown().await,
-            [cmd, name] if cmd == "new" => cmd_new(name).await,
+            [cmd, rest @ ..] if cmd == "new" => {
+                let opts = parse_new_options(rest)?;
+                cmd_new(opts.name.as_deref(), opts.shell.as_deref()).await
+            }
             [cmd, name] if cmd == "attach" || cmd == "-r" => cmd_attach(name).await,
             [cmd, name] if cmd == "kill" => cmd_kill(name).await,
-            [cmd] if cmd == "new" => {
-                let name = default_new_name();
-                cmd_new_and_attach(&name).await
-            }
             _ => {
                 if is_chinese() {
                     anyhow::bail!("未知命令。运行 `qscn --help` 查看帮助")
@@ -96,6 +95,72 @@ fn run_client(args: Vec<String>) -> anyhow::Result<()> {
 fn default_new_name() -> String {
     use chrono::Utc;
     Utc::now().format("%Y%m%d-%H%M%S").to_string()
+}
+
+#[derive(Debug)]
+struct NewOptions {
+    name: Option<String>,
+    shell: Option<String>,
+}
+
+fn parse_new_options(args: &[String]) -> anyhow::Result<NewOptions> {
+    let mut name = None;
+    let mut shell = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--session" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .with_context(|| missing_option_value("--session"))?;
+                set_once(&mut name, value.clone(), "--session")?;
+            }
+            "--shell" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .with_context(|| missing_option_value("--shell"))?;
+                set_once(&mut shell, value.clone(), "--shell")?;
+            }
+            value if value.starts_with("--session=") => {
+                let value = value.trim_start_matches("--session=");
+                if value.is_empty() {
+                    anyhow::bail!("{}", missing_option_value("--session"));
+                }
+                set_once(&mut name, value.to_string(), "--session")?;
+            }
+            value if value.starts_with("--shell=") => {
+                let value = value.trim_start_matches("--shell=");
+                if value.is_empty() {
+                    anyhow::bail!("{}", missing_option_value("--shell"));
+                }
+                set_once(&mut shell, value.to_string(), "--shell")?;
+            }
+            value if value.starts_with('-') => {
+                anyhow::bail!("unknown new option: {value}");
+            }
+            value => {
+                anyhow::bail!("unexpected argument for new: {value}. Use --session <name>");
+            }
+        }
+        i += 1;
+    }
+
+    Ok(NewOptions { name, shell })
+}
+
+fn set_once(slot: &mut Option<String>, value: String, label: &str) -> anyhow::Result<()> {
+    if slot.is_some() {
+        anyhow::bail!("duplicate {label}");
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+fn missing_option_value(option: &str) -> String {
+    format!("missing value for {option}")
 }
 
 // ── 语言检测 ──────────────────────────────────────────────────────────────────
@@ -146,7 +211,9 @@ fn print_help() {
 用法:
   qscn                         智能启动：无会话时新建并进入 main，单会话时直接 attach，
                             多会话时列出所有会话
-  qscn new [<name>]            新建会话并进入（省略 name 时自动用时间戳命名）
+  qscn new                     新建自动命名会话并进入
+  qscn new --session <name>    用参数指定会话名
+  qscn new --shell <shell>     指定启动 shell（Windows: cmd 或 powershell）
   qscn attach <name>           进入已有会话
   qscn -r <name>               同 attach，兼容 tmux 风格
   qscn ls                      列出所有会话（同 list）
@@ -165,7 +232,8 @@ ls 输出格式:
 
 示例:
   qscn                         # 自动进入唯一会话，或新建 main
-  qscn new work                # 新建名为 work 的会话
+  qscn new --session work      # 新建名为 work 的会话
+  qscn new --shell cmd --session work
   qscn attach work             # 重新进入 work 会话
   qscn ls                      # 查看所有会话状态
   qscn kill work               # 终止 work 会话
@@ -178,7 +246,9 @@ ls 输出格式:
 Usage:
   qscn                         smart launch: create and enter 'main' if no sessions,
                             attach if one session, list all if multiple
-  qscn new [<name>]            create a new session and attach (auto-name if omitted)
+  qscn new                     create an auto-named session and attach
+  qscn new --session <name>    specify the session name as an option
+  qscn new --shell <shell>     specify the startup shell (Windows: cmd or powershell)
   qscn attach <name>           attach to an existing session
   qscn -r <name>               same as attach (tmux-style shorthand)
   qscn ls                      list all sessions (alias: list)
@@ -197,7 +267,8 @@ ls output format:
 
 Examples:
   qscn                         # auto-attach or create main
-  qscn new work                # create session named 'work'
+  qscn new --session work      # create session named 'work'
+  qscn new --shell cmd --session work
   qscn attach work             # reattach to 'work'
   qscn ls                      # show all session states
   qscn kill work               # terminate 'work'
@@ -211,7 +282,7 @@ Examples:
 async fn cmd_default() -> anyhow::Result<()> {
     let sessions = list_sessions().await?;
     match sessions.len() {
-        0 => cmd_new_and_attach("main").await,
+        0 => cmd_new_and_attach("main", None).await,
         1 => cmd_attach(&sessions[0].name.clone()).await,
         _ => {
             print_sessions(&sessions);
@@ -226,11 +297,12 @@ async fn cmd_list() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_new(name: &str) -> anyhow::Result<()> {
-    cmd_new_and_attach(name).await
+async fn cmd_new(name: Option<&str>, shell: Option<&str>) -> anyhow::Result<()> {
+    let name = name.map(str::to_string).unwrap_or_else(default_new_name);
+    cmd_new_and_attach(&name, shell).await
 }
 
-async fn cmd_new_and_attach(name: &str) -> anyhow::Result<()> {
+async fn cmd_new_and_attach(name: &str, shell: Option<&str>) -> anyhow::Result<()> {
     validate_session_name(name)?;
     let mut conn = ensure_and_connect().await?;
     send_recv_ok(
@@ -240,6 +312,7 @@ async fn cmd_new_and_attach(name: &str) -> anyhow::Result<()> {
             id: "1".to_string(),
             command: Some(Command::New),
             name: name.to_string(),
+            shell: shell.unwrap_or_default().to_string(),
             ..Default::default()
         },
     )
@@ -469,7 +542,7 @@ async fn run_attach_loop(conn: TcpConn, name: String, term_size: (u16, u16)) -> 
     let writer = std::sync::Arc::new(tokio::sync::Mutex::new(write_half));
     let mut reader = BufReader::new(read_half);
 
-    let (cols, rows) = term_size;
+    let (cols, rows) = normalize_terminal_size(term_size);
     let mut screen = term::TermScreen::new(rows, cols);
 
     let writer_c = writer.clone();
@@ -528,7 +601,7 @@ async fn run_attach_loop(conn: TcpConn, name: String, term_size: (u16, u16)) -> 
                 }
 
                 Event::Resize(w, h) => {
-                    let _ = resize_tx_bg.send((w, h));
+                    let _ = resize_tx_bg.send(normalize_terminal_size((w, h)));
                 }
 
                 _ => {}
@@ -691,12 +764,14 @@ fn spawn_daemon() -> anyhow::Result<()> {
 
     #[cfg(not(windows))]
     {
+        use std::os::unix::process::CommandExt;
         use std::process::Stdio;
         std::process::Command::new(&exe)
             .arg("--daemon")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .process_group(0)
             .spawn()
             .context("spawn daemon process")?;
     }
@@ -745,6 +820,72 @@ fn check_response(resp: &Message, want_id: &str) -> anyhow::Result<()> {
 // ── 终端尺寸 ──────────────────────────────────────────────────────────────────
 
 fn get_terminal_size() -> anyhow::Result<(u16, u16)> {
-    let (w, h) = crossterm::terminal::size()?;
-    Ok((w, h))
+    let size = crossterm::terminal::size()?;
+    Ok(normalize_terminal_size(size))
+}
+
+fn normalize_terminal_size((cols, rows): (u16, u16)) -> (u16, u16) {
+    (cols.max(1), rows.max(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_new_options_accepts_empty_options() {
+        let opts = parse_new_options(&[]).unwrap();
+
+        assert_eq!(opts.name, None);
+        assert_eq!(opts.shell, None);
+    }
+
+    #[test]
+    fn parse_new_options_accepts_shell_and_session_flags() {
+        let args = strings(&["--shell", "cmd", "--session", "work"]);
+        let opts = parse_new_options(&args).unwrap();
+
+        assert_eq!(opts.name.as_deref(), Some("work"));
+        assert_eq!(opts.shell.as_deref(), Some("cmd"));
+    }
+
+    #[test]
+    fn parse_new_options_accepts_equals_forms() {
+        let args = strings(&["--shell=cmd.exe", "--session=work"]);
+        let opts = parse_new_options(&args).unwrap();
+
+        assert_eq!(opts.name.as_deref(), Some("work"));
+        assert_eq!(opts.shell.as_deref(), Some("cmd.exe"));
+    }
+
+    #[test]
+    fn parse_new_options_rejects_positional_name() {
+        let args = strings(&["work"]);
+        let err = parse_new_options(&args).expect_err("positional name should fail");
+
+        assert!(
+            err.to_string()
+                .contains("unexpected argument for new: work. Use --session <name>")
+        );
+    }
+
+    #[test]
+    fn parse_new_options_rejects_duplicate_names() {
+        let args = strings(&["--session", "work", "--session", "other"]);
+        let err = parse_new_options(&args).expect_err("duplicate name should fail");
+
+        assert!(err.to_string().contains("duplicate --session"));
+    }
+
+    #[test]
+    fn normalize_terminal_size_clamps_zero_dimensions() {
+        assert_eq!(normalize_terminal_size((0, 0)), (1, 1));
+        assert_eq!(normalize_terminal_size((80, 0)), (80, 1));
+        assert_eq!(normalize_terminal_size((0, 24)), (1, 24));
+        assert_eq!(normalize_terminal_size((80, 24)), (80, 24));
+    }
 }

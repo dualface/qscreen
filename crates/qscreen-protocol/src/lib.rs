@@ -74,6 +74,7 @@ pub struct Message {
     pub command: Option<Command>,
     pub event: Option<EventType>,
     pub name: String,
+    pub shell: String,
     pub width: u32,
     pub height: u32,
     pub ok: bool,
@@ -96,6 +97,8 @@ struct WireMessage {
     event: Option<EventType>,
     #[serde(skip_serializing_if = "String::is_empty", default)]
     name: String,
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    shell: String,
     #[serde(skip_serializing_if = "is_zero_u32", default)]
     width: u32,
     #[serde(skip_serializing_if = "is_zero_u32", default)]
@@ -144,6 +147,7 @@ impl Message {
             command: self.command.clone(),
             event: self.event.clone(),
             name: self.name.clone(),
+            shell: self.shell.clone(),
             width: self.width,
             height: self.height,
             ok: self.ok,
@@ -187,6 +191,7 @@ impl Message {
             command: wire.command,
             event: wire.event,
             name: wire.name,
+            shell: wire.shell,
             width: wire.width,
             height: wire.height,
             ok: wire.ok,
@@ -275,6 +280,7 @@ mod tests {
             id: "1".to_string(),
             command: Some(Command::New),
             name: "test".to_string(),
+            shell: "cmd".to_string(),
             width: 80,
             height: 24,
             ..Default::default()
@@ -285,8 +291,23 @@ mod tests {
         assert_eq!(decoded.id, "1");
         assert_eq!(decoded.command, Some(Command::New));
         assert_eq!(decoded.name, "test");
+        assert_eq!(decoded.shell, "cmd");
         assert_eq!(decoded.width, 80);
         assert_eq!(decoded.height, 24);
+    }
+
+    #[test]
+    fn omit_empty_shell() {
+        let msg = Message {
+            kind: MessageKind::Request,
+            command: Some(Command::New),
+            name: "test".to_string(),
+            ..Default::default()
+        };
+        let line = msg.to_json_line().unwrap();
+        let json_str = std::str::from_utf8(&line).unwrap();
+
+        assert!(!json_str.contains("\"shell\""));
     }
 
     #[test]
