@@ -743,24 +743,36 @@ mod tests {
             .await
             .unwrap();
 
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
-        let mut messages = vec![Message::from_json(&line).unwrap()];
+        let mut messages = vec![read_response_with_id(&mut reader, attach_id).await];
 
         for command in commands {
+            let command_id = command.id.clone();
             reader
                 .get_mut()
                 .write_all(&command.to_json_line().unwrap())
                 .await
                 .unwrap();
-            line.clear();
-            reader.read_line(&mut line).await.unwrap();
-            messages.push(Message::from_json(&line).unwrap());
+            messages.push(read_response_with_id(&mut reader, &command_id).await);
         }
 
         drop(reader);
         handle.await.unwrap();
         messages
+    }
+
+    async fn read_response_with_id<S>(reader: &mut BufReader<S>, expected_id: &str) -> Message
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let msg = Message::from_json(&line).unwrap();
+            if msg.kind == MessageKind::Response && msg.id == expected_id {
+                return msg;
+            }
+        }
     }
 
     #[tokio::test]
@@ -986,6 +998,11 @@ mod tests {
         reader.read_line(&mut line).await.unwrap();
         let attach_resp = Message::from_json(&line).unwrap();
         assert!(attach_resp.ok);
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let screen_event = Message::from_json(&line).unwrap();
+        assert_eq!(screen_event.kind, MessageKind::Event);
+        assert_eq!(screen_event.event, Some(EventType::Output));
 
         line.clear();
         let resize = Message {

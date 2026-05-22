@@ -17,6 +17,7 @@ anyhow = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 portable-pty = "0.8"
+vt100 = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # Windows 平台仅需 tokio 的 named_pipe 实现（包含在 tokio full feature 内）

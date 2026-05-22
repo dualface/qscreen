@@ -440,6 +440,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "vt100",
 ]
 
 [[package]]

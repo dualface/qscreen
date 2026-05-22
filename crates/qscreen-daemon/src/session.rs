@@ -78,6 +78,7 @@ pub struct Session {
     pty_writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     child_killer: Arc<Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>>,
     pub scrollback: Arc<Mutex<ScrollbackBuf>>,
+    screen: Arc<Mutex<vt100::Parser>>,
     /// 已 attach 客户端；空 map = detached
     pub attached_clients: Arc<Mutex<HashMap<ClientId, AttachedClient>>>,
     pub active_client_id: Arc<Mutex<Option<ClientId>>>,
@@ -132,6 +133,7 @@ impl Session {
         let closed = Arc::new(AtomicBool::new(false));
         let pty_master = Arc::new(Mutex::new(Some(pair.master)));
         let pty_writer_arc = Arc::new(Mutex::new(Some(pty_writer)));
+        let screen = Arc::new(Mutex::new(vt100::Parser::new(h, w, 0)));
 
         let sess = Arc::new(Session {
             session_id,
@@ -146,6 +148,7 @@ impl Session {
             pty_writer: pty_writer_arc.clone(),
             child_killer: child_killer.clone(),
             scrollback: scrollback.clone(),
+            screen: screen.clone(),
             attached_clients: attached_clients.clone(),
             active_client_id: active_client_id.clone(),
             next_client_id,
@@ -154,6 +157,7 @@ impl Session {
         // PTY output 读取任务（阻塞 IO，放在 spawn_blocking）
         {
             let scrollback_r = scrollback.clone();
+            let screen_r = screen.clone();
             let attached_r = attached_clients.clone();
             let active_client_r = active_client_id.clone();
             let exited_r = exited.clone();
@@ -167,6 +171,7 @@ impl Session {
                         Ok(n) => {
                             let data = Bytes::copy_from_slice(&buf[..n]);
                             scrollback_r.lock().unwrap().append(&data);
+                            screen_r.lock().unwrap().process(&data);
                             broadcast_output(&attached_r, &active_client_r, data);
                         }
                     }
@@ -244,6 +249,7 @@ impl Session {
         drop(guard);
         *self.width.lock().unwrap() = width;
         *self.height.lock().unwrap() = height;
+        self.screen.lock().unwrap().set_size(height, width);
         Ok(())
     }
 
@@ -273,7 +279,7 @@ impl Session {
         self.resize_pty(width as u16, height as u16)
     }
 
-    /// Attach 一个客户端：返回 scrollback 快照 + 注册事件发送端
+    /// Attach 一个客户端：返回当前 screen 快照 + 注册事件发送端
     /// 返回 Err 如果 session 已退出
     pub fn attach(
         &self,
@@ -289,7 +295,7 @@ impl Session {
         }
         self.resize(width, height)?;
 
-        let scrollback = self.scrollback.lock().unwrap().snapshot();
+        let screen_snapshot = self.screen.lock().unwrap().screen().contents_formatted();
         let mut next_id = self.next_client_id.lock().unwrap();
         let client_id = *next_id;
         *next_id += 1;
@@ -307,7 +313,7 @@ impl Session {
             },
         );
         *self.active_client_id.lock().unwrap() = Some(client_id);
-        Ok((client_id, scrollback))
+        Ok((client_id, screen_snapshot))
     }
 
     pub fn focus_client(&self, client_id: ClientId) -> anyhow::Result<()> {
@@ -662,6 +668,26 @@ mod tests {
 
         assert_eq!(*session.active_client_id.lock().unwrap(), Some(client1));
         assert_eq!((session.width(), session.height()), (90, 20));
+
+        session.close();
+    }
+
+    #[tokio::test]
+    async fn attach_returns_current_screen_snapshot() {
+        let session =
+            Session::new("1".to_string(), "snapshot".to_string(), 80, 24, None).unwrap();
+        session.scrollback.lock().unwrap().append(b"old history\r\n");
+        {
+            let mut screen = session.screen.lock().unwrap();
+            screen.process(b"\x1b[2J\x1b[Hcurrent");
+        }
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let (_, snapshot) = session.attach(tx, 80, 24).unwrap();
+
+        assert!(snapshot.contains(&0x1b));
+        assert!(snapshot.windows(b"current".len()).any(|w| w == b"current"));
+        assert!(!snapshot.windows(b"old history".len()).any(|w| w == b"old history"));
 
         session.close();
     }
