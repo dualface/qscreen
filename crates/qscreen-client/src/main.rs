@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::Context;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use qscreen_protocol::{
-    validate_session_name, Command, EventType, Message, MessageKind, SessionInfo,
+    Command, EventType, Message, MessageKind, SessionInfo, validate_session_name,
 };
 use qscreen_shared::{daemon_log_path, pipe_name};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -108,10 +108,10 @@ fn is_chinese() -> bool {
 
 fn detect_chinese() -> bool {
     for var in ["LANG", "LANGUAGE", "LC_ALL", "LC_MESSAGES"] {
-        if let Ok(val) = std::env::var(var) {
-            if !val.is_empty() {
-                return val.to_lowercase().contains("zh");
-            }
+        if let Ok(val) = std::env::var(var)
+            && !val.is_empty()
+        {
+            return val.to_lowercase().contains("zh");
         }
     }
     #[cfg(windows)]
@@ -233,13 +233,16 @@ async fn cmd_new(name: &str) -> anyhow::Result<()> {
 async fn cmd_new_and_attach(name: &str) -> anyhow::Result<()> {
     validate_session_name(name)?;
     let mut conn = ensure_and_connect().await?;
-    send_recv_ok(&mut conn, Message {
-        kind: MessageKind::Request,
-        id: "1".to_string(),
-        command: Some(Command::New),
-        name: name.to_string(),
-        ..Default::default()
-    })
+    send_recv_ok(
+        &mut conn,
+        Message {
+            kind: MessageKind::Request,
+            id: "1".to_string(),
+            command: Some(Command::New),
+            name: name.to_string(),
+            ..Default::default()
+        },
+    )
     .await?;
     drop(conn);
     attach_session(name).await
@@ -253,26 +256,32 @@ async fn cmd_attach(name: &str) -> anyhow::Result<()> {
 async fn cmd_kill(name: &str) -> anyhow::Result<()> {
     validate_session_name(name)?;
     let mut conn = ensure_and_connect().await?;
-    send_recv_ok(&mut conn, Message {
-        kind: MessageKind::Request,
-        id: "1".to_string(),
-        command: Some(Command::Kill),
-        name: name.to_string(),
-        ..Default::default()
-    })
+    send_recv_ok(
+        &mut conn,
+        Message {
+            kind: MessageKind::Request,
+            id: "1".to_string(),
+            command: Some(Command::Kill),
+            name: name.to_string(),
+            ..Default::default()
+        },
+    )
     .await
 }
 
 async fn cmd_shutdown() -> anyhow::Result<()> {
     match connect().await {
-        Err(_) => return Ok(()),
+        Err(_) => Ok(()),
         Ok(mut conn) => {
-            send_recv_ok(&mut conn, Message {
-                kind: MessageKind::Request,
-                id: "1".to_string(),
-                command: Some(Command::Stop),
-                ..Default::default()
-            })
+            send_recv_ok(
+                &mut conn,
+                Message {
+                    kind: MessageKind::Request,
+                    id: "1".to_string(),
+                    command: Some(Command::Stop),
+                    ..Default::default()
+                },
+            )
             .await?;
             Ok(())
         }
@@ -281,12 +290,15 @@ async fn cmd_shutdown() -> anyhow::Result<()> {
 
 async fn list_sessions() -> anyhow::Result<Vec<SessionInfo>> {
     let mut conn = ensure_and_connect().await?;
-    send_msg(&mut conn, Message {
-        kind: MessageKind::Request,
-        id: "1".to_string(),
-        command: Some(Command::List),
-        ..Default::default()
-    })
+    send_msg(
+        &mut conn,
+        Message {
+            kind: MessageKind::Request,
+            id: "1".to_string(),
+            command: Some(Command::List),
+            ..Default::default()
+        },
+    )
     .await?;
     let resp = recv_msg(&mut conn).await?;
     check_response(&resp, "1")?;
@@ -322,40 +334,40 @@ async fn attach_session(name: &str) -> anyhow::Result<()> {
     let mut conn = ensure_and_connect().await?;
 
     let attach_id = "1";
-    send_msg(&mut conn, Message {
-        kind: MessageKind::Request,
-        id: attach_id.to_string(),
-        command: Some(Command::Attach),
-        name: name.to_string(),
-        ..Default::default()
-    })
+    send_msg(
+        &mut conn,
+        Message {
+            kind: MessageKind::Request,
+            id: attach_id.to_string(),
+            command: Some(Command::Attach),
+            name: name.to_string(),
+            ..Default::default()
+        },
+    )
     .await?;
 
     let resp = recv_msg(&mut conn).await?;
     check_response(&resp, attach_id)?;
 
-    let term_size = {
-        #[cfg(windows)]
-        { get_terminal_size().unwrap_or((80, 24)) }
-        #[cfg(not(windows))]
-        { (80u16, 24u16) }
-    };
+    let term_size = get_terminal_size().unwrap_or((80, 24));
 
     {
         let (w, h) = term_size;
-        let _ = send_msg(&mut conn, Message {
-            kind: MessageKind::Request,
-            id: "2".to_string(),
-            command: Some(Command::Resize),
-            name: name.to_string(),
-            width: w as u32,
-            height: h as u32,
-            ..Default::default()
-        })
+        let _ = send_msg(
+            &mut conn,
+            Message {
+                kind: MessageKind::Request,
+                id: "2".to_string(),
+                command: Some(Command::Resize),
+                name: name.to_string(),
+                width: w as u32,
+                height: h as u32,
+                ..Default::default()
+            },
+        )
         .await;
     }
 
-    #[cfg(windows)]
     crossterm::terminal::enable_raw_mode()?;
 
     #[cfg(windows)]
@@ -374,14 +386,13 @@ async fn attach_session(name: &str) -> anyhow::Result<()> {
         Err(_) => 1,
     };
 
+    let _ = crossterm::terminal::disable_raw_mode();
+    let _ = std::io::stdout().write_all(
+        b"\x1b[?2026l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?25h\x1b[0m\x1b[r",
+    );
     #[cfg(windows)]
-    {
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = std::io::stdout().write_all(
-            b"\x1b[?2026l\x1b[?9001l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?25h\x1b[0m\x1b[r\x1b[!p",
-        );
-        let _ = std::io::stdout().flush();
-    }
+    let _ = std::io::stdout().write_all(b"\x1b[?9001l\x1b[!p");
+    let _ = std::io::stdout().flush();
 
     std::process::exit(code);
 }
@@ -453,11 +464,7 @@ fn key_event_to_bytes(event: crossterm::event::KeyEvent) -> Vec<u8> {
 
 // ── Attach 主循环 ─────────────────────────────────────────────────────────────
 
-async fn run_attach_loop(
-    conn: TcpConn,
-    name: String,
-    term_size: (u16, u16),
-) -> anyhow::Result<()> {
+async fn run_attach_loop(conn: TcpConn, name: String, term_size: (u16, u16)) -> anyhow::Result<()> {
     let (read_half, write_half) = tokio::io::split(conn.stream);
     let writer = std::sync::Arc::new(tokio::sync::Mutex::new(write_half));
     let mut reader = BufReader::new(read_half);
@@ -480,11 +487,7 @@ async fn run_attach_loop(
     // 键盘/resize 读取线程（crossterm::event::read() 是阻塞调用）
     tokio::task::spawn_blocking(move || {
         let mut pending_prefix = false;
-        loop {
-            let event = match crossterm::event::read() {
-                Ok(e) => e,
-                Err(_) => break,
-            };
+        while let Ok(event) = crossterm::event::read() {
             match event {
                 // 只处理按键按下事件，避免 key-up 重复输入
                 Event::Key(key_event)
@@ -557,10 +560,8 @@ async fn run_attach_loop(
                         Some(EventType::Exit) => break,
                         _ => {}
                     },
-                    MessageKind::Response => {
-                        if !msg.error.is_empty() {
-                            break;
-                        }
+                    MessageKind::Response if !msg.error.is_empty() => {
+                        break;
                     }
                     _ => {}
                 }
@@ -645,9 +646,13 @@ async fn connect() -> anyhow::Result<TcpConn> {
     Ok(TcpConn { stream })
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 async fn connect() -> anyhow::Result<TcpConn> {
-    anyhow::bail!("qscreen 仅支持 Windows")
+    let path = pipe_name();
+    let stream = tokio::net::UnixStream::connect(&path)
+        .await
+        .with_context(|| format!("connect to daemon socket {}", path))?;
+    Ok(TcpConn { stream })
 }
 
 async fn ensure_and_connect() -> anyhow::Result<TcpConn> {
@@ -686,8 +691,12 @@ fn spawn_daemon() -> anyhow::Result<()> {
 
     #[cfg(not(windows))]
     {
+        use std::process::Stdio;
         std::process::Command::new(&exe)
             .arg("--daemon")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .context("spawn daemon process")?;
     }
@@ -735,7 +744,6 @@ fn check_response(resp: &Message, want_id: &str) -> anyhow::Result<()> {
 
 // ── 终端尺寸 ──────────────────────────────────────────────────────────────────
 
-#[cfg(windows)]
 fn get_terminal_size() -> anyhow::Result<(u16, u16)> {
     let (w, h) = crossterm::terminal::size()?;
     Ok((w, h))

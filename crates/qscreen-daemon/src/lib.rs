@@ -5,13 +5,13 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use qscreen_protocol::{
+    Command, EventType, MAX_PAYLOAD_SIZE, Message, MessageKind, SessionInfo,
     attached_session_error, duplicate_session_error, exited_session_error, missing_session_error,
-    validate_new_size, validate_resize, validate_session_name, Command, EventType, Message,
-    MessageKind, SessionInfo, MAX_PAYLOAD_SIZE,
+    validate_new_size, validate_resize, validate_session_name,
 };
 use qscreen_shared::pipe_name;
 use session::{Session, SessionEvent};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, watch};
 
 // ── Daemon 共享状态 ───────────────────────────────────────────────────────────
@@ -35,10 +35,7 @@ impl State {
 
     fn list_sessions(&self) -> Vec<SessionInfo> {
         let guard = self.sessions.lock().unwrap();
-        let mut infos: Vec<SessionInfo> = guard
-            .values()
-            .map(|s| session_info(s))
-            .collect();
+        let mut infos: Vec<SessionInfo> = guard.values().map(|s| session_info(s)).collect();
         infos.sort_by(|a, b| a.name.cmp(&b.name));
         infos
     }
@@ -68,11 +65,7 @@ fn session_info(s: &Session) -> SessionInfo {
         name: s.name.clone(),
         attached: s.is_attached(),
         exited: s.exited.load(std::sync::atomic::Ordering::SeqCst),
-        exit_code: s
-            .exit_code
-            .lock()
-            .unwrap()
-            .unwrap_or(0) as i64,
+        exit_code: s.exit_code.lock().unwrap().unwrap_or(0) as i64,
         created_at: s.created_at,
         width: w,
         height: h,
@@ -131,9 +124,34 @@ pub async fn run() -> anyhow::Result<()> {
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        anyhow::bail!("qscreen-daemon 仅支持 Windows (ConPTY)");
+        let _ = std::fs::remove_file(&pipe);
+        let listener = tokio::net::UnixListener::bind(&pipe)
+            .with_context(|| format!("bind unix socket {}", pipe))?;
+
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((conn, _)) => {
+                            let state_c = state.clone();
+                            tokio::spawn(async move {
+                                handle_connection(conn, state_c).await;
+                            });
+                        }
+                        Err(e) => tracing::warn!("unix socket accept error: {}", e),
+                    }
+                }
+                _ = stop_rx.changed() => {
+                    if *stop_rx.borrow() {
+                        tracing::info!("daemon stop signal received");
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&pipe);
     }
 
     state.kill_all();
@@ -143,13 +161,12 @@ pub async fn run() -> anyhow::Result<()> {
 
 // ── 连接处理 ─────────────────────────────────────────────────────────────────
 
-#[cfg(windows)]
-async fn handle_connection(
-    stream: tokio::net::windows::named_pipe::NamedPipeServer,
-    state: Arc<State>,
-) {
+async fn handle_connection<S>(stream: S, state: Arc<State>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (read_half, write_half) = tokio::io::split(stream);
-    let writer: SharedWriter = Arc::new(tokio::sync::Mutex::new(write_half));
+    let writer = Arc::new(tokio::sync::Mutex::new(write_half));
     let mut reader = BufReader::new(read_half);
 
     let mut line = String::new();
@@ -204,11 +221,7 @@ async fn handle_connection(
     }
 }
 
-type SharedWriter = Arc<
-    tokio::sync::Mutex<
-        tokio::io::WriteHalf<tokio::net::windows::named_pipe::NamedPipeServer>,
-    >,
->;
+type SharedWriter<W> = Arc<tokio::sync::Mutex<W>>;
 
 /// 非 attach 命令的统一 dispatch
 async fn dispatch_command(msg: &Message, state: &State) -> Message {
@@ -235,15 +248,19 @@ async fn dispatch_inner(msg: &Message, state: &State) -> anyhow::Result<Message>
             validate_new_size(msg.width, msg.height)?;
             {
                 let guard = state.sessions.lock().unwrap();
-                if let Some(existing) = guard.get(&msg.name) {
-                    if !existing.exited.load(std::sync::atomic::Ordering::SeqCst) {
-                        anyhow::bail!("{}", duplicate_session_error(&msg.name));
-                    }
+                if let Some(existing) = guard.get(&msg.name)
+                    && !existing.exited.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    anyhow::bail!("{}", duplicate_session_error(&msg.name));
                 }
             }
             let sess = Session::new(msg.name.clone(), msg.width, msg.height)?;
             tracing::info!(session = %msg.name, "session created");
-            state.sessions.lock().unwrap().insert(msg.name.clone(), sess);
+            state
+                .sessions
+                .lock()
+                .unwrap()
+                .insert(msg.name.clone(), sess);
             Ok(Message {
                 kind: MessageKind::Response,
                 ok: true,
@@ -320,15 +337,15 @@ async fn dispatch_inner(msg: &Message, state: &State) -> anyhow::Result<Message>
 }
 
 /// attach 命令处理：握手 → 发送 scrollback → 双向 IO 循环
-#[cfg(windows)]
-async fn handle_attach(
+async fn handle_attach<R, W>(
     msg: Message,
-    mut reader: BufReader<
-        tokio::io::ReadHalf<tokio::net::windows::named_pipe::NamedPipeServer>,
-    >,
-    writer: SharedWriter,
+    mut reader: BufReader<R>,
+    writer: SharedWriter<W>,
     state: Arc<State>,
-) {
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let session_name = msg.name.clone();
     let attach_id = msg.id.clone();
 
@@ -484,10 +501,10 @@ async fn handle_attach(
 
         match &cmd.command {
             Some(Command::Input) => {
-                if !cmd.payload.is_empty() {
-                    if let Err(e) = sess.write_input(&cmd.payload) {
-                        tracing::debug!(session = %session_name, "write input error: {}", e);
-                    }
+                if !cmd.payload.is_empty()
+                    && let Err(e) = sess.write_input(&cmd.payload)
+                {
+                    tracing::debug!(session = %session_name, "write input error: {}", e);
                 }
                 // 兼容 Go 协议：input 也发 ok 响应
                 let resp = Message {

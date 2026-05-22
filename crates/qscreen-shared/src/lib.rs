@@ -2,19 +2,36 @@ use std::path::PathBuf;
 
 pub const PIPE_PREFIX: &str = r"\\.\pipe\qscreen-";
 
-/// Named Pipe 路径：\\.\pipe\qscreen-<sanitized-username>
+/// IPC 名称：Windows 为 Named Pipe，Unix 为 Unix domain socket 路径。
 pub fn pipe_name() -> String {
     let user = current_user();
-    format!("{}{}", PIPE_PREFIX, sanitize_pipe_user(&user))
+    #[cfg(windows)]
+    {
+        format!("{}{}", PIPE_PREFIX, sanitize_pipe_user(&user))
+    }
+    #[cfg(unix)]
+    {
+        unix_runtime_dir()
+            .join(format!("qscreen-{}.sock", sanitize_pipe_user(&user)))
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
-/// Daemon 日志路径：%TEMP%\qscreen-daemon-<user>.log
+/// Daemon 日志路径：Windows 用 %TEMP%，Unix 用 ${TMPDIR:-/tmp}。
 pub fn daemon_log_path() -> PathBuf {
-    let temp = std::env::var("TEMP")
-        .or_else(|_| std::env::var("TMP"))
-        .unwrap_or_else(|_| "C:\\Temp".to_string());
     let user = sanitize_pipe_user(&current_user());
-    PathBuf::from(temp).join(format!("qscreen-daemon-{}.log", user))
+    #[cfg(windows)]
+    {
+        let temp = std::env::var("TEMP")
+            .or_else(|_| std::env::var("TMP"))
+            .unwrap_or_else(|_| "C:\\Temp".to_string());
+        PathBuf::from(temp).join(format!("qscreen-daemon-{}.log", user))
+    }
+    #[cfg(unix)]
+    {
+        unix_runtime_dir().join(format!("qscreen-daemon-{}.log", user))
+    }
 }
 
 pub fn current_user() -> String {
@@ -36,6 +53,13 @@ pub fn sanitize_pipe_user(user: &str) -> String {
         .collect()
 }
 
+#[cfg(unix)]
+fn unix_runtime_dir() -> PathBuf {
+    std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -53,6 +77,9 @@ mod tests {
 
     #[test]
     fn pipe_name_has_prefix() {
+        #[cfg(windows)]
         assert!(pipe_name().starts_with(r"\\.\pipe\qscreen-"));
+        #[cfg(unix)]
+        assert!(pipe_name().ends_with(".sock"));
     }
 }

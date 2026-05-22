@@ -44,5 +44,4 @@ impl TermScreen {
         self.parser.set_size(rows, cols);
         self.prev_contents.clear();
     }
-
 }

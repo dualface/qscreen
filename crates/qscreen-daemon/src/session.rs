@@ -32,7 +32,8 @@ impl ScrollbackBuf {
     pub fn append(&mut self, p: &[u8]) {
         if p.len() >= SCROLLBACK_LIMIT {
             self.data.clear();
-            self.data.extend_from_slice(&p[p.len() - SCROLLBACK_LIMIT..]);
+            self.data
+                .extend_from_slice(&p[p.len() - SCROLLBACK_LIMIT..]);
             return;
         }
         self.data.extend_from_slice(p);
@@ -66,8 +67,16 @@ pub struct Session {
 
 impl Session {
     pub fn new(name: String, width: u32, height: u32) -> anyhow::Result<Arc<Self>> {
-        let w = if width > 0 { width as u16 } else { DEFAULT_WIDTH };
-        let h = if height > 0 { height as u16 } else { DEFAULT_HEIGHT };
+        let w = if width > 0 {
+            width as u16
+        } else {
+            DEFAULT_WIDTH
+        };
+        let h = if height > 0 {
+            height as u16
+        } else {
+            DEFAULT_HEIGHT
+        };
 
         let pty_system = NativePtySystem::default();
         let pair = pty_system
@@ -77,19 +86,14 @@ impl Session {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .context("openpty failed — ConPTY requires Windows 10 1809+")?;
+            .context("openpty failed")?;
 
         // 先拿 reader 和 writer，再把 master 包进 Arc<Mutex>
         let pty_reader = pair.master.try_clone_reader().context("try_clone_reader")?;
         let pty_writer = pair.master.take_writer().context("take_writer")?;
 
-        // 启动 PowerShell
-        let shell = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
-        let cmd = CommandBuilder::new(shell);
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .context("spawn powershell")?;
+        let cmd = default_shell_command();
+        let child = pair.slave.spawn_command(cmd).context("spawn shell")?;
         drop(pair.slave);
 
         let scrollback = Arc::new(Mutex::new(ScrollbackBuf::new()));
@@ -216,10 +220,7 @@ impl Session {
 
     /// Attach 一个客户端：返回 scrollback 快照 + 注册事件发送端
     /// 返回 Err 如果已有客户端 attach 或 session 已退出
-    pub fn attach(
-        &self,
-        tx: mpsc::UnboundedSender<SessionEvent>,
-    ) -> anyhow::Result<Vec<u8>> {
+    pub fn attach(&self, tx: mpsc::UnboundedSender<SessionEvent>) -> anyhow::Result<Vec<u8>> {
         if self.exited.load(Ordering::SeqCst) {
             anyhow::bail!("session has exited");
         }
@@ -254,5 +255,19 @@ impl Session {
 
     pub fn is_attached(&self) -> bool {
         self.attached_tx.lock().unwrap().is_some()
+    }
+}
+
+fn default_shell_command() -> CommandBuilder {
+    #[cfg(windows)]
+    {
+        CommandBuilder::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+    }
+    #[cfg(unix)]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let mut cmd = CommandBuilder::new(shell);
+        cmd.arg("-l");
+        cmd
     }
 }

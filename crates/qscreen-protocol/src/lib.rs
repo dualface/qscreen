@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 // 与 Go wire.go 保持字节兼容的常量
 pub const MAX_CONTROL_MESSAGE_SIZE: usize = 64 * 1024;
 pub const MAX_PAYLOAD_SIZE: usize = 64 * 1024;
-pub const MAX_WIRE_MESSAGE_SIZE: usize = MAX_CONTROL_MESSAGE_SIZE + 4 * ((MAX_PAYLOAD_SIZE + 2) / 3);
+pub const MAX_WIRE_MESSAGE_SIZE: usize =
+    MAX_CONTROL_MESSAGE_SIZE + 4 * MAX_PAYLOAD_SIZE.div_ceil(3);
 
 pub const MIN_TERMINAL_WIDTH: u32 = 1;
 pub const MAX_TERMINAL_WIDTH: u32 = 500;
@@ -107,7 +108,11 @@ struct WireMessage {
     sessions: Vec<SessionInfo>,
     #[serde(skip_serializing_if = "is_zero_i64", default)]
     exit_code: i64,
-    #[serde(rename = "payload_b64", skip_serializing_if = "String::is_empty", default)]
+    #[serde(
+        rename = "payload_b64",
+        skip_serializing_if = "String::is_empty",
+        default
+    )]
     payload_b64: String,
 }
 
@@ -127,7 +132,11 @@ impl Message {
     /// 序列化为 JSON line（末尾加 \n）
     pub fn to_json_line(&self) -> anyhow::Result<Vec<u8>> {
         if self.payload.len() > MAX_PAYLOAD_SIZE {
-            anyhow::bail!("payload too large: {} > {}", self.payload.len(), MAX_PAYLOAD_SIZE);
+            anyhow::bail!(
+                "payload too large: {} > {}",
+                self.payload.len(),
+                MAX_PAYLOAD_SIZE
+            );
         }
         let wire = WireMessage {
             kind: self.kind.clone(),
@@ -164,7 +173,11 @@ impl Message {
         } else {
             let decoded = B64.decode(&wire.payload_b64)?;
             if decoded.len() > MAX_PAYLOAD_SIZE {
-                anyhow::bail!("payload too large after decode: {} > {}", decoded.len(), MAX_PAYLOAD_SIZE);
+                anyhow::bail!(
+                    "payload too large after decode: {} > {}",
+                    decoded.len(),
+                    MAX_PAYLOAD_SIZE
+                );
             }
             decoded
         };
@@ -204,11 +217,19 @@ pub fn validate_session_name(name: &str) -> anyhow::Result<()> {
 }
 
 pub fn validate_resize(width: u32, height: u32) -> anyhow::Result<()> {
-    if width < MIN_TERMINAL_WIDTH || width > MAX_TERMINAL_WIDTH {
-        anyhow::bail!("terminal width must be between {} and {}", MIN_TERMINAL_WIDTH, MAX_TERMINAL_WIDTH);
+    if !(MIN_TERMINAL_WIDTH..=MAX_TERMINAL_WIDTH).contains(&width) {
+        anyhow::bail!(
+            "terminal width must be between {} and {}",
+            MIN_TERMINAL_WIDTH,
+            MAX_TERMINAL_WIDTH
+        );
     }
-    if height < MIN_TERMINAL_HEIGHT || height > MAX_TERMINAL_HEIGHT {
-        anyhow::bail!("terminal height must be between {} and {}", MIN_TERMINAL_HEIGHT, MAX_TERMINAL_HEIGHT);
+    if !(MIN_TERMINAL_HEIGHT..=MAX_TERMINAL_HEIGHT).contains(&height) {
+        anyhow::bail!(
+            "terminal height must be between {} and {}",
+            MIN_TERMINAL_HEIGHT,
+            MAX_TERMINAL_HEIGHT
+        );
     }
     Ok(())
 }
@@ -280,7 +301,10 @@ mod tests {
         let line = msg.to_json_line().unwrap();
         // 检查 payload_b64 字段名兼容 Go
         let json_str = std::str::from_utf8(&line).unwrap();
-        assert!(json_str.contains("payload_b64"), "must use payload_b64 field name");
+        assert!(
+            json_str.contains("payload_b64"),
+            "must use payload_b64 field name"
+        );
         let decoded = Message::from_json(json_str).unwrap();
         assert_eq!(decoded.payload, payload);
     }
