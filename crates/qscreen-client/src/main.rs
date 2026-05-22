@@ -1,16 +1,127 @@
 use std::io::Write;
+use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use qscreen_protocol::{
-    Command, EventType, Message, MessageKind, SessionInfo, validate_session_name,
+    Command, EventType, Message, MessageKind, SessionInfo, attached_session_error,
+    exited_session_error, validate_session_name,
 };
 use qscreen_shared::{daemon_log_path, pipe_name};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 mod term;
+
+const DEFAULT_PREFIX: PrefixKey = PrefixKey {
+    ctrl_char: 'A',
+    byte: 0x01,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrefixKey {
+    ctrl_char: char,
+    byte: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClientConfig {
+    prefix: PrefixKey,
+}
+
+impl PrefixKey {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        let value = value.trim();
+        if value.is_empty() {
+            anyhow::bail!(
+                "invalid prefix: value is empty; expected C-a through C-z or Ctrl+A through Ctrl+Z"
+            );
+        }
+
+        let ctrl_char = if let Some(rest) = value
+            .strip_prefix("C-")
+            .or_else(|| value.strip_prefix("c-"))
+        {
+            parse_prefix_letter(value, rest)?
+        } else {
+            let lower = value.to_ascii_lowercase();
+            if !lower.starts_with("ctrl+") {
+                anyhow::bail!(
+                    "invalid prefix `{}`: expected C-a through C-z or Ctrl+A through Ctrl+Z",
+                    value
+                );
+            }
+            parse_prefix_letter(value, &value[5..])?
+        };
+
+        Ok(Self {
+            ctrl_char,
+            byte: ctrl_char as u8 - b'A' + 1,
+        })
+    }
+}
+
+fn parse_prefix_letter(original: &str, rest: &str) -> anyhow::Result<char> {
+    let mut chars = rest.chars();
+    let Some(letter) = chars.next() else {
+        anyhow::bail!(
+            "invalid prefix `{}`: missing control letter; expected A through Z",
+            original
+        );
+    };
+    if chars.next().is_some() {
+        anyhow::bail!(
+            "invalid prefix `{}`: expected exactly one control letter",
+            original
+        );
+    }
+    if !letter.is_ascii_alphabetic() {
+        anyhow::bail!(
+            "invalid prefix `{}`: control key must be a letter A through Z",
+            original
+        );
+    }
+    Ok(letter.to_ascii_uppercase())
+}
+
+fn parse_client_config(args: Vec<String>) -> anyhow::Result<(ClientConfig, Vec<String>)> {
+    parse_client_config_with_env(args, std::env::var("QSCREEN_PREFIX").ok())
+}
+
+fn parse_client_config_with_env(
+    args: Vec<String>,
+    env_prefix: Option<String>,
+) -> anyhow::Result<(ClientConfig, Vec<String>)> {
+    let (prefix_arg, remaining_args) = take_prefix_arg(args)?;
+    let prefix = match prefix_arg.or(env_prefix) {
+        Some(value) => PrefixKey::parse(&value)?,
+        None => DEFAULT_PREFIX,
+    };
+    Ok((ClientConfig { prefix }, remaining_args))
+}
+
+fn take_prefix_arg(args: Vec<String>) -> anyhow::Result<(Option<String>, Vec<String>)> {
+    let mut prefix = None;
+    let mut remaining = Vec::with_capacity(args.len());
+    let mut iter = args.into_iter();
+
+    while let Some(arg) = iter.next() {
+        if arg == "--prefix" {
+            let Some(value) = iter.next() else {
+                anyhow::bail!("invalid prefix: --prefix requires a value");
+            };
+            prefix = Some(value);
+        } else if let Some(value) = arg.strip_prefix("--prefix=") {
+            prefix = Some(value.to_string());
+        } else {
+            remaining.push(arg);
+        }
+    }
+
+    Ok((prefix, remaining))
+}
 
 // ── 入口 ─────────────────────────────────────────────────────────────────────
 
@@ -62,13 +173,14 @@ fn run_daemon_mode() {
 // ── Client 模式 ───────────────────────────────────────────────────────────────
 
 fn run_client(args: Vec<String>) -> anyhow::Result<()> {
+    let (config, args) = parse_client_config(args)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
 
     rt.block_on(async {
         match args.as_slice() {
-            [] => cmd_default().await,
+            [] => cmd_default(config).await,
             [cmd] if cmd == "-h" || cmd == "--help" => {
                 print_help();
                 Ok(())
@@ -77,9 +189,9 @@ fn run_client(args: Vec<String>) -> anyhow::Result<()> {
             [cmd] if cmd == "shutdown" => cmd_shutdown().await,
             [cmd, rest @ ..] if cmd == "new" => {
                 let opts = parse_new_options(rest)?;
-                cmd_new(opts.name.as_deref(), opts.shell.as_deref()).await
+                cmd_new(opts.name.as_deref(), opts.shell.as_deref(), config).await
             }
-            [cmd, name] if cmd == "attach" || cmd == "-r" => cmd_attach(name).await,
+            [cmd, name] if cmd == "attach" || cmd == "-r" => cmd_attach(name, config).await,
             [cmd, name] if cmd == "kill" => cmd_kill(name).await,
             _ => {
                 if is_chinese() {
@@ -209,22 +321,33 @@ fn print_help() {
             r#"qscreen — 轻量终端会话管理器
 
 用法:
-  qscn                         智能启动：无会话时新建并进入 main，单会话时直接 attach，
+  qscn [--prefix C-a]          智能启动：无会话时新建并进入 main，单会话时直接 attach，
                             多会话时列出所有会话
-  qscn new                     新建自动命名会话并进入
-  qscn new --session <name>    用参数指定会话名
-  qscn new --shell <shell>     指定启动 shell（Windows: cmd 或 powershell）
-  qscn attach <name>           进入已有会话
-  qscn -r <name>               同 attach，兼容 tmux 风格
+  qscn [--prefix C-a] new
+                               新建自动命名会话并进入
+  qscn [--prefix C-a] new --session <name>
+                               用参数指定会话名
+  qscn [--prefix C-a] new --shell <shell>
+                               指定启动 shell（Windows: cmd 或 powershell）
+  qscn [--prefix C-a] attach <name>
+                               进入已有会话
+  qscn [--prefix C-a] -r <name>
+                               同 attach，兼容 tmux 风格
   qscn ls                      列出所有会话（同 list）
   qscn list                    列出所有会话
   qscn kill <name>             强制终止指定会话
   qscn shutdown                停止后台 daemon（所有会话将被关闭）
   qscn -h, --help              显示此帮助
 
+前缀:
+  --prefix C-b                 使用 Ctrl+B 作为当前命令的会话前缀
+  QSCREEN_PREFIX=C-b           为所有命令设置备用前缀
+  支持 C-a..C-z 或 Ctrl+A..Ctrl+Z；CLI 参数优先于环境变量
+
 会话内热键:
-  Ctrl+A D                  从当前会话 detach（会话继续在后台运行）
-  Ctrl+A Ctrl+A             向 PTY 发送字面 Ctrl+A 字符
+  <prefix> d                  从当前会话 detach（会话继续在后台运行）
+  <prefix> <prefix>           向 PTY 发送字面前缀字符
+  <prefix> s                  打开会话列表，选择 detached 会话后切换 attach
 
 ls 输出格式:
   <name>  <状态>  <创建时间>  <终端尺寸>
@@ -234,6 +357,7 @@ ls 输出格式:
   qscn                         # 自动进入唯一会话，或新建 main
   qscn new --session work      # 新建名为 work 的会话
   qscn new --shell cmd --session work
+  qscn --prefix C-b attach work # 使用 Ctrl+B 作为前缀进入 work
   qscn attach work             # 重新进入 work 会话
   qscn ls                      # 查看所有会话状态
   qscn kill work               # 终止 work 会话
@@ -244,22 +368,33 @@ ls 输出格式:
             r#"qscreen — lightweight terminal session manager
 
 Usage:
-  qscn                         smart launch: create and enter 'main' if no sessions,
+  qscn [--prefix C-a]          smart launch: create and enter 'main' if no sessions,
                             attach if one session, list all if multiple
-  qscn new                     create an auto-named session and attach
-  qscn new --session <name>    specify the session name as an option
-  qscn new --shell <shell>     specify the startup shell (Windows: cmd or powershell)
-  qscn attach <name>           attach to an existing session
-  qscn -r <name>               same as attach (tmux-style shorthand)
+  qscn [--prefix C-a] new
+                               create an auto-named session and attach
+  qscn [--prefix C-a] new --session <name>
+                               specify the session name as an option
+  qscn [--prefix C-a] new --shell <shell>
+                               specify the startup shell (Windows: cmd or powershell)
+  qscn [--prefix C-a] attach <name>
+                               attach to an existing session
+  qscn [--prefix C-a] -r <name>
+                               same as attach (tmux-style shorthand)
   qscn ls                      list all sessions (alias: list)
   qscn list                    list all sessions
   qscn kill <name>             forcibly terminate a session
   qscn shutdown                stop the background daemon (closes all sessions)
   qscn -h, --help              show this help
 
+Prefix:
+  --prefix C-b                 use Ctrl+B as the session prefix for this command
+  QSCREEN_PREFIX=C-b           set a fallback prefix for every command
+  Values: C-a..C-z or Ctrl+A..Ctrl+Z; CLI takes precedence over env
+
 Key bindings (inside a session):
-  Ctrl+A D                  detach from session (session keeps running)
-  Ctrl+A Ctrl+A             send a literal Ctrl+A to the PTY
+  <prefix> d                  detach from session (session keeps running)
+  <prefix> <prefix>           send a literal prefix key to the PTY
+  <prefix> s                  open the session list and switch to a detached session
 
 ls output format:
   <name>  <state>  <created-at>  <terminal-size>
@@ -269,6 +404,7 @@ Examples:
   qscn                         # auto-attach or create main
   qscn new --session work      # create session named 'work'
   qscn new --shell cmd --session work
+  qscn --prefix C-b attach work # attach using Ctrl+B as the prefix
   qscn attach work             # reattach to 'work'
   qscn ls                      # show all session states
   qscn kill work               # terminate 'work'
@@ -279,11 +415,11 @@ Examples:
 
 // ── 子命令实现 ────────────────────────────────────────────────────────────────
 
-async fn cmd_default() -> anyhow::Result<()> {
+async fn cmd_default(config: ClientConfig) -> anyhow::Result<()> {
     let sessions = list_sessions().await?;
     match sessions.len() {
-        0 => cmd_new_and_attach("main", None).await,
-        1 => cmd_attach(&sessions[0].name.clone()).await,
+        0 => cmd_new_and_attach("main", None, config).await,
+        1 => cmd_attach(&sessions[0].name.clone(), config).await,
         _ => {
             print_sessions(&sessions);
             Ok(())
@@ -297,12 +433,20 @@ async fn cmd_list() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_new(name: Option<&str>, shell: Option<&str>) -> anyhow::Result<()> {
+async fn cmd_new(
+    name: Option<&str>,
+    shell: Option<&str>,
+    config: ClientConfig,
+) -> anyhow::Result<()> {
     let name = name.map(str::to_string).unwrap_or_else(default_new_name);
-    cmd_new_and_attach(&name, shell).await
+    cmd_new_and_attach(&name, shell, config).await
 }
 
-async fn cmd_new_and_attach(name: &str, shell: Option<&str>) -> anyhow::Result<()> {
+async fn cmd_new_and_attach(
+    name: &str,
+    shell: Option<&str>,
+    config: ClientConfig,
+) -> anyhow::Result<()> {
     validate_session_name(name)?;
     let mut conn = ensure_and_connect().await?;
     send_recv_ok(
@@ -318,12 +462,12 @@ async fn cmd_new_and_attach(name: &str, shell: Option<&str>) -> anyhow::Result<(
     )
     .await?;
     drop(conn);
-    attach_session(name).await
+    attach_session_loop(name, config).await
 }
 
-async fn cmd_attach(name: &str) -> anyhow::Result<()> {
+async fn cmd_attach(name: &str, config: ClientConfig) -> anyhow::Result<()> {
     validate_session_name(name)?;
-    attach_session(name).await
+    attach_session_loop(name, config).await
 }
 
 async fn cmd_kill(name: &str) -> anyhow::Result<()> {
@@ -380,30 +524,119 @@ async fn list_sessions() -> anyhow::Result<Vec<SessionInfo>> {
 
 fn print_sessions(sessions: &[SessionInfo]) {
     for s in sessions {
-        let state = if s.exited {
-            format!("exited({})", s.exit_code)
-        } else if s.attached {
-            "attached".to_string()
-        } else {
-            "detached".to_string()
-        };
-        let size = if s.size.is_empty() {
-            format!("{}x{}", s.width, s.height)
-        } else {
-            s.size.clone()
-        };
         let created = if s.created_at.timestamp() == 0 {
             "-".to_string()
         } else {
             s.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string()
         };
-        println!("{}\t{}\t{}\t{}", s.name, state, created, size);
+        println!(
+            "{}\t{}\t{}\t{}",
+            s.name,
+            session_state_label(s),
+            created,
+            session_size_label(s)
+        );
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionListRow {
+    name: String,
+    state: String,
+    size: String,
+    is_current: bool,
+    exited: bool,
+    attached: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionListSelection {
+    Close,
+    Error(String),
+    Switch(String),
+}
+
+fn build_session_list_rows(sessions: &[SessionInfo], current_name: &str) -> Vec<SessionListRow> {
+    let mut rows: Vec<SessionListRow> = sessions
+        .iter()
+        .map(|session| SessionListRow {
+            name: session.name.clone(),
+            state: session_state_label(session),
+            size: session_size_label(session),
+            is_current: session.name == current_name,
+            exited: session.exited,
+            attached: session.attached,
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+fn session_state_label(session: &SessionInfo) -> String {
+    if session.exited {
+        format!("exited({})", session.exit_code)
+    } else if session.attached {
+        "attached".to_string()
+    } else {
+        "detached".to_string()
+    }
+}
+
+fn session_size_label(session: &SessionInfo) -> String {
+    if session.size.is_empty() {
+        format!("{}x{}", session.width, session.height)
+    } else {
+        session.size.clone()
+    }
+}
+
+fn selection_for_session_row(row: &SessionListRow) -> SessionListSelection {
+    if row.is_current {
+        SessionListSelection::Close
+    } else if row.exited {
+        SessionListSelection::Error(exited_session_error(&row.name))
+    } else if row.attached {
+        SessionListSelection::Error(attached_session_error(&row.name))
+    } else {
+        SessionListSelection::Switch(row.name.clone())
+    }
+}
+
+fn move_session_list_selection(selected: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+
+    if delta < 0 {
+        selected.saturating_sub(delta.unsigned_abs())
+    } else {
+        (selected + delta as usize).min(len - 1)
     }
 }
 
 // ── Attach 实现 ───────────────────────────────────────────────────────────────
 
-async fn attach_session(name: &str) -> anyhow::Result<()> {
+async fn attach_session_loop(initial_name: &str, config: ClientConfig) -> anyhow::Result<()> {
+    let mut name = initial_name.to_string();
+
+    loop {
+        validate_session_name(&name)?;
+        let outcome = attach_session_once(&name, config).await?;
+        match next_attach_target_after_outcome(outcome) {
+            Some(next_name) => name = next_name,
+            None => return Ok(()),
+        }
+    }
+}
+
+fn next_attach_target_after_outcome(outcome: AttachOutcome) -> Option<String> {
+    match outcome {
+        AttachOutcome::SwitchTo(next_name) => Some(next_name),
+        AttachOutcome::Detached | AttachOutcome::Ended => None,
+    }
+}
+
+async fn attach_session_once(name: &str, config: ClientConfig) -> anyhow::Result<AttachOutcome> {
     let mut conn = ensure_and_connect().await?;
 
     let attach_id = "1";
@@ -441,33 +674,38 @@ async fn attach_session(name: &str) -> anyhow::Result<()> {
         .await;
     }
 
-    crossterm::terminal::enable_raw_mode()?;
-
-    #[cfg(windows)]
-    {
-        let _ = std::io::stdout().write_all(b"\x1b[?9001l");
-        let _ = std::io::stdout().flush();
-    }
+    let _terminal = TerminalCleanupGuard::enter()?;
 
     let name_owned = name.to_string();
-    let result = run_attach_loop(conn, name_owned, term_size).await;
+    run_attach_loop(conn, name_owned, term_size, config.prefix).await
+}
 
-    // spawn_blocking 里 crossterm::event::read() 阻塞，无法通过 channel 取消
-    // 直接 exit 让 OS 清理所有线程，父终端由 disable_raw_mode 恢复
-    let code = match result {
-        Ok(_) => 0i32,
-        Err(_) => 1,
-    };
+struct TerminalCleanupGuard;
 
-    let _ = crossterm::terminal::disable_raw_mode();
-    let _ = std::io::stdout().write_all(
-        b"\x1b[?2026l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?25h\x1b[0m\x1b[r",
-    );
-    #[cfg(windows)]
-    let _ = std::io::stdout().write_all(b"\x1b[?9001l\x1b[!p");
-    let _ = std::io::stdout().flush();
+impl TerminalCleanupGuard {
+    fn enter() -> anyhow::Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
 
-    std::process::exit(code);
+        #[cfg(windows)]
+        {
+            let _ = std::io::stdout().write_all(b"\x1b[?9001l");
+            let _ = std::io::stdout().flush();
+        }
+
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalCleanupGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = std::io::stdout().write_all(
+            b"\x1b[?2026l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?25h\x1b[0m\x1b[r",
+        );
+        #[cfg(windows)]
+        let _ = std::io::stdout().write_all(b"\x1b[?9001l\x1b[!p");
+        let _ = std::io::stdout().flush();
+    }
 }
 
 // ── 键盘事件 → PTY 字节序列 ───────────────────────────────────────────────────
@@ -537,92 +775,110 @@ fn key_event_to_bytes(event: crossterm::event::KeyEvent) -> Vec<u8> {
 
 // ── Attach 主循环 ─────────────────────────────────────────────────────────────
 
-async fn run_attach_loop(conn: TcpConn, name: String, term_size: (u16, u16)) -> anyhow::Result<()> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttachAction {
+    Input(Vec<u8>),
+    Resize(u16, u16),
+    Detach,
+    OpenSessionList,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionListAction {
+    MoveUp,
+    MoveDown,
+    Select,
+    Cancel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttachOutcome {
+    Detached,
+    SwitchTo(String),
+    Ended,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PrefixState {
+    pending: bool,
+}
+
+impl PrefixState {
+    fn handle_key(
+        &mut self,
+        key_event: crossterm::event::KeyEvent,
+        prefix: PrefixKey,
+    ) -> Vec<AttachAction> {
+        if is_prefix_key_event(key_event, prefix) {
+            if self.pending {
+                self.pending = false;
+                return vec![AttachAction::Input(vec![prefix.byte])];
+            }
+            self.pending = true;
+            return Vec::new();
+        }
+
+        if self.pending {
+            self.pending = false;
+            if key_char_eq_ignore_ascii_case(key_event.code, 'd') {
+                return vec![AttachAction::Detach];
+            }
+            if key_char_eq_ignore_ascii_case(key_event.code, 's') && session_list_action_enabled() {
+                return vec![AttachAction::OpenSessionList];
+            }
+
+            let mut actions = vec![AttachAction::Input(vec![prefix.byte])];
+            let bytes = key_event_to_bytes(key_event);
+            if !bytes.is_empty() {
+                actions.push(AttachAction::Input(bytes));
+            }
+            return actions;
+        }
+
+        let bytes = key_event_to_bytes(key_event);
+        if bytes.is_empty() {
+            Vec::new()
+        } else {
+            vec![AttachAction::Input(bytes)]
+        }
+    }
+}
+
+async fn run_attach_loop(
+    conn: TcpConn,
+    name: String,
+    term_size: (u16, u16),
+    prefix: PrefixKey,
+) -> anyhow::Result<AttachOutcome> {
     let (read_half, write_half) = tokio::io::split(conn.stream);
-    let writer = std::sync::Arc::new(tokio::sync::Mutex::new(write_half));
+    let writer = Arc::new(tokio::sync::Mutex::new(write_half));
     let mut reader = BufReader::new(read_half);
 
-    let (cols, rows) = normalize_terminal_size(term_size);
+    let (cols, rows) = term_size;
     let mut screen = term::TermScreen::new(rows, cols);
 
     let writer_c = writer.clone();
     let name_c = name.clone();
     let mut msg_id: u64 = 10;
 
-    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-    let (detach_tx, mut detach_rx) = tokio::sync::oneshot::channel::<()>();
-    let (resize_tx, mut resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
-
-    let stdin_tx_bg = stdin_tx;
-    let resize_tx_bg = resize_tx;
-    let detach_tx = std::sync::Mutex::new(Some(detach_tx));
-
-    // 键盘/resize 读取线程（crossterm::event::read() 是阻塞调用）
-    tokio::task::spawn_blocking(move || {
-        let mut pending_prefix = false;
-        while let Ok(event) = crossterm::event::read() {
-            match event {
-                // 只处理按键按下事件，避免 key-up 重复输入
-                Event::Key(key_event)
-                    if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
-                {
-                    // Ctrl+A 前缀检测（detach 热键：Ctrl+A D）
-                    let is_ctrl_a = key_event.modifiers.contains(KeyModifiers::CONTROL)
-                        && key_event.code == KeyCode::Char('a');
-
-                    if is_ctrl_a {
-                        if pending_prefix {
-                            // 双 Ctrl+A → 发送一个字面 Ctrl+A 到 PTY
-                            pending_prefix = false;
-                            let _ = stdin_tx_bg.send(vec![0x01]);
-                        } else {
-                            pending_prefix = true;
-                        }
-                        continue;
-                    }
-
-                    if pending_prefix {
-                        pending_prefix = false;
-                        if key_event.code == KeyCode::Char('d') {
-                            // Ctrl+A D → detach
-                            if let Some(tx) = detach_tx.lock().unwrap().take() {
-                                let _ = tx.send(());
-                            }
-                            return;
-                        }
-                        // 非 D → 先补发 Ctrl+A，再处理当前键
-                        let _ = stdin_tx_bg.send(vec![0x01]);
-                    }
-
-                    let bytes = key_event_to_bytes(key_event);
-                    if !bytes.is_empty() {
-                        let _ = stdin_tx_bg.send(bytes);
-                    }
-                }
-
-                Event::Resize(w, h) => {
-                    let _ = resize_tx_bg.send(normalize_terminal_size((w, h)));
-                }
-
-                _ => {}
-            }
-        }
-    });
+    let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel::<AttachAction>();
+    let stop_input = Arc::new(AtomicBool::new(false));
+    let mut input_handle = spawn_attach_input_reader(action_tx.clone(), stop_input.clone(), prefix);
 
     let mut stdout = std::io::stdout();
     let mut line = String::new();
 
-    loop {
+    let outcome = loop {
         line.clear();
         tokio::select! {
             result = reader.read_line(&mut line) => {
                 match result {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) | Err(_) => break AttachOutcome::Ended,
                     Ok(_) => {}
                 }
                 let msg = match Message::from_json(&line) {
                     Ok(m) => m,
-                    Err(_) => break,
+                    Err(_) => break AttachOutcome::Ended,
                 };
                 match msg.kind {
                     MessageKind::Event => match msg.event {
@@ -630,20 +886,20 @@ async fn run_attach_loop(conn: TcpConn, name: String, term_size: (u16, u16)) -> 
                             screen.process(&msg.payload);
                             let _ = screen.render(&mut stdout);
                         }
-                        Some(EventType::Exit) => break,
+                        Some(EventType::Exit) => break AttachOutcome::Ended,
                         _ => {}
                     },
                     MessageKind::Response if !msg.error.is_empty() => {
-                        break;
+                        break AttachOutcome::Ended;
                     }
                     _ => {}
                 }
             }
 
-            bytes = stdin_rx.recv() => {
-                match bytes {
-                    None => break,
-                    Some(data) => {
+            action = action_rx.recv() => {
+                match action {
+                    None => break AttachOutcome::Ended,
+                    Some(AttachAction::Input(data)) => {
                         msg_id += 1;
                         let input_msg = Message {
                             kind: MessageKind::Request,
@@ -655,49 +911,269 @@ async fn run_attach_loop(conn: TcpConn, name: String, term_size: (u16, u16)) -> 
                         };
                         let bytes = input_msg.to_json_line()?;
                         if writer_c.lock().await.write_all(&bytes).await.is_err() {
-                            break;
+                            break AttachOutcome::Ended;
+                        }
+                    }
+                    Some(AttachAction::Resize(w, h)) => {
+                        screen.resize(h, w);
+                        msg_id += 1;
+                        let resize_msg = Message {
+                            kind: MessageKind::Request,
+                            id: msg_id.to_string(),
+                            command: Some(Command::Resize),
+                            name: name_c.clone(),
+                            width: w as u32,
+                            height: h as u32,
+                            ..Default::default()
+                        };
+                        let bytes = resize_msg.to_json_line()?;
+                        if writer_c.lock().await.write_all(&bytes).await.is_err() {
+                            break AttachOutcome::Ended;
+                        }
+                    }
+                    Some(AttachAction::Detach) => {
+                        msg_id += 1;
+                        let detach_msg = Message {
+                            kind: MessageKind::Request,
+                            id: msg_id.to_string(),
+                            command: Some(Command::Detach),
+                            name: name_c.clone(),
+                            ..Default::default()
+                        };
+                        let bytes = detach_msg.to_json_line()?;
+                        let _ = writer_c.lock().await.write_all(&bytes).await;
+                        break AttachOutcome::Detached;
+                    }
+                    Some(AttachAction::OpenSessionList) => {
+                        stop_input.store(true, Ordering::Relaxed);
+                        let _ = input_handle.await;
+
+                        match run_session_list_mode(&name_c, screen.size(), &mut stdout, &mut screen).await? {
+                            SessionListSelection::Switch(next_name) => {
+                                break AttachOutcome::SwitchTo(next_name);
+                            }
+                            SessionListSelection::Close | SessionListSelection::Error(_) => {
+                                screen.force_redraw();
+                                let _ = screen.render(&mut stdout);
+                                stop_input.store(false, Ordering::Relaxed);
+                                input_handle = spawn_attach_input_reader(
+                                    action_tx.clone(),
+                                    stop_input.clone(),
+                                    prefix,
+                                );
+                            }
                         }
                     }
                 }
             }
+        }
+    };
 
-            size = resize_rx.recv() => {
-                if let Some((w, h)) = size {
-                    screen.resize(h, w);
-                    msg_id += 1;
-                    let resize_msg = Message {
-                        kind: MessageKind::Request,
-                        id: msg_id.to_string(),
-                        command: Some(Command::Resize),
-                        name: name_c.clone(),
-                        width: w as u32,
-                        height: h as u32,
-                        ..Default::default()
-                    };
-                    let bytes = resize_msg.to_json_line()?;
-                    if writer_c.lock().await.write_all(&bytes).await.is_err() {
-                        break;
+    stop_input.store(true, Ordering::Relaxed);
+    Ok(outcome)
+}
+
+fn spawn_attach_input_reader(
+    action_tx: tokio::sync::mpsc::UnboundedSender<AttachAction>,
+    stop_input: Arc<AtomicBool>,
+    prefix: PrefixKey,
+) -> tokio::task::JoinHandle<()> {
+    // Keyboard/resize reading uses a bounded poll so attach cleanup can finish without process exit.
+    tokio::task::spawn_blocking(move || {
+        let mut prefix_state = PrefixState::default();
+        while !stop_input.load(Ordering::Relaxed) {
+            let event = match crossterm::event::poll(Duration::from_millis(50)) {
+                Ok(true) => crossterm::event::read(),
+                Ok(false) => continue,
+                Err(_) => break,
+            };
+            let Ok(event) = event else {
+                break;
+            };
+            match event {
+                // 只处理按键按下事件，避免 key-up 重复输入
+                Event::Key(key_event)
+                    if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
+                    for action in prefix_state.handle_key(key_event, prefix) {
+                        let should_stop =
+                            matches!(action, AttachAction::Detach | AttachAction::OpenSessionList);
+                        let _ = action_tx.send(action);
+                        if should_stop {
+                            return;
+                        }
+                    }
+                }
+
+                Event::Resize(w, h) => {
+                    let _ = action_tx.send(AttachAction::Resize(w, h));
+                }
+
+                _ => {}
+            }
+        }
+    })
+}
+
+async fn run_session_list_mode<W: Write>(
+    current_name: &str,
+    term_size: (u16, u16),
+    stdout: &mut W,
+    screen: &mut term::TermScreen,
+) -> anyhow::Result<SessionListSelection> {
+    let mut rows = build_session_list_rows(&list_sessions().await?, current_name);
+    let mut selected = rows
+        .iter()
+        .position(|row| row.is_current)
+        .unwrap_or_default();
+    let mut status = String::new();
+
+    render_session_list(stdout, &rows, selected, &status, term_size)?;
+
+    loop {
+        let action = read_session_list_action().await?;
+        match action {
+            SessionListAction::MoveUp => {
+                selected = move_session_list_selection(selected, rows.len(), -1);
+                render_session_list(stdout, &rows, selected, &status, term_size)?;
+            }
+            SessionListAction::MoveDown => {
+                selected = move_session_list_selection(selected, rows.len(), 1);
+                render_session_list(stdout, &rows, selected, &status, term_size)?;
+            }
+            SessionListAction::Cancel => return Ok(SessionListSelection::Close),
+            SessionListAction::Select => {
+                if rows.is_empty() {
+                    status = "no sessions".to_string();
+                    render_session_list(stdout, &rows, selected, &status, term_size)?;
+                    continue;
+                }
+
+                rows = build_session_list_rows(&list_sessions().await?, current_name);
+                if rows.is_empty() {
+                    selected = 0;
+                    status = "no sessions".to_string();
+                    render_session_list(stdout, &rows, selected, &status, term_size)?;
+                    continue;
+                }
+                selected = selected.min(rows.len().saturating_sub(1));
+                let selection = selection_for_session_row(&rows[selected]);
+                match selection {
+                    SessionListSelection::Close => return Ok(SessionListSelection::Close),
+                    SessionListSelection::Switch(name) => {
+                        return Ok(SessionListSelection::Switch(name));
+                    }
+                    SessionListSelection::Error(error) => {
+                        status = error.clone();
+                        render_session_list(stdout, &rows, selected, &status, term_size)?;
                     }
                 }
             }
+        }
+        screen.force_redraw();
+    }
+}
 
-            _ = &mut detach_rx => {
-                msg_id += 1;
-                let detach_msg = Message {
-                    kind: MessageKind::Request,
-                    id: msg_id.to_string(),
-                    command: Some(Command::Detach),
-                    name: name_c.clone(),
-                    ..Default::default()
-                };
-                let bytes = detach_msg.to_json_line()?;
-                let _ = writer_c.lock().await.write_all(&bytes).await;
-                break;
+async fn read_session_list_action() -> anyhow::Result<SessionListAction> {
+    tokio::task::spawn_blocking(|| {
+        loop {
+            match crossterm::event::poll(Duration::from_millis(50)) {
+                Ok(true) => match crossterm::event::read() {
+                    Ok(Event::Key(key_event))
+                        if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                    {
+                        match key_event.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                return Ok(SessionListAction::MoveUp);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                return Ok(SessionListAction::MoveDown);
+                            }
+                            KeyCode::Enter => return Ok(SessionListAction::Select),
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                return Ok(SessionListAction::Cancel);
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => return Err(anyhow::Error::new(e)),
+                },
+                Ok(false) => {}
+                Err(e) => return Err(anyhow::Error::new(e)),
             }
+        }
+    })
+    .await?
+}
+
+fn render_session_list<W: Write>(
+    out: &mut W,
+    rows: &[SessionListRow],
+    selected: usize,
+    status: &str,
+    term_size: (u16, u16),
+) -> std::io::Result<()> {
+    let (cols, rows_count) = term_size;
+    write!(out, "\x1b[?2026h\x1b[2J\x1b[H")?;
+    writeln!(out, "qscreen sessions")?;
+    writeln!(out, "Use Up/Down or k/j, Enter to switch, Esc/q to cancel")?;
+    writeln!(out)?;
+
+    if rows.is_empty() {
+        writeln!(out, "  no sessions")?;
+    } else {
+        for (idx, row) in rows.iter().enumerate() {
+            let selector = if idx == selected { ">" } else { " " };
+            let current = if row.is_current { "*" } else { " " };
+            writeln!(
+                out,
+                "{} {} {:<24} {:<14} {:>8}",
+                selector,
+                current,
+                truncate_for_terminal(&row.name, 24),
+                truncate_for_terminal(&row.state, 14),
+                truncate_for_terminal(&row.size, 8)
+            )?;
         }
     }
 
-    Ok(())
+    let used_lines = rows.len() as u16 + 4;
+    if rows_count > used_lines + 1 {
+        write!(out, "\x1b[{};1H", rows_count)?;
+    } else {
+        writeln!(out)?;
+    }
+    let mut status_line = if status.is_empty() {
+        "* marks current session".to_string()
+    } else {
+        status.to_string()
+    };
+    status_line = truncate_for_terminal(&status_line, cols as usize);
+    write!(out, "{}\x1b[?2026l", status_line)?;
+    out.flush()
+}
+
+fn truncate_for_terminal(value: &str, width: usize) -> String {
+    value.chars().take(width).collect()
+}
+
+fn is_prefix_key_event(event: crossterm::event::KeyEvent, prefix: PrefixKey) -> bool {
+    if event.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(event.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&prefix.ctrl_char))
+    {
+        return true;
+    }
+
+    key_event_to_bytes(event) == [prefix.byte]
+}
+
+fn key_char_eq_ignore_ascii_case(code: KeyCode, expected: char) -> bool {
+    matches!(code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&expected))
+}
+
+fn session_list_action_enabled() -> bool {
+    true
 }
 
 // ── 连接工具 ──────────────────────────────────────────────────────────────────
@@ -764,14 +1240,12 @@ fn spawn_daemon() -> anyhow::Result<()> {
 
     #[cfg(not(windows))]
     {
-        use std::os::unix::process::CommandExt;
         use std::process::Stdio;
         std::process::Command::new(&exe)
             .arg("--daemon")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .process_group(0)
             .spawn()
             .context("spawn daemon process")?;
     }
@@ -820,72 +1294,368 @@ fn check_response(resp: &Message, want_id: &str) -> anyhow::Result<()> {
 // ── 终端尺寸 ──────────────────────────────────────────────────────────────────
 
 fn get_terminal_size() -> anyhow::Result<(u16, u16)> {
-    let size = crossterm::terminal::size()?;
-    Ok(normalize_terminal_size(size))
-}
-
-fn normalize_terminal_size((cols, rows): (u16, u16)) -> (u16, u16) {
-    (cols.max(1), rows.max(1))
+    let (w, h) = crossterm::terminal::size()?;
+    Ok((w, h))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn strings(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| value.to_string()).collect()
-    }
-
     #[test]
-    fn parse_new_options_accepts_empty_options() {
-        let opts = parse_new_options(&[]).unwrap();
-
-        assert_eq!(opts.name, None);
-        assert_eq!(opts.shell, None);
-    }
-
-    #[test]
-    fn parse_new_options_accepts_shell_and_session_flags() {
-        let args = strings(&["--shell", "cmd", "--session", "work"]);
-        let opts = parse_new_options(&args).unwrap();
-
-        assert_eq!(opts.name.as_deref(), Some("work"));
-        assert_eq!(opts.shell.as_deref(), Some("cmd"));
-    }
-
-    #[test]
-    fn parse_new_options_accepts_equals_forms() {
-        let args = strings(&["--shell=cmd.exe", "--session=work"]);
-        let opts = parse_new_options(&args).unwrap();
-
-        assert_eq!(opts.name.as_deref(), Some("work"));
-        assert_eq!(opts.shell.as_deref(), Some("cmd.exe"));
-    }
-
-    #[test]
-    fn parse_new_options_rejects_positional_name() {
-        let args = strings(&["work"]);
-        let err = parse_new_options(&args).expect_err("positional name should fail");
-
-        assert!(
-            err.to_string()
-                .contains("unexpected argument for new: work. Use --session <name>")
+    fn parse_prefix_accepts_supported_aliases() {
+        assert_eq!(PrefixKey::parse("C-a").unwrap(), DEFAULT_PREFIX);
+        assert_eq!(PrefixKey::parse("c-a").unwrap(), DEFAULT_PREFIX);
+        assert_eq!(PrefixKey::parse("Ctrl+A").unwrap(), DEFAULT_PREFIX);
+        assert_eq!(
+            PrefixKey::parse("ctrl+z").unwrap(),
+            PrefixKey {
+                ctrl_char: 'Z',
+                byte: 0x1a,
+            }
         );
     }
 
     #[test]
-    fn parse_new_options_rejects_duplicate_names() {
-        let args = strings(&["--session", "work", "--session", "other"]);
-        let err = parse_new_options(&args).expect_err("duplicate name should fail");
-
-        assert!(err.to_string().contains("duplicate --session"));
+    fn parse_prefix_generates_boundary_control_bytes() {
+        assert_eq!(PrefixKey::parse("Ctrl+A").unwrap().byte, 0x01);
+        assert_eq!(PrefixKey::parse("Ctrl+Z").unwrap().byte, 0x1a);
     }
 
     #[test]
-    fn normalize_terminal_size_clamps_zero_dimensions() {
-        assert_eq!(normalize_terminal_size((0, 0)), (1, 1));
-        assert_eq!(normalize_terminal_size((80, 0)), (80, 1));
-        assert_eq!(normalize_terminal_size((0, 24)), (1, 24));
-        assert_eq!(normalize_terminal_size((80, 24)), (80, 24));
+    fn parse_prefix_rejects_invalid_values() {
+        for value in ["", "Alt+A", "Ctrl+1", "Ctrl+AA", "C-", "C-ab", "A"] {
+            let err = PrefixKey::parse(value).unwrap_err().to_string();
+            assert!(err.starts_with("invalid prefix"), "{value}: {err}");
+        }
+    }
+
+    #[test]
+    fn client_config_uses_default_prefix() {
+        let (config, args) = parse_client_config_with_env(vec![], None).unwrap();
+        assert_eq!(config.prefix, DEFAULT_PREFIX);
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn client_config_uses_environment_fallback() {
+        let (config, args) =
+            parse_client_config_with_env(vec!["attach".into(), "work".into()], Some("C-b".into()))
+                .unwrap();
+        assert_eq!(
+            config.prefix,
+            PrefixKey {
+                ctrl_char: 'B',
+                byte: 0x02,
+            }
+        );
+        assert_eq!(args, vec!["attach", "work"]);
+    }
+
+    #[test]
+    fn client_config_cli_overrides_environment() {
+        let (config, args) = parse_client_config_with_env(
+            vec![
+                "--prefix".into(),
+                "C-b".into(),
+                "attach".into(),
+                "work".into(),
+            ],
+            Some("C-a".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            config.prefix,
+            PrefixKey {
+                ctrl_char: 'B',
+                byte: 0x02,
+            }
+        );
+        assert_eq!(args, vec!["attach", "work"]);
+    }
+
+    #[test]
+    fn client_config_accepts_prefix_for_all_entry_shapes() {
+        for args in [
+            vec!["--prefix", "C-b", "attach", "work"],
+            vec!["--prefix", "C-b", "new", "work"],
+            vec!["--prefix", "C-b"],
+        ] {
+            let (config, remaining) =
+                parse_client_config_with_env(args.iter().map(|s| s.to_string()).collect(), None)
+                    .unwrap();
+            assert_eq!(config.prefix.ctrl_char, 'B');
+            assert!(
+                !remaining
+                    .iter()
+                    .any(|arg| arg == "--prefix" || arg == "C-b")
+            );
+        }
+    }
+
+    #[test]
+    fn client_config_rejects_invalid_prefix_early() {
+        let err = parse_client_config_with_env(
+            vec![
+                "--prefix".into(),
+                "Alt+A".into(),
+                "attach".into(),
+                "work".into(),
+            ],
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.starts_with("invalid prefix"), "{err}");
+
+        let err =
+            parse_client_config_with_env(vec!["attach".into(), "work".into()], Some("C-1".into()))
+                .unwrap_err()
+                .to_string();
+        assert!(err.starts_with("invalid prefix"), "{err}");
+    }
+
+    fn ctrl_key(c: char) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn char_key(c: char) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn raw_char_key(byte: u8) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(KeyCode::Char(byte as char), KeyModifiers::NONE)
+    }
+
+    fn session(name: &str, attached: bool, exited: bool, width: u32, height: u32) -> SessionInfo {
+        SessionInfo {
+            name: name.to_string(),
+            attached,
+            exited,
+            exit_code: if exited { 7 } else { 0 },
+            created_at: chrono::DateTime::default(),
+            width,
+            height,
+            size: String::new(),
+        }
+    }
+
+    #[test]
+    fn prefix_key_event_matches_default_ctrl_a() {
+        assert!(is_prefix_key_event(ctrl_key('a'), DEFAULT_PREFIX));
+        assert!(is_prefix_key_event(ctrl_key('A'), DEFAULT_PREFIX));
+        assert!(!is_prefix_key_event(ctrl_key('b'), DEFAULT_PREFIX));
+    }
+
+    #[test]
+    fn prefix_key_event_matches_custom_ctrl_b() {
+        let prefix = PrefixKey::parse("C-b").unwrap();
+        assert!(is_prefix_key_event(ctrl_key('b'), prefix));
+        assert!(is_prefix_key_event(ctrl_key('B'), prefix));
+        assert!(!is_prefix_key_event(ctrl_key('a'), prefix));
+    }
+
+    #[test]
+    fn prefix_key_event_matches_raw_control_bytes() {
+        let prefix = PrefixKey::parse("C-b").unwrap();
+        assert!(is_prefix_key_event(raw_char_key(0x02), prefix));
+        assert!(!is_prefix_key_event(raw_char_key(0x01), prefix));
+    }
+
+    #[test]
+    fn prefix_state_detaches_for_default_and_custom_prefixes() {
+        for prefix in [DEFAULT_PREFIX, PrefixKey::parse("C-b").unwrap()] {
+            let mut state = PrefixState::default();
+            assert_eq!(state.handle_key(ctrl_key(prefix.ctrl_char), prefix), vec![]);
+            assert_eq!(
+                state.handle_key(char_key('d'), prefix),
+                vec![AttachAction::Detach]
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_state_accepts_uppercase_actions() {
+        let mut state = PrefixState::default();
+        assert_eq!(state.handle_key(ctrl_key('a'), DEFAULT_PREFIX), vec![]);
+        assert_eq!(
+            state.handle_key(char_key('D'), DEFAULT_PREFIX),
+            vec![AttachAction::Detach]
+        );
+
+        let mut state = PrefixState::default();
+        assert_eq!(state.handle_key(ctrl_key('a'), DEFAULT_PREFIX), vec![]);
+        assert_eq!(
+            state.handle_key(char_key('S'), DEFAULT_PREFIX),
+            vec![AttachAction::OpenSessionList]
+        );
+    }
+
+    #[test]
+    fn prefix_state_sends_literal_prefix_for_double_prefix() {
+        for prefix in [DEFAULT_PREFIX, PrefixKey::parse("C-b").unwrap()] {
+            let mut state = PrefixState::default();
+            assert_eq!(state.handle_key(ctrl_key(prefix.ctrl_char), prefix), vec![]);
+            assert_eq!(
+                state.handle_key(ctrl_key(prefix.ctrl_char), prefix),
+                vec![AttachAction::Input(vec![prefix.byte])]
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_state_falls_back_to_literal_prefix_then_normal_byte() {
+        for prefix in [DEFAULT_PREFIX, PrefixKey::parse("C-b").unwrap()] {
+            let mut state = PrefixState::default();
+            assert_eq!(state.handle_key(ctrl_key(prefix.ctrl_char), prefix), vec![]);
+            assert_eq!(
+                state.handle_key(char_key('x'), prefix),
+                vec![
+                    AttachAction::Input(vec![prefix.byte]),
+                    AttachAction::Input(vec![b'x'])
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_state_treats_detach_key_as_normal_without_pending_prefix() {
+        let mut state = PrefixState::default();
+        assert_eq!(
+            state.handle_key(char_key('d'), DEFAULT_PREFIX),
+            vec![AttachAction::Input(vec![b'd'])]
+        );
+    }
+
+    #[test]
+    fn prefix_state_opens_session_list_for_default_and_custom_prefixes() {
+        for prefix in [DEFAULT_PREFIX, PrefixKey::parse("C-b").unwrap()] {
+            let mut state = PrefixState::default();
+            assert_eq!(state.handle_key(ctrl_key(prefix.ctrl_char), prefix), vec![]);
+            assert_eq!(
+                state.handle_key(char_key('s'), prefix),
+                vec![AttachAction::OpenSessionList]
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_state_uses_raw_custom_prefix_bytes() {
+        let prefix = PrefixKey::parse("C-b").unwrap();
+
+        let mut state = PrefixState::default();
+        assert_eq!(state.handle_key(raw_char_key(0x02), prefix), vec![]);
+        assert_eq!(
+            state.handle_key(char_key('d'), prefix),
+            vec![AttachAction::Detach]
+        );
+
+        let mut state = PrefixState::default();
+        assert_eq!(state.handle_key(raw_char_key(0x02), prefix), vec![]);
+        assert_eq!(
+            state.handle_key(char_key('s'), prefix),
+            vec![AttachAction::OpenSessionList]
+        );
+    }
+
+    #[test]
+    fn session_list_rows_sort_like_list_output_and_mark_current() {
+        let sessions = vec![
+            session("zeta", false, false, 100, 40),
+            session("alpha", true, false, 80, 24),
+            session("mid", false, true, 120, 30),
+        ];
+        let rows = build_session_list_rows(&sessions, "alpha");
+
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "mid", "zeta"]
+        );
+        assert!(rows[0].is_current);
+        assert_eq!(rows[0].state, "attached");
+        assert_eq!(rows[0].size, "80x24");
+        assert_eq!(rows[1].state, "exited(7)");
+        assert_eq!(rows[2].state, "detached");
+    }
+
+    #[test]
+    fn session_list_rows_prefer_protocol_size_label() {
+        let mut info = session("work", false, false, 80, 24);
+        info.size = "132x43".to_string();
+        let rows = build_session_list_rows(&[info], "main");
+
+        assert_eq!(rows[0].size, "132x43");
+    }
+
+    #[test]
+    fn selection_rules_cover_current_exited_attached_and_attachable() {
+        let rows = build_session_list_rows(
+            &[
+                session("current", true, false, 80, 24),
+                session("done", false, true, 80, 24),
+                session("busy", true, false, 80, 24),
+                session("next", false, false, 80, 24),
+            ],
+            "current",
+        );
+
+        assert_eq!(
+            selection_for_session_row(rows.iter().find(|row| row.name == "current").unwrap()),
+            SessionListSelection::Close
+        );
+        assert_eq!(
+            selection_for_session_row(rows.iter().find(|row| row.name == "done").unwrap()),
+            SessionListSelection::Error(exited_session_error("done"))
+        );
+        assert_eq!(
+            selection_for_session_row(rows.iter().find(|row| row.name == "busy").unwrap()),
+            SessionListSelection::Error(attached_session_error("busy"))
+        );
+        assert_eq!(
+            selection_for_session_row(rows.iter().find(|row| row.name == "next").unwrap()),
+            SessionListSelection::Switch("next".to_string())
+        );
+    }
+
+    #[test]
+    fn session_list_navigation_clamps_to_bounds() {
+        assert_eq!(move_session_list_selection(0, 4, -1), 0);
+        assert_eq!(move_session_list_selection(1, 4, -1), 0);
+        assert_eq!(move_session_list_selection(2, 4, 1), 3);
+        assert_eq!(move_session_list_selection(3, 4, 1), 3);
+        assert_eq!(move_session_list_selection(0, 0, 1), 0);
+    }
+
+    #[test]
+    fn render_session_list_shows_current_marker_selection_and_status() {
+        let rows = build_session_list_rows(
+            &[
+                session("main", true, false, 80, 24),
+                session("work", false, false, 100, 30),
+            ],
+            "main",
+        );
+        let mut out = Vec::new();
+
+        render_session_list(&mut out, &rows, 1, "ready", (80, 24)).unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("qscreen sessions"));
+        assert!(text.contains("  * main"));
+        assert!(text.contains(">   work"));
+        assert!(text.contains("ready"));
+    }
+
+    #[test]
+    fn attach_loop_target_helper_retries_only_on_switch() {
+        assert_eq!(
+            next_attach_target_after_outcome(AttachOutcome::SwitchTo("next".to_string())),
+            Some("next".to_string())
+        );
+        assert_eq!(
+            next_attach_target_after_outcome(AttachOutcome::Detached),
+            None
+        );
+        assert_eq!(next_attach_target_after_outcome(AttachOutcome::Ended), None);
     }
 }
