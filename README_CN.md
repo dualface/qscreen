@@ -1,6 +1,6 @@
 # qscreen
 
-`qscreen` 是一个轻量终端会话管理器。它把 shell 会话放在后台 daemon 中运行，支持 detach、reattach，并提供一组简洁的 `tmux` 风格命令。
+`qscreen` 是一个轻量终端会话管理器。它把 shell 会话放在后台 daemon 中运行，支持 detach、reattach，并通过 `qscn` 执行文件提供一组简洁的 `tmux` 风格命令。
 
 ## 功能
 
@@ -39,14 +39,14 @@ make clean
 ## 使用
 
 ```sh
-qscreen                      # 智能启动
-qscreen new work             # 创建并进入会话
-qscreen new                  # 创建时间戳命名的会话
-qscreen attach work          # 重新进入会话
-qscreen -r work              # attach 的别名
-qscreen ls                   # 列出会话
-qscreen kill work            # 终止会话
-qscreen shutdown             # 停止 daemon 并关闭所有会话
+qscn                         # 智能启动
+qscn new work                # 创建并进入会话
+qscn new                     # 创建时间戳命名的会话
+qscn attach work             # 重新进入会话
+qscn -r work                 # attach 的别名
+qscn ls                      # 列出会话
+qscn kill work               # 终止会话
+qscn shutdown                # 停止 daemon 并关闭所有会话
 ```
 
 会话内热键：
@@ -54,7 +54,7 @@ qscreen shutdown             # 停止 daemon 并关闭所有会话
 - `Ctrl+A D`：detach，会话继续后台运行。
 - `Ctrl+A Ctrl+A`：向 shell 发送字面 `Ctrl+A`。
 
-`qscreen ls` 输出格式：
+`qscn ls` 输出格式：
 
 ```text
 <name>  <状态>  <创建时间>  <终端尺寸>

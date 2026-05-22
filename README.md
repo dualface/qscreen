@@ -1,6 +1,6 @@
 # qscreen
 
-`qscreen` is a lightweight terminal session manager. It keeps shell sessions alive in a background daemon, lets you detach and reattach, and provides a small `tmux`-style command set.
+`qscreen` is a lightweight terminal session manager. It keeps shell sessions alive in a background daemon, lets you detach and reattach, and provides a small `tmux`-style command set through the `qscn` executable.
 
 ## Features
 
@@ -39,14 +39,14 @@ make clean
 ## Usage
 
 ```sh
-qscreen                      # smart launch
-qscreen new work             # create and attach to a session
-qscreen new                  # create a timestamp-named session
-qscreen attach work          # reattach to a session
-qscreen -r work              # alias for attach
-qscreen ls                   # list sessions
-qscreen kill work            # terminate a session
-qscreen shutdown             # stop daemon and close sessions
+qscn                         # smart launch
+qscn new work                # create and attach to a session
+qscn new                     # create a timestamp-named session
+qscn attach work             # reattach to a session
+qscn -r work                 # alias for attach
+qscn ls                      # list sessions
+qscn kill work               # terminate a session
+qscn shutdown                # stop daemon and close sessions
 ```
 
 Inside a session:
@@ -54,7 +54,7 @@ Inside a session:
 - `Ctrl+A D`: detach, leaving the session running.
 - `Ctrl+A Ctrl+A`: send a literal `Ctrl+A` to the shell.
 
-`qscreen ls` prints:
+`qscn ls` prints:
 
 ```text
 <name>  <state>  <created-at>  <terminal-size>

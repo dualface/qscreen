@@ -84,9 +84,9 @@ fn run_client(args: Vec<String>) -> anyhow::Result<()> {
             }
             _ => {
                 if is_chinese() {
-                    anyhow::bail!("未知命令。运行 `qscreen --help` 查看帮助")
+                    anyhow::bail!("未知命令。运行 `qscn --help` 查看帮助")
                 } else {
-                    anyhow::bail!("unknown command. Run `qscreen --help` for usage")
+                    anyhow::bail!("unknown command. Run `qscn --help` for usage")
                 }
             }
         }
@@ -144,16 +144,16 @@ fn print_help() {
             r#"qscreen — 轻量终端会话管理器
 
 用法:
-  qscreen                      智能启动：无会话时新建并进入 main，单会话时直接 attach，
+  qscn                         智能启动：无会话时新建并进入 main，单会话时直接 attach，
                             多会话时列出所有会话
-  qscreen new [<name>]         新建会话并进入（省略 name 时自动用时间戳命名）
-  qscreen attach <name>        进入已有会话
-  qscreen -r <name>            同 attach，兼容 tmux 风格
-  qscreen ls                   列出所有会话（同 list）
-  qscreen list                 列出所有会话
-  qscreen kill <name>          强制终止指定会话
-  qscreen shutdown             停止后台 daemon（所有会话将被关闭）
-  qscreen -h, --help           显示此帮助
+  qscn new [<name>]            新建会话并进入（省略 name 时自动用时间戳命名）
+  qscn attach <name>           进入已有会话
+  qscn -r <name>               同 attach，兼容 tmux 风格
+  qscn ls                      列出所有会话（同 list）
+  qscn list                    列出所有会话
+  qscn kill <name>             强制终止指定会话
+  qscn shutdown                停止后台 daemon（所有会话将被关闭）
+  qscn -h, --help              显示此帮助
 
 会话内热键:
   Ctrl+A D                  从当前会话 detach（会话继续在后台运行）
@@ -164,11 +164,11 @@ ls 输出格式:
   状态: attached | detached | exited(<退出码>)
 
 示例:
-  qscreen                      # 自动进入唯一会话，或新建 main
-  qscreen new work             # 新建名为 work 的会话
-  qscreen attach work          # 重新进入 work 会话
-  qscreen ls                   # 查看所有会话状态
-  qscreen kill work            # 终止 work 会话
+  qscn                         # 自动进入唯一会话，或新建 main
+  qscn new work                # 新建名为 work 的会话
+  qscn attach work             # 重新进入 work 会话
+  qscn ls                      # 查看所有会话状态
+  qscn kill work               # 终止 work 会话
 "#
         );
     } else {
@@ -176,16 +176,16 @@ ls 输出格式:
             r#"qscreen — lightweight terminal session manager
 
 Usage:
-  qscreen                      smart launch: create and enter 'main' if no sessions,
+  qscn                         smart launch: create and enter 'main' if no sessions,
                             attach if one session, list all if multiple
-  qscreen new [<name>]         create a new session and attach (auto-name if omitted)
-  qscreen attach <name>        attach to an existing session
-  qscreen -r <name>            same as attach (tmux-style shorthand)
-  qscreen ls                   list all sessions (alias: list)
-  qscreen list                 list all sessions
-  qscreen kill <name>          forcibly terminate a session
-  qscreen shutdown             stop the background daemon (closes all sessions)
-  qscreen -h, --help           show this help
+  qscn new [<name>]            create a new session and attach (auto-name if omitted)
+  qscn attach <name>           attach to an existing session
+  qscn -r <name>               same as attach (tmux-style shorthand)
+  qscn ls                      list all sessions (alias: list)
+  qscn list                    list all sessions
+  qscn kill <name>             forcibly terminate a session
+  qscn shutdown                stop the background daemon (closes all sessions)
+  qscn -h, --help              show this help
 
 Key bindings (inside a session):
   Ctrl+A D                  detach from session (session keeps running)
@@ -196,11 +196,11 @@ ls output format:
   states: attached | detached | exited(<code>)
 
 Examples:
-  qscreen                      # auto-attach or create main
-  qscreen new work             # create session named 'work'
-  qscreen attach work          # reattach to 'work'
-  qscreen ls                   # show all session states
-  qscreen kill work            # terminate 'work'
+  qscn                         # auto-attach or create main
+  qscn new work                # create session named 'work'
+  qscn attach work             # reattach to 'work'
+  qscn ls                      # show all session states
+  qscn kill work               # terminate 'work'
 "#
         );
     }

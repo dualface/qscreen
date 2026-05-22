@@ -4,7 +4,7 @@
 
 This is a Rust workspace for `qscreen`, a lightweight terminal session manager. Workspace members live under `crates/`:
 
-- `crates/qscreen-client`: `qscreen` binary, CLI parsing, terminal attach UI, daemon launch mode.
+- `crates/qscreen-client`: `qscn` binary, CLI parsing, terminal attach UI, daemon launch mode.
 - `crates/qscreen-daemon`: daemon state, session lifecycle, Windows named-pipe handling, PTY integration.
 - `crates/qscreen-protocol`: JSON-line wire protocol, message types, validation helpers, compatibility constants.
 - `crates/qscreen-shared`: shared paths and pipe-name helpers.
