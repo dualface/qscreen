@@ -7,8 +7,8 @@ use std::time::Duration;
 use anyhow::Context;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use qscreen_protocol::{
-    Command, EventType, Message, MessageKind, SessionInfo, attached_session_error,
-    exited_session_error, validate_session_name,
+    Command, EventType, Message, MessageKind, SessionInfo, exited_session_error,
+    validate_session_name,
 };
 use qscreen_shared::{daemon_log_path, pipe_name};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -524,19 +524,23 @@ async fn list_sessions() -> anyhow::Result<Vec<SessionInfo>> {
 
 fn print_sessions(sessions: &[SessionInfo]) {
     for s in sessions {
-        let created = if s.created_at.timestamp() == 0 {
-            "-".to_string()
-        } else {
-            s.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-        };
-        println!(
-            "{}\t{}\t{}\t{}",
-            s.name,
-            session_state_label(s),
-            created,
-            session_size_label(s)
-        );
+        println!("{}", format_session_line(s));
     }
+}
+
+fn format_session_line(s: &SessionInfo) -> String {
+    let created = if s.created_at.timestamp() == 0 {
+        "-".to_string()
+    } else {
+        s.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    };
+    format!(
+        "{}\t{}\t{}\t{}",
+        s.name,
+        session_state_label(s),
+        created,
+        session_size_label(s)
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -595,8 +599,6 @@ fn selection_for_session_row(row: &SessionListRow) -> SessionListSelection {
         SessionListSelection::Close
     } else if row.exited {
         SessionListSelection::Error(exited_session_error(&row.name))
-    } else if row.attached {
-        SessionListSelection::Error(attached_session_error(&row.name))
     } else {
         SessionListSelection::Switch(row.name.clone())
     }
@@ -638,6 +640,8 @@ fn next_attach_target_after_outcome(outcome: AttachOutcome) -> Option<String> {
 
 async fn attach_session_once(name: &str, config: ClientConfig) -> anyhow::Result<AttachOutcome> {
     let mut conn = ensure_and_connect().await?;
+    let term_size = get_terminal_size().unwrap_or((80, 24));
+    let (term_width, term_height) = term_size;
 
     let attach_id = "1";
     send_msg(
@@ -647,6 +651,8 @@ async fn attach_session_once(name: &str, config: ClientConfig) -> anyhow::Result
             id: attach_id.to_string(),
             command: Some(Command::Attach),
             name: name.to_string(),
+            width: term_width as u32,
+            height: term_height as u32,
             ..Default::default()
         },
     )
@@ -654,25 +660,6 @@ async fn attach_session_once(name: &str, config: ClientConfig) -> anyhow::Result
 
     let resp = recv_msg(&mut conn).await?;
     check_response(&resp, attach_id)?;
-
-    let term_size = get_terminal_size().unwrap_or((80, 24));
-
-    {
-        let (w, h) = term_size;
-        let _ = send_msg(
-            &mut conn,
-            Message {
-                kind: MessageKind::Request,
-                id: "2".to_string(),
-                command: Some(Command::Resize),
-                name: name.to_string(),
-                width: w as u32,
-                height: h as u32,
-                ..Default::default()
-            },
-        )
-        .await;
-    }
 
     let _terminal = TerminalCleanupGuard::enter()?;
 
@@ -685,11 +672,14 @@ struct TerminalCleanupGuard;
 impl TerminalCleanupGuard {
     fn enter() -> anyhow::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
+        let mut stdout = std::io::stdout();
+        term::enable_focus_reporting(&mut stdout)?;
 
         #[cfg(windows)]
         {
-            let _ = std::io::stdout().write_all(b"\x1b[?9001l");
-            let _ = std::io::stdout().flush();
+            use std::io::Write;
+            let _ = stdout.write_all(b"\x1b[?9001l");
+            let _ = stdout.flush();
         }
 
         Ok(Self)
@@ -698,13 +688,8 @@ impl TerminalCleanupGuard {
 
 impl Drop for TerminalCleanupGuard {
     fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = std::io::stdout().write_all(
-            b"\x1b[?2026l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?25h\x1b[0m\x1b[r",
-        );
-        #[cfg(windows)]
-        let _ = std::io::stdout().write_all(b"\x1b[?9001l\x1b[!p");
-        let _ = std::io::stdout().flush();
+        let mut stdout = std::io::stdout();
+        let _ = term::cleanup_attach_terminal(&mut stdout);
     }
 }
 
@@ -779,6 +764,7 @@ fn key_event_to_bytes(event: crossterm::event::KeyEvent) -> Vec<u8> {
 enum AttachAction {
     Input(Vec<u8>),
     Resize(u16, u16),
+    Focus,
     Detach,
     OpenSessionList,
 }
@@ -931,6 +917,20 @@ async fn run_attach_loop(
                             break AttachOutcome::Ended;
                         }
                     }
+                    Some(AttachAction::Focus) => {
+                        msg_id += 1;
+                        let focus_msg = Message {
+                            kind: MessageKind::Request,
+                            id: msg_id.to_string(),
+                            command: Some(Command::Focus),
+                            name: name_c.clone(),
+                            ..Default::default()
+                        };
+                        let bytes = focus_msg.to_json_line()?;
+                        if writer_c.lock().await.write_all(&bytes).await.is_err() {
+                            break AttachOutcome::Ended;
+                        }
+                    }
                     Some(AttachAction::Detach) => {
                         msg_id += 1;
                         let detach_msg = Message {
@@ -1007,6 +1007,9 @@ fn spawn_attach_input_reader(
 
                 Event::Resize(w, h) => {
                     let _ = action_tx.send(AttachAction::Resize(w, h));
+                }
+                Event::FocusGained => {
+                    let _ = action_tx.send(AttachAction::Focus);
                 }
 
                 _ => {}
@@ -1441,6 +1444,11 @@ mod tests {
     }
 
     #[test]
+    fn focus_action_is_available_for_attach_loop() {
+        assert_eq!(AttachAction::Focus, AttachAction::Focus);
+    }
+
+    #[test]
     fn prefix_key_event_matches_default_ctrl_a() {
         assert!(is_prefix_key_event(ctrl_key('a'), DEFAULT_PREFIX));
         assert!(is_prefix_key_event(ctrl_key('A'), DEFAULT_PREFIX));
@@ -1609,11 +1617,23 @@ mod tests {
         );
         assert_eq!(
             selection_for_session_row(rows.iter().find(|row| row.name == "busy").unwrap()),
-            SessionListSelection::Error(attached_session_error("busy"))
+            SessionListSelection::Switch("busy".to_string())
         );
         assert_eq!(
             selection_for_session_row(rows.iter().find(|row| row.name == "next").unwrap()),
             SessionListSelection::Switch("next".to_string())
+        );
+    }
+
+    #[test]
+    fn format_session_line_uses_attached_bool_for_live_sessions() {
+        assert_eq!(
+            format_session_line(&session("work", true, false, 100, 30)),
+            "work\tattached\t-\t100x30"
+        );
+        assert_eq!(
+            format_session_line(&session("idle", false, false, 80, 24)),
+            "idle\tdetached\t-\t80x24"
         );
     }
 

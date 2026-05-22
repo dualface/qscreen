@@ -1,5 +1,23 @@
 use std::io::Write;
 
+const ENABLE_FOCUS_REPORTING: &[u8] = b"\x1b[?1004h";
+const RESTORE_AFTER_ATTACH: &[u8] =
+    b"\x1b[?2026l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?25h\x1b[0m\x1b[r";
+
+pub fn enable_focus_reporting<W: Write>(out: &mut W) -> std::io::Result<()> {
+    out.write_all(ENABLE_FOCUS_REPORTING)?;
+    out.flush()
+}
+
+pub fn cleanup_attach_terminal<W: Write>(out: &mut W) -> std::io::Result<()> {
+    let raw_mode_result = crossterm::terminal::disable_raw_mode();
+    out.write_all(RESTORE_AFTER_ATTACH)?;
+    #[cfg(windows)]
+    out.write_all(b"\x1b[?9001l\x1b[!p")?;
+    out.flush()?;
+    raw_mode_result
+}
+
 /// 客户端 VT 状态机 + 渲染器
 ///
 /// 维护与 ConPTY 同步的 grid，从 grid 渲染输出到用户终端，

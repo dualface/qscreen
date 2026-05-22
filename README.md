@@ -8,7 +8,8 @@
 - Smart default command: create `main`, attach the only session, or list multiple sessions.
 - Background daemon starts on demand.
 - Scrollback replay when reattaching.
-- Terminal resize forwarding.
+- Multiple clients can attach to the same session; output is broadcast to all attached clients and each client can detach independently.
+- Terminal sizing follows the latest active client: attaching, focusing, or sending input makes that client's size own the PTY, while inactive client resizes are remembered until that client becomes active.
 - Windows, Linux, and macOS support.
 
 ## Platform Notes
@@ -86,6 +87,17 @@ With the default prefix, those controls are `Ctrl+A d`, `Ctrl+A Ctrl+A`, and
 ```
 
 States are `attached`, `detached`, or `exited(<code>)`.
+
+More than one terminal can attach to an existing session. All attached terminals
+receive the same session output. Detaching one terminal leaves the session and
+other attached terminals running. A session is shown as `attached` while at least
+one client is attached.
+
+The daemon tracks a size for each attached client. The PTY uses the most recent
+active client's size, where active means the client just attached, gained focus,
+or sent input. Resize events from an inactive client update that client's stored
+size without immediately resizing the PTY; the stored size is applied when that
+client next becomes active.
 
 ## Project Layout
 

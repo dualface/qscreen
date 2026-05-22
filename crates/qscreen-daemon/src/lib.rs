@@ -7,12 +7,12 @@ use anyhow::Context;
 use qscreen_protocol::{
     Command, EventType, MAX_PAYLOAD_SIZE, Message, MessageKind, SessionInfo,
     attached_session_error, duplicate_session_error, exited_session_error, missing_session_error,
-    validate_new_size, validate_resize, validate_session_name,
+    validate_attach_size, validate_new_size, validate_resize, validate_session_name,
 };
 use qscreen_shared::pipe_name;
 use session::{Session, SessionEvent};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 // ── Daemon 共享状态 ───────────────────────────────────────────────────────────
 
@@ -370,6 +370,21 @@ async fn handle_attach<R, W>(
         return;
     }
 
+    if let Err(e) = validate_attach_size(msg.width, msg.height) {
+        let resp = Message {
+            kind: MessageKind::Response,
+            id: attach_id,
+            error: e.to_string(),
+            ..Default::default()
+        };
+        let _ = writer
+            .lock()
+            .await
+            .write_all(&resp.to_json_line().unwrap_or_default())
+            .await;
+        return;
+    }
+
     // 获取 session
     let sess = match state.get_session(&session_name) {
         Some(s) => s,
@@ -391,8 +406,8 @@ async fn handle_attach<R, W>(
 
     // 注册事件接收 channel
     let (tx, mut rx) = mpsc::unbounded_channel::<SessionEvent>();
-    let scrollback = match sess.attach(tx) {
-        Ok(sb) => sb,
+    let (client_id, scrollback) = match sess.attach(tx, msg.width, msg.height) {
+        Ok(result) => result,
         Err(e) => {
             let resp = Message {
                 kind: MessageKind::Response,
@@ -409,7 +424,7 @@ async fn handle_attach<R, W>(
         }
     };
 
-    tracing::info!(session = %session_name, "client attached");
+    tracing::info!(session = %session_name, client_id, "client attached");
 
     // 发送 attach 成功响应
     let ok_resp = Message {
@@ -425,7 +440,7 @@ async fn handle_attach<R, W>(
         .await
         .is_err()
     {
-        sess.detach();
+        sess.detach(client_id);
         return;
     }
 
@@ -448,12 +463,13 @@ async fn handle_attach<R, W>(
             .await
             .is_err()
         {
-            sess.detach();
+            sess.detach(client_id);
             return;
         }
     }
 
     // 启动 writer 任务：PTY 输出 → client
+    let (writer_done_tx, mut writer_done_rx) = oneshot::channel::<()>();
     let writer_task_handle = {
         let writer_c = writer.clone();
         let name_c = session_name.clone();
@@ -483,6 +499,7 @@ async fn handle_attach<R, W>(
                 }
             }
             tracing::debug!(session = %name_c, "writer task ended");
+            let _ = writer_done_tx.send(());
         })
     };
 
@@ -490,7 +507,11 @@ async fn handle_attach<R, W>(
     let mut line = String::new();
     loop {
         line.clear();
-        match reader.read_line(&mut line).await {
+        let read_result = tokio::select! {
+            result = reader.read_line(&mut line) => result,
+            _ = &mut writer_done_rx => break,
+        };
+        match read_result {
             Ok(0) => break,
             Ok(_) => {}
             Err(_) => break,
@@ -505,10 +526,28 @@ async fn handle_attach<R, W>(
         };
 
         match &cmd.command {
-            Some(Command::Input) => {
-                if !cmd.payload.is_empty()
-                    && let Err(e) = sess.write_input(&cmd.payload)
+            Some(Command::Focus) => {
+                if let Err(e) = sess.focus_client(client_id) {
+                    tracing::debug!(session = %session_name, client_id, "focus error: {}", e);
+                }
+                let resp = Message {
+                    kind: MessageKind::Response,
+                    id: cmd.id.clone(),
+                    ok: true,
+                    ..Default::default()
+                };
+                if writer
+                    .lock()
+                    .await
+                    .write_all(&resp.to_json_line().unwrap_or_default())
+                    .await
+                    .is_err()
                 {
+                    break;
+                }
+            }
+            Some(Command::Input) => {
+                if let Err(e) = sess.input_client(client_id, &cmd.payload) {
                     tracing::debug!(session = %session_name, "write input error: {}", e);
                 }
                 // 兼容 Go 协议：input 也发 ok 响应
@@ -530,7 +569,7 @@ async fn handle_attach<R, W>(
             }
             Some(Command::Resize) => {
                 if cmd.width > 0 && cmd.height > 0 {
-                    let _ = sess.resize(cmd.width, cmd.height);
+                    let _ = sess.resize_client(client_id, cmd.width, cmd.height);
                 }
                 let resp = Message {
                     kind: MessageKind::Response,
@@ -549,7 +588,7 @@ async fn handle_attach<R, W>(
                 }
             }
             Some(Command::Detach) => {
-                sess.detach();
+                sess.detach(client_id);
                 let resp = Message {
                     kind: MessageKind::Response,
                     id: cmd.id.clone(),
@@ -561,7 +600,7 @@ async fn handle_attach<R, W>(
                     .await
                     .write_all(&resp.to_json_line().unwrap_or_default())
                     .await;
-                tracing::info!(session = %session_name, "client detached");
+                tracing::info!(session = %session_name, client_id, "client detached");
                 writer_task_handle.abort();
                 return;
             }
@@ -569,9 +608,9 @@ async fn handle_attach<R, W>(
         }
     }
 
-    sess.detach();
+    sess.detach(client_id);
     writer_task_handle.abort();
-    tracing::debug!(session = %session_name, "client disconnected");
+    tracing::debug!(session = %session_name, client_id, "client disconnected");
 }
 
 fn session_error(name: &str, e: anyhow::Error) -> anyhow::Error {
@@ -582,5 +621,268 @@ fn session_error(name: &str, e: anyhow::Error) -> anyhow::Error {
         anyhow::anyhow!("{}", exited_session_error(name))
     } else {
         e
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    fn test_state() -> Arc<State> {
+        let (stop_tx, _stop_rx) = watch::channel(false);
+        Arc::new(State::new(stop_tx))
+    }
+
+    async fn insert_session(state: &State, name: &str) -> Arc<Session> {
+        let session = Session::new(name.to_string(), 80, 24, None).unwrap();
+        state
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), session.clone());
+        session
+    }
+
+    fn recv_exit(rx: &mut mpsc::UnboundedReceiver<SessionEvent>) -> i32 {
+        for _ in 0..16 {
+            match rx.try_recv().expect("expected session event") {
+                SessionEvent::Output(_) => {}
+                SessionEvent::Exit(code) => return code,
+            }
+        }
+        panic!("expected exit");
+    }
+
+    async fn attach_with_script(
+        state: Arc<State>,
+        name: &str,
+        attach_id: &str,
+        attach_size: (u32, u32),
+        commands: Vec<Message>,
+    ) -> Vec<Message> {
+        let (client, server) = tokio::io::duplex(4096);
+        let handle = tokio::spawn(handle_connection(server, state));
+        let mut reader = BufReader::new(client);
+
+        let attach = Message {
+            kind: MessageKind::Request,
+            id: attach_id.to_string(),
+            command: Some(Command::Attach),
+            name: name.to_string(),
+            width: attach_size.0,
+            height: attach_size.1,
+            ..Default::default()
+        };
+        reader
+            .get_mut()
+            .write_all(&attach.to_json_line().unwrap())
+            .await
+            .unwrap();
+
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let mut messages = vec![Message::from_json(&line).unwrap()];
+
+        for command in commands {
+            reader
+                .get_mut()
+                .write_all(&command.to_json_line().unwrap())
+                .await
+                .unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            messages.push(Message::from_json(&line).unwrap());
+        }
+
+        drop(reader);
+        handle.await.unwrap();
+        messages
+    }
+
+    #[tokio::test]
+    async fn handle_attach_allows_second_client_and_reports_attached_in_list() {
+        let state = test_state();
+        let session = insert_session(&state, "work").await;
+
+        let (client, server) = tokio::io::duplex(4096);
+        let handle = tokio::spawn(handle_connection(server, state.clone()));
+        let mut reader = BufReader::new(client);
+
+        let attach = Message {
+            kind: MessageKind::Request,
+            id: "attach-1".to_string(),
+            command: Some(Command::Attach),
+            name: "work".to_string(),
+            width: 80,
+            height: 24,
+            ..Default::default()
+        };
+        reader
+            .get_mut()
+            .write_all(&attach.to_json_line().unwrap())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let response = Message::from_json(&line).unwrap();
+        assert!(response.ok);
+
+        let messages =
+            attach_with_script(state.clone(), "work", "attach-2", (100, 30), vec![]).await;
+
+        assert!(messages[0].ok);
+        assert_eq!(session.attached_clients.lock().unwrap().len(), 1);
+        assert!(state.list_sessions()[0].attached);
+
+        drop(reader);
+        handle.await.unwrap();
+        session.close();
+    }
+
+    #[tokio::test]
+    async fn handle_attach_detach_removes_only_that_client() {
+        let state = test_state();
+        let session = insert_session(&state, "work").await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (kept_client, _) = session.attach(tx, 80, 24).unwrap();
+
+        let messages = attach_with_script(
+            state.clone(),
+            "work",
+            "attach-1",
+            (100, 30),
+            vec![Message {
+                kind: MessageKind::Request,
+                id: "detach-1".to_string(),
+                command: Some(Command::Detach),
+                name: "work".to_string(),
+                ..Default::default()
+            }],
+        )
+        .await;
+
+        assert!(messages[0].ok);
+        assert!(messages[1].ok);
+        let attached = session.attached_clients.lock().unwrap();
+        assert_eq!(attached.len(), 1);
+        assert!(attached.contains_key(&kept_client));
+        drop(attached);
+
+        session.close();
+    }
+
+    #[tokio::test]
+    async fn dispatch_kill_notifies_all_attached_clients_and_removes_session() {
+        let state = test_state();
+        let session = insert_session(&state, "work").await;
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+
+        let _ = session.attach(tx1, 80, 24).unwrap();
+        let _ = session.attach(tx2, 100, 30).unwrap();
+
+        let response = dispatch_command(
+            &Message {
+                kind: MessageKind::Request,
+                id: "kill-1".to_string(),
+                command: Some(Command::Kill),
+                name: "work".to_string(),
+                ..Default::default()
+            },
+            &state,
+        )
+        .await;
+
+        assert!(response.ok);
+        assert_eq!(response.id, "kill-1");
+        assert!(state.get_session("work").is_none());
+        assert_eq!(recv_exit(&mut rx1), -1);
+        assert_eq!(recv_exit(&mut rx2), -1);
+        assert!(!session.is_attached());
+    }
+
+    #[tokio::test]
+    async fn handle_attach_focus_applies_attached_client_size() {
+        let state = test_state();
+        let session = insert_session(&state, "work").await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (first_client, _) = session.attach(tx, 80, 24).unwrap();
+
+        let (client, server) = tokio::io::duplex(4096);
+        let handle = tokio::spawn(handle_connection(server, state.clone()));
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+
+        let attach = Message {
+            kind: MessageKind::Request,
+            id: "attach-1".to_string(),
+            command: Some(Command::Attach),
+            name: "work".to_string(),
+            width: 100,
+            height: 30,
+            ..Default::default()
+        };
+        reader
+            .get_mut()
+            .write_all(&attach.to_json_line().unwrap())
+            .await
+            .unwrap();
+        reader.read_line(&mut line).await.unwrap();
+        let attach_resp = Message::from_json(&line).unwrap();
+        assert!(attach_resp.ok);
+
+        line.clear();
+        let resize = Message {
+            kind: MessageKind::Request,
+            id: "resize-1".to_string(),
+            command: Some(Command::Resize),
+            name: "work".to_string(),
+            width: 120,
+            height: 40,
+            ..Default::default()
+        };
+        reader
+            .get_mut()
+            .write_all(&resize.to_json_line().unwrap())
+            .await
+            .unwrap();
+        reader.read_line(&mut line).await.unwrap();
+        let resize_resp = Message::from_json(&line).unwrap();
+        assert!(resize_resp.ok);
+
+        session.focus_client(first_client).unwrap();
+        assert_eq!((session.width(), session.height()), (80, 24));
+        assert_eq!(
+            *session.active_client_id.lock().unwrap(),
+            Some(first_client)
+        );
+
+        line.clear();
+        let focus = Message {
+            kind: MessageKind::Request,
+            id: "focus-1".to_string(),
+            command: Some(Command::Focus),
+            name: "work".to_string(),
+            ..Default::default()
+        };
+        reader
+            .get_mut()
+            .write_all(&focus.to_json_line().unwrap())
+            .await
+            .unwrap();
+        reader.read_line(&mut line).await.unwrap();
+        let focus_resp = Message::from_json(&line).unwrap();
+        assert!(focus_resp.ok);
+
+        assert_eq!((session.width(), session.height()), (120, 40));
+        assert_ne!(
+            *session.active_client_id.lock().unwrap(),
+            Some(first_client)
+        );
+
+        drop(reader);
+        handle.await.unwrap();
+        session.close();
     }
 }

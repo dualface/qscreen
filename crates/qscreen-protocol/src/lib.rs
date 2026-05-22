@@ -34,6 +34,7 @@ pub enum Command {
     List,
     Attach,
     Detach,
+    Focus,
     Input,
     Resize,
     Kill,
@@ -239,6 +240,13 @@ pub fn validate_resize(width: u32, height: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn validate_attach_size(width: u32, height: u32) -> anyhow::Result<()> {
+    if width == 0 || height == 0 {
+        anyhow::bail!("attach terminal size must set both width and height");
+    }
+    validate_resize(width, height)
+}
+
 pub fn validate_new_size(width: u32, height: u32) -> anyhow::Result<()> {
     if width == 0 && height == 0 {
         return Ok(());
@@ -311,6 +319,22 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_focus_command() {
+        let msg = Message {
+            kind: MessageKind::Request,
+            id: "focus-1".to_string(),
+            command: Some(Command::Focus),
+            name: "test".to_string(),
+            ..Default::default()
+        };
+        let line = msg.to_json_line().unwrap();
+        let json_str = std::str::from_utf8(&line).unwrap();
+        assert!(json_str.contains(r#""command":"focus""#));
+        let decoded = Message::from_json(json_str).unwrap();
+        assert_eq!(decoded.command, Some(Command::Focus));
+    }
+
+    #[test]
     fn round_trip_payload() {
         let payload = b"hello\x1b[6n world".to_vec();
         let msg = Message {
@@ -368,5 +392,38 @@ mod tests {
         assert!(validate_session_name("").is_err());
         assert!(validate_session_name("bad name").is_err());
         assert!(validate_session_name(&"x".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn validate_attach_size_rejects_missing_width() {
+        let msg = Message::from_json(
+            r#"{"kind":"request","id":"1","command":"attach","name":"main","height":24}"#,
+        )
+        .unwrap();
+        assert!(validate_attach_size(msg.width, msg.height).is_err());
+    }
+
+    #[test]
+    fn validate_attach_size_rejects_missing_height() {
+        let msg = Message::from_json(
+            r#"{"kind":"request","id":"1","command":"attach","name":"main","width":80}"#,
+        )
+        .unwrap();
+        assert!(validate_attach_size(msg.width, msg.height).is_err());
+    }
+
+    #[test]
+    fn validate_attach_size_rejects_zero_width() {
+        assert!(validate_attach_size(0, 24).is_err());
+    }
+
+    #[test]
+    fn validate_attach_size_rejects_zero_height() {
+        assert!(validate_attach_size(80, 0).is_err());
+    }
+
+    #[test]
+    fn validate_attach_size_accepts_valid_size() {
+        validate_attach_size(80, 24).unwrap();
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,11 +17,19 @@ const DEFAULT_WINDOWS_SHELL: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0
 #[cfg(any(windows, test))]
 const CMD_WINDOWS_SHELL: &str = r"C:\Windows\System32\cmd.exe";
 
-/// PTY 输出事件，通过 attached_tx 发给当前 attach 的客户端
+pub type ClientId = u64;
+
+/// PTY 输出事件，通过 attached_clients 发给当前 attach 的客户端
 #[derive(Debug)]
 pub enum SessionEvent {
     Output(Bytes),
     Exit(i32),
+}
+
+pub struct AttachedClient {
+    pub tx: mpsc::UnboundedSender<SessionEvent>,
+    pub width: u16,
+    pub height: u16,
 }
 
 /// 256KB 环形 scrollback buffer（字节级）
@@ -65,8 +74,10 @@ pub struct Session {
     /// PTY writer：写 input
     pty_writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     pub scrollback: Arc<Mutex<ScrollbackBuf>>,
-    /// 已 attach 客户端的事件发送端；None = detached
-    pub attached_tx: Arc<Mutex<Option<mpsc::UnboundedSender<SessionEvent>>>>,
+    /// 已 attach 客户端；空 map = detached
+    pub attached_clients: Arc<Mutex<HashMap<ClientId, AttachedClient>>>,
+    pub active_client_id: Arc<Mutex<Option<ClientId>>>,
+    next_client_id: Arc<Mutex<ClientId>>,
 }
 
 impl Session {
@@ -106,8 +117,10 @@ impl Session {
         drop(pair.slave);
 
         let scrollback = Arc::new(Mutex::new(ScrollbackBuf::new()));
-        let attached_tx: Arc<Mutex<Option<mpsc::UnboundedSender<SessionEvent>>>> =
-            Arc::new(Mutex::new(None));
+        let attached_clients: Arc<Mutex<HashMap<ClientId, AttachedClient>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let active_client_id: Arc<Mutex<Option<ClientId>>> = Arc::new(Mutex::new(None));
+        let next_client_id = Arc::new(Mutex::new(1));
         let exited = Arc::new(AtomicBool::new(false));
         let exit_code: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
         let closed = Arc::new(AtomicBool::new(false));
@@ -125,13 +138,16 @@ impl Session {
             pty_master: pty_master.clone(),
             pty_writer: pty_writer_arc.clone(),
             scrollback: scrollback.clone(),
-            attached_tx: attached_tx.clone(),
+            attached_clients: attached_clients.clone(),
+            active_client_id: active_client_id.clone(),
+            next_client_id,
         });
 
         // PTY output 读取任务（阻塞 IO，放在 spawn_blocking）
         {
             let scrollback_r = scrollback.clone();
-            let attached_r = attached_tx.clone();
+            let attached_r = attached_clients.clone();
+            let active_client_r = active_client_id.clone();
             let exited_r = exited.clone();
             let name_r = name.clone();
             tokio::task::spawn_blocking(move || {
@@ -143,9 +159,7 @@ impl Session {
                         Ok(n) => {
                             let data = Bytes::copy_from_slice(&buf[..n]);
                             scrollback_r.lock().unwrap().append(&data);
-                            if let Some(tx) = attached_r.lock().unwrap().as_ref() {
-                                let _ = tx.send(SessionEvent::Output(data));
-                            }
+                            broadcast_output(&attached_r, &active_client_r, data);
                         }
                     }
                 }
@@ -156,7 +170,8 @@ impl Session {
 
         // 子进程退出等待任务
         {
-            let attached_e = attached_tx.clone();
+            let attached_e = attached_clients.clone();
+            let active_client_e = active_client_id.clone();
             let exited_e = exited.clone();
             let exit_code_e = exit_code.clone();
             let name_e = name.clone();
@@ -169,9 +184,11 @@ impl Session {
                 tracing::info!(session = %name_e, exit_code = code, "session exited");
                 *exit_code_e.lock().unwrap() = Some(code);
                 exited_e.store(true, Ordering::SeqCst);
-                if let Some(tx) = attached_e.lock().unwrap().take() {
-                    let _ = tx.send(SessionEvent::Exit(code));
+                let mut attached = attached_e.lock().unwrap();
+                for (_, client) in attached.drain() {
+                    let _ = client.tx.send(SessionEvent::Exit(code));
                 }
+                *active_client_e.lock().unwrap() = None;
             });
         }
 
@@ -186,11 +203,45 @@ impl Session {
         *self.height.lock().unwrap()
     }
 
-    /// 写输入到 PTY（forwarded from client Input 命令）
-    pub fn write_input(&self, data: &[u8]) -> anyhow::Result<()> {
+    fn ensure_open(&self) -> anyhow::Result<()> {
         if self.closed.load(Ordering::SeqCst) {
             anyhow::bail!("session is closed");
         }
+        Ok(())
+    }
+
+    fn resize_pty(&self, width: u16, height: u16) -> anyhow::Result<()> {
+        self.ensure_open()?;
+        let guard = self.pty_master.lock().unwrap();
+        match guard.as_ref() {
+            None => anyhow::bail!("session is closed"),
+            Some(m) => {
+                m.resize(PtySize {
+                    rows: height,
+                    cols: width,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .context("resize pty")?;
+            }
+        }
+        drop(guard);
+        *self.width.lock().unwrap() = width;
+        *self.height.lock().unwrap() = height;
+        Ok(())
+    }
+
+    fn client_size(&self, client_id: ClientId) -> anyhow::Result<(u16, u16)> {
+        let attached = self.attached_clients.lock().unwrap();
+        let client = attached
+            .get(&client_id)
+            .ok_or_else(|| anyhow::anyhow!("client {client_id} is not attached"))?;
+        Ok((client.width, client.height))
+    }
+
+    /// 写输入到 PTY（forwarded from client Input 命令）
+    pub fn write_input(&self, data: &[u8]) -> anyhow::Result<()> {
+        self.ensure_open()?;
         let mut guard = self.pty_writer.lock().unwrap();
         match guard.as_mut() {
             None => anyhow::bail!("session is closed"),
@@ -203,51 +254,84 @@ impl Session {
 
     /// resize PTY
     pub fn resize(&self, width: u32, height: u32) -> anyhow::Result<()> {
-        if self.closed.load(Ordering::SeqCst) {
-            anyhow::bail!("session is closed");
-        }
-        let w = width as u16;
-        let h = height as u16;
-        let guard = self.pty_master.lock().unwrap();
-        match guard.as_ref() {
-            None => anyhow::bail!("session is closed"),
-            Some(m) => {
-                m.resize(PtySize {
-                    rows: h,
-                    cols: w,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .context("resize pty")?;
-            }
-        }
-        drop(guard);
-        *self.width.lock().unwrap() = w;
-        *self.height.lock().unwrap() = h;
-        Ok(())
+        self.resize_pty(width as u16, height as u16)
     }
 
     /// Attach 一个客户端：返回 scrollback 快照 + 注册事件发送端
-    /// 返回 Err 如果已有客户端 attach 或 session 已退出
-    pub fn attach(&self, tx: mpsc::UnboundedSender<SessionEvent>) -> anyhow::Result<Vec<u8>> {
+    /// 返回 Err 如果 session 已退出
+    pub fn attach(
+        &self,
+        tx: mpsc::UnboundedSender<SessionEvent>,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<(ClientId, Vec<u8>)> {
         if self.exited.load(Ordering::SeqCst) {
             anyhow::bail!("session has exited");
         }
         if self.closed.load(Ordering::SeqCst) {
             anyhow::bail!("session is closed");
         }
-        let mut guard = self.attached_tx.lock().unwrap();
-        if guard.is_some() {
-            anyhow::bail!("session is already attached");
-        }
+        self.resize(width, height)?;
+
         let scrollback = self.scrollback.lock().unwrap().snapshot();
-        *guard = Some(tx);
-        Ok(scrollback)
+        let mut next_id = self.next_client_id.lock().unwrap();
+        let client_id = *next_id;
+        *next_id += 1;
+        drop(next_id);
+
+        let w = width as u16;
+        let h = height as u16;
+        let mut guard = self.attached_clients.lock().unwrap();
+        guard.insert(
+            client_id,
+            AttachedClient {
+                tx,
+                width: w,
+                height: h,
+            },
+        );
+        *self.active_client_id.lock().unwrap() = Some(client_id);
+        Ok((client_id, scrollback))
     }
 
-    /// Detach 当前客户端（幂等）
-    pub fn detach(&self) {
-        self.attached_tx.lock().unwrap().take();
+    pub fn focus_client(&self, client_id: ClientId) -> anyhow::Result<()> {
+        let (width, height) = self.client_size(client_id)?;
+        *self.active_client_id.lock().unwrap() = Some(client_id);
+        self.resize_pty(width, height)
+    }
+
+    pub fn input_client(&self, client_id: ClientId, data: &[u8]) -> anyhow::Result<()> {
+        self.focus_client(client_id)?;
+        self.write_input(data)
+    }
+
+    pub fn resize_client(
+        &self,
+        client_id: ClientId,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<()> {
+        self.ensure_open()?;
+        {
+            let mut attached = self.attached_clients.lock().unwrap();
+            let client = attached
+                .get_mut(&client_id)
+                .ok_or_else(|| anyhow::anyhow!("client {client_id} is not attached"))?;
+            client.width = width as u16;
+            client.height = height as u16;
+        }
+        if *self.active_client_id.lock().unwrap() == Some(client_id) {
+            self.resize_pty(width as u16, height as u16)?;
+        }
+        Ok(())
+    }
+
+    /// Detach 指定客户端（幂等）
+    pub fn detach(&self, client_id: ClientId) {
+        self.attached_clients.lock().unwrap().remove(&client_id);
+        if *self.active_client_id.lock().unwrap() == Some(client_id) {
+            *self.active_client_id.lock().unwrap() = None;
+        }
     }
 
     /// 关闭 session（kill PTY）
@@ -257,13 +341,47 @@ impl Session {
         self.pty_writer.lock().unwrap().take();
         self.pty_master.lock().unwrap().take();
         // 通知已 attach 的客户端
-        if let Some(tx) = self.attached_tx.lock().unwrap().take() {
-            let _ = tx.send(SessionEvent::Exit(-1));
+        let mut attached = self.attached_clients.lock().unwrap();
+        for (_, client) in attached.drain() {
+            let _ = client.tx.send(SessionEvent::Exit(-1));
         }
+        *self.active_client_id.lock().unwrap() = None;
     }
 
     pub fn is_attached(&self) -> bool {
-        self.attached_tx.lock().unwrap().is_some()
+        !self.attached_clients.lock().unwrap().is_empty()
+    }
+}
+
+fn broadcast_output(
+    attached_clients: &Arc<Mutex<HashMap<ClientId, AttachedClient>>>,
+    active_client_id: &Arc<Mutex<Option<ClientId>>>,
+    data: Bytes,
+) {
+    let failed_clients = {
+        let attached = attached_clients.lock().unwrap();
+        attached
+            .iter()
+            .filter_map(|(client_id, client)| {
+                client
+                    .tx
+                    .send(SessionEvent::Output(data.clone()))
+                    .err()
+                    .map(|_| *client_id)
+            })
+            .collect::<Vec<_>>()
+    };
+    if failed_clients.is_empty() {
+        return;
+    }
+
+    let mut attached = attached_clients.lock().unwrap();
+    let mut active = active_client_id.lock().unwrap();
+    for client_id in failed_clients {
+        attached.remove(&client_id);
+        if *active == Some(client_id) {
+            *active = None;
+        }
     }
 }
 
@@ -353,5 +471,152 @@ mod tests {
             .to_string();
 
         assert!(err.contains("unsupported Windows shell value: pwsh"));
+    }
+
+    fn recv_output_matching(rx: &mut mpsc::UnboundedReceiver<SessionEvent>, expected: &[u8]) {
+        for _ in 0..16 {
+            match rx.try_recv().expect("expected session event") {
+                SessionEvent::Output(data) if data == expected => return,
+                SessionEvent::Output(_) => {}
+                SessionEvent::Exit(code) => panic!("expected output, got exit {code}"),
+            }
+        }
+        panic!("expected matching output");
+    }
+
+    fn recv_exit(rx: &mut mpsc::UnboundedReceiver<SessionEvent>) -> i32 {
+        for _ in 0..16 {
+            match rx.try_recv().expect("expected session event") {
+                SessionEvent::Output(_) => {}
+                SessionEvent::Exit(code) => return code,
+            }
+        }
+        panic!("expected exit");
+    }
+
+    #[tokio::test]
+    async fn attach_multiple_clients_and_detach_independently() {
+        let session = Session::new("multi-detach".to_string(), 80, 24, None).unwrap();
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+
+        let (client1, scrollback1) = session.attach(tx1, 80, 24).unwrap();
+        let (client2, scrollback2) = session.attach(tx2, 100, 30).unwrap();
+
+        assert_ne!(client1, client2);
+        assert_eq!(scrollback1, scrollback2);
+        assert!(session.is_attached());
+        assert_eq!(session.attached_clients.lock().unwrap().len(), 2);
+        assert_eq!(*session.active_client_id.lock().unwrap(), Some(client2));
+
+        session.detach(client1);
+        assert!(session.is_attached());
+        assert_eq!(session.attached_clients.lock().unwrap().len(), 1);
+        assert!(
+            session
+                .attached_clients
+                .lock()
+                .unwrap()
+                .contains_key(&client2)
+        );
+
+        session.close();
+    }
+
+    #[tokio::test]
+    async fn broadcast_output_reaches_all_clients_and_removes_only_failed_senders() {
+        let session = Session::new("multi-broadcast".to_string(), 80, 24, None).unwrap();
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let (tx2, rx2) = mpsc::unbounded_channel();
+        let (tx3, mut rx3) = mpsc::unbounded_channel();
+
+        let (client1, _) = session.attach(tx1, 80, 24).unwrap();
+        let (failed_client, _) = session.attach(tx2, 80, 24).unwrap();
+        let (client3, _) = session.attach(tx3, 80, 24).unwrap();
+        drop(rx2);
+
+        broadcast_output(
+            &session.attached_clients,
+            &session.active_client_id,
+            Bytes::from_static(b"chunk"),
+        );
+
+        recv_output_matching(&mut rx1, b"chunk");
+        recv_output_matching(&mut rx3, b"chunk");
+        let attached = session.attached_clients.lock().unwrap();
+        assert!(attached.contains_key(&client1));
+        assert!(!attached.contains_key(&failed_client));
+        assert!(attached.contains_key(&client3));
+        drop(attached);
+
+        session.close();
+    }
+
+    #[tokio::test]
+    async fn close_notifies_all_attached_clients() {
+        let session = Session::new("multi-close".to_string(), 80, 24, None).unwrap();
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+
+        let _ = session.attach(tx1, 80, 24).unwrap();
+        let _ = session.attach(tx2, 80, 24).unwrap();
+
+        session.close();
+
+        assert_eq!(recv_exit(&mut rx1), -1);
+        assert_eq!(recv_exit(&mut rx2), -1);
+        assert!(!session.is_attached());
+        assert_eq!(*session.active_client_id.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn inactive_resize_stores_size_without_pty_resize_until_focus_or_input() {
+        let session = Session::new("multi-size".to_string(), 80, 24, None).unwrap();
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+
+        let (client1, _) = session.attach(tx1, 80, 24).unwrap();
+        let (client2, _) = session.attach(tx2, 100, 30).unwrap();
+
+        assert_eq!(*session.active_client_id.lock().unwrap(), Some(client2));
+        assert_eq!((session.width(), session.height()), (100, 30));
+
+        session.resize_client(client1, 120, 40).unwrap();
+
+        assert_eq!(*session.active_client_id.lock().unwrap(), Some(client2));
+        assert_eq!((session.width(), session.height()), (100, 30));
+        {
+            let attached = session.attached_clients.lock().unwrap();
+            let resized = attached.get(&client1).unwrap();
+            assert_eq!((resized.width, resized.height), (120, 40));
+        }
+
+        session.focus_client(client1).unwrap();
+
+        assert_eq!(*session.active_client_id.lock().unwrap(), Some(client1));
+        assert_eq!((session.width(), session.height()), (120, 40));
+
+        session.close();
+    }
+
+    #[tokio::test]
+    async fn input_client_marks_active_and_applies_client_size() {
+        let session = Session::new("multi-input-size".to_string(), 80, 24, None).unwrap();
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+
+        let (client1, _) = session.attach(tx1, 80, 24).unwrap();
+        let (client2, _) = session.attach(tx2, 100, 30).unwrap();
+        session.resize_client(client1, 90, 20).unwrap();
+
+        assert_eq!(*session.active_client_id.lock().unwrap(), Some(client2));
+        assert_eq!((session.width(), session.height()), (100, 30));
+
+        session.input_client(client1, b"").unwrap();
+
+        assert_eq!(*session.active_client_id.lock().unwrap(), Some(client1));
+        assert_eq!((session.width(), session.height()), (90, 20));
+
+        session.close();
     }
 }
