@@ -25,6 +25,7 @@ crossterm = "0.28"
 anyhow = "1"
 bytes = "1"
 vt100 = "0.15"
+unicode-width = "0.2"
 qscreen-protocol = { path = "crates/qscreen-protocol" }
 qscreen-shared = { path = "crates/qscreen-shared" }
 qscreen-daemon = { path = "crates/qscreen-daemon" }

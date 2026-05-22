@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use qscreen_protocol::{
-    Command, EventType, MAX_PAYLOAD_SIZE, Message, MessageKind, SessionInfo,
-    attached_session_error, exited_session_error, missing_session_error, validate_attach_size,
-    validate_new_size, validate_resize, validate_session_id, validate_session_name,
+    Command, EventType, Message, MessageKind, SessionInfo, attached_session_error,
+    exited_session_error, missing_session_error, validate_attach_size, validate_new_size,
+    validate_resize, validate_session_id, validate_session_name,
 };
 use qscreen_shared::pipe_name;
 use session::{Session, SessionEvent};
@@ -380,7 +380,7 @@ async fn dispatch_inner(msg: &Message, state: &State) -> anyhow::Result<Message>
     }
 }
 
-/// attach 命令处理：握手 → 发送 scrollback → 双向 IO 循环
+/// attach 命令处理：握手 → 发送当前 screen frame → 双向 IO 循环
 async fn handle_attach<R, W>(
     msg: Message,
     mut reader: BufReader<R>,
@@ -445,7 +445,7 @@ async fn handle_attach<R, W>(
 
     // 注册事件接收 channel
     let (tx, mut rx) = mpsc::unbounded_channel::<SessionEvent>();
-    let (client_id, scrollback) = match sess.attach(tx, msg.width, msg.height) {
+    let (client_id, screen_frame) = match sess.attach(tx, msg.width, msg.height) {
         Ok(result) => result,
         Err(e) => {
             let resp = Message {
@@ -486,29 +486,30 @@ async fn handle_attach<R, W>(
         return;
     }
 
-    // 发送 scrollback（分块，每块不超过 MAX_PAYLOAD_SIZE）
-    let mut offset = 0;
-    while offset < scrollback.len() {
-        let end = (offset + MAX_PAYLOAD_SIZE).min(scrollback.len());
-        let chunk = scrollback[offset..end].to_vec();
-        offset = end;
-        let event = Message {
-            kind: MessageKind::Event,
-            event: Some(EventType::Output),
-            session_id: session_id.clone(),
-            payload: chunk,
-            ..Default::default()
-        };
-        if writer
-            .lock()
-            .await
-            .write_all(&event.to_json_line().unwrap_or_default())
-            .await
-            .is_err()
-        {
+    let frame_payload = match serde_json::to_vec(&screen_frame) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!(session_id = %session_id, error = %e, "serialize screen frame failed");
             sess.detach(client_id);
             return;
         }
+    };
+    let frame_event = Message {
+        kind: MessageKind::Event,
+        event: Some(EventType::Frame),
+        session_id: session_id.clone(),
+        payload: frame_payload,
+        ..Default::default()
+    };
+    if writer
+        .lock()
+        .await
+        .write_all(&frame_event.to_json_line().unwrap_or_default())
+        .await
+        .is_err()
+    {
+        sess.detach(client_id);
+        return;
     }
 
     // 启动 writer 任务：PTY 输出 → client
@@ -1002,7 +1003,7 @@ mod tests {
         reader.read_line(&mut line).await.unwrap();
         let screen_event = Message::from_json(&line).unwrap();
         assert_eq!(screen_event.kind, MessageKind::Event);
-        assert_eq!(screen_event.event, Some(EventType::Output));
+        assert_eq!(screen_event.event, Some(EventType::Frame));
 
         line.clear();
         let resize = Message {

@@ -7,6 +7,10 @@ use anyhow::Context;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
+use qscreen_protocol::{
+    FRAME_FLAG_BOLD, FRAME_FLAG_INVERSE, FRAME_FLAG_ITALIC, FRAME_FLAG_UNDERLINE, FrameColor,
+    ScreenFrame, ScreenRun,
+};
 use tokio::sync::mpsc;
 
 pub const SCROLLBACK_LIMIT: usize = 256 * 1024;
@@ -279,14 +283,14 @@ impl Session {
         self.resize_pty(width as u16, height as u16)
     }
 
-    /// Attach 一个客户端：返回当前 screen 快照 + 注册事件发送端
+    /// Attach 一个客户端：返回当前 screen frame + 注册事件发送端
     /// 返回 Err 如果 session 已退出
     pub fn attach(
         &self,
         tx: mpsc::UnboundedSender<SessionEvent>,
         width: u32,
         height: u32,
-    ) -> anyhow::Result<(ClientId, Vec<u8>)> {
+    ) -> anyhow::Result<(ClientId, ScreenFrame)> {
         if self.exited.load(Ordering::SeqCst) {
             anyhow::bail!("session has exited");
         }
@@ -295,7 +299,7 @@ impl Session {
         }
         self.resize(width, height)?;
 
-        let screen_snapshot = self.screen.lock().unwrap().screen().contents_formatted();
+        let screen_frame = self.screen_frame();
         let mut next_id = self.next_client_id.lock().unwrap();
         let client_id = *next_id;
         *next_id += 1;
@@ -313,7 +317,60 @@ impl Session {
             },
         );
         *self.active_client_id.lock().unwrap() = Some(client_id);
-        Ok((client_id, screen_snapshot))
+        Ok((client_id, screen_frame))
+    }
+
+    fn screen_frame(&self) -> ScreenFrame {
+        let parser = self.screen.lock().unwrap();
+        let screen = parser.screen();
+        let (rows, cols) = screen.size();
+        let (cursor_row, cursor_col) = screen.cursor_position();
+        let mut rows_v2 = Vec::with_capacity(rows as usize);
+
+        for row in 0..rows {
+            let mut runs = Vec::new();
+            let mut current: Option<ScreenRun> = None;
+
+            for col in 0..cols {
+                let Some(cell) = screen.cell(row, col) else {
+                    push_cell_run(
+                        &mut runs,
+                        &mut current,
+                        " ".to_string(),
+                        1,
+                        default_run_attrs(),
+                    );
+                    continue;
+                };
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+
+                let text = if cell.has_contents() {
+                    cell.contents()
+                } else {
+                    " ".to_string()
+                };
+                let width = if cell.is_wide() { 2 } else { 1 };
+                let attrs = cell_run_attrs(cell);
+                push_cell_run(&mut runs, &mut current, text, width, attrs);
+            }
+
+            if let Some(run) = current.take() {
+                runs.push(run);
+            }
+            rows_v2.push(runs);
+        }
+
+        ScreenFrame {
+            rows,
+            cols,
+            cursor_row,
+            cursor_col,
+            hide_cursor: screen.hide_cursor(),
+            alternate_screen: screen.alternate_screen(),
+            rows_v2,
+        }
     }
 
     pub fn focus_client(&self, client_id: ClientId) -> anyhow::Result<()> {
@@ -375,6 +432,67 @@ impl Session {
 
     pub fn is_attached(&self) -> bool {
         !self.attached_clients.lock().unwrap().is_empty()
+    }
+}
+
+fn push_cell_run(
+    runs: &mut Vec<ScreenRun>,
+    current: &mut Option<ScreenRun>,
+    text: String,
+    width: u16,
+    attrs: (FrameColor, FrameColor, u8),
+) {
+    let (fg, bg, flags) = attrs;
+    match current.as_mut() {
+        Some(run) if run.fg == fg && run.bg == bg && run.flags == flags => {
+            run.text.push_str(&text);
+            run.width = run.width.saturating_add(width);
+        }
+        _ => {
+            if let Some(run) = current.take() {
+                runs.push(run);
+            }
+            *current = Some(ScreenRun {
+                text,
+                fg,
+                bg,
+                flags,
+                width,
+            });
+        }
+    }
+}
+
+fn default_run_attrs() -> (FrameColor, FrameColor, u8) {
+    (FrameColor::Default, FrameColor::Default, 0)
+}
+
+fn cell_run_attrs(cell: &vt100::Cell) -> (FrameColor, FrameColor, u8) {
+    let mut flags = 0;
+    if cell.bold() {
+        flags |= FRAME_FLAG_BOLD;
+    }
+    if cell.italic() {
+        flags |= FRAME_FLAG_ITALIC;
+    }
+    if cell.underline() {
+        flags |= FRAME_FLAG_UNDERLINE;
+    }
+    if cell.inverse() {
+        flags |= FRAME_FLAG_INVERSE;
+    }
+    (
+        frame_color(cell.fgcolor()),
+        frame_color(cell.bgcolor()),
+        flags,
+    )
+}
+
+fn frame_color(color: vt100::Color) -> FrameColor {
+    match color {
+        vt100::Color::Default => FrameColor::Default,
+        vt100::Color::Idx(value) => FrameColor::Idx(value),
+        vt100::Color::Rgb(r, g, b) => FrameColor::Rgb(r, g, b),
     }
 }
 
@@ -542,11 +660,12 @@ mod tests {
         let (tx1, _rx1) = mpsc::unbounded_channel();
         let (tx2, _rx2) = mpsc::unbounded_channel();
 
-        let (client1, scrollback1) = session.attach(tx1, 80, 24).unwrap();
-        let (client2, scrollback2) = session.attach(tx2, 100, 30).unwrap();
+        let (client1, frame1) = session.attach(tx1, 80, 24).unwrap();
+        let (client2, frame2) = session.attach(tx2, 100, 30).unwrap();
 
         assert_ne!(client1, client2);
-        assert_eq!(scrollback1, scrollback2);
+        assert_eq!((frame1.cols, frame1.rows), (80, 24));
+        assert_eq!((frame2.cols, frame2.rows), (100, 30));
         assert!(session.is_attached());
         assert_eq!(session.attached_clients.lock().unwrap().len(), 2);
         assert_eq!(*session.active_client_id.lock().unwrap(), Some(client2));
@@ -673,21 +792,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_returns_current_screen_snapshot() {
-        let session =
-            Session::new("1".to_string(), "snapshot".to_string(), 80, 24, None).unwrap();
-        session.scrollback.lock().unwrap().append(b"old history\r\n");
+    async fn attach_returns_current_screen_frame() {
+        let session = Session::new("1".to_string(), "frame".to_string(), 80, 24, None).unwrap();
+        session
+            .scrollback
+            .lock()
+            .unwrap()
+            .append(b"old history\r\n");
         {
             let mut screen = session.screen.lock().unwrap();
             screen.process(b"\x1b[2J\x1b[Hcurrent");
         }
         let (tx, _rx) = mpsc::unbounded_channel();
 
-        let (_, snapshot) = session.attach(tx, 80, 24).unwrap();
+        let (_, frame) = session.attach(tx, 80, 24).unwrap();
+        let frame_text = frame
+            .rows_v2
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|run| run.text.as_str())
+            .collect::<String>();
 
-        assert!(snapshot.contains(&0x1b));
-        assert!(snapshot.windows(b"current".len()).any(|w| w == b"current"));
-        assert!(!snapshot.windows(b"old history".len()).any(|w| w == b"old history"));
+        assert_eq!((frame.cols, frame.rows), (80, 24));
+        assert!(frame_text.contains("current"));
+        assert!(!frame_text.contains("old history"));
 
         session.close();
     }

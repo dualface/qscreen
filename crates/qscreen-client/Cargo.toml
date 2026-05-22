@@ -20,3 +20,4 @@ crossterm = { workspace = true }
 chrono = { workspace = true }
 bytes = { workspace = true }
 vt100 = { workspace = true }
+unicode-width = { workspace = true }

@@ -46,7 +46,44 @@ pub enum Command {
 #[serde(rename_all = "lowercase")]
 pub enum EventType {
     Output,
+    Frame,
     Exit,
+}
+
+pub const FRAME_FLAG_BOLD: u8 = 0b0000_0001;
+pub const FRAME_FLAG_ITALIC: u8 = 0b0000_0010;
+pub const FRAME_FLAG_UNDERLINE: u8 = 0b0000_0100;
+pub const FRAME_FLAG_INVERSE: u8 = 0b0000_1000;
+
+/// Structured visible terminal state, copied from psmux's row/run model.
+/// This avoids replaying a vt100 ANSI dump into an xterm host on reattach.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ScreenFrame {
+    pub rows: u16,
+    pub cols: u16,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+    pub hide_cursor: bool,
+    pub alternate_screen: bool,
+    pub rows_v2: Vec<Vec<ScreenRun>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenRun {
+    pub text: String,
+    pub fg: FrameColor,
+    pub bg: FrameColor,
+    pub flags: u8,
+    pub width: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", content = "value", rename_all = "lowercase")]
+pub enum FrameColor {
+    #[default]
+    Default,
+    Idx(u8),
+    Rgb(u8, u8, u8),
 }
 
 // ── SessionInfo ─────────────────────────────────────────────────────────────
@@ -390,6 +427,36 @@ mod tests {
         );
         let decoded = Message::from_json(json_str).unwrap();
         assert_eq!(decoded.payload, payload);
+    }
+
+    #[test]
+    fn round_trip_frame_event_type() {
+        let frame = ScreenFrame {
+            rows: 1,
+            cols: 5,
+            rows_v2: vec![vec![ScreenRun {
+                text: "hello".to_string(),
+                fg: FrameColor::Default,
+                bg: FrameColor::Idx(4),
+                flags: FRAME_FLAG_BOLD,
+                width: 5,
+            }]],
+            ..Default::default()
+        };
+        let payload = serde_json::to_vec(&frame).unwrap();
+        let msg = Message {
+            kind: MessageKind::Event,
+            event: Some(EventType::Frame),
+            payload: payload.clone(),
+            ..Default::default()
+        };
+
+        let line = msg.to_json_line().unwrap();
+        let decoded = Message::from_json(std::str::from_utf8(&line).unwrap()).unwrap();
+        let decoded_frame: ScreenFrame = serde_json::from_slice(&decoded.payload).unwrap();
+
+        assert_eq!(decoded.event, Some(EventType::Frame));
+        assert_eq!(decoded_frame, frame);
     }
 
     #[test]
