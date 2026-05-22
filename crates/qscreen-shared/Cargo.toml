@@ -1,0 +1,6 @@
+[package]
+name = "qscreen-shared"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
