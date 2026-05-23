@@ -3,5 +3,8 @@ Thumbs.db
 
 /target/
 /worktrees/
+/dist/
 
+/qscn
+/qscn.exe
 
