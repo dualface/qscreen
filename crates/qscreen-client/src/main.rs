@@ -898,6 +898,7 @@ async fn run_attach_loop(
 
     let (cols, rows) = term_size;
     let mut screen = term::TermScreen::new(rows, cols);
+    let mut frame_renderer = term::FrameRenderer::default();
 
     let writer_c = writer.clone();
     let session_id_c = session_id.clone();
@@ -940,7 +941,7 @@ async fn run_attach_loop(
                                 }
                             }
                             if let Some(frame) = latest_frame.as_ref() {
-                                let _ = term::render_screen_frame(&mut stdout, &frame);
+                                let _ = frame_renderer.render(&mut stdout, frame);
                             }
                         }
                         Some(EventType::Exit) => break AttachOutcome::Ended,
@@ -973,6 +974,7 @@ async fn run_attach_loop(
                     }
                     Some(AttachAction::Resize(w, h)) => {
                         screen.resize(h, w);
+                        frame_renderer.reset();
                         msg_id += 1;
                         let resize_msg = Message {
                             kind: MessageKind::Request,
@@ -1025,6 +1027,7 @@ async fn run_attach_loop(
                             }
                             SessionListSelection::Close | SessionListSelection::Error(_) => {
                                 let (w, h) = screen.size();
+                                frame_renderer.reset();
                                 msg_id += 1;
                                 let resize_msg = Message {
                                     kind: MessageKind::Request,

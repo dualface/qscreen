@@ -3,6 +3,7 @@ use std::io::Write;
 use qscreen_protocol::{
     FRAME_FLAG_BLINK, FRAME_FLAG_BOLD, FRAME_FLAG_DIM, FRAME_FLAG_HIDDEN, FRAME_FLAG_INVERSE,
     FRAME_FLAG_ITALIC, FRAME_FLAG_STRIKETHROUGH, FRAME_FLAG_UNDERLINE, FrameColor, ScreenFrame,
+    ScreenRun,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -25,12 +26,56 @@ pub fn cleanup_attach_terminal<W: Write>(out: &mut W) -> std::io::Result<()> {
 }
 
 pub fn render_screen_frame<W: Write>(out: &mut W, frame: &ScreenFrame) -> std::io::Result<()> {
+    let mut renderer = FrameRenderer::default();
+    renderer.render(out, frame)
+}
+
+#[derive(Default)]
+pub struct FrameRenderer {
+    previous: Option<ScreenFrame>,
+}
+
+impl FrameRenderer {
+    pub fn render<W: Write>(&mut self, out: &mut W, frame: &ScreenFrame) -> std::io::Result<()> {
+        if self.previous.as_ref() == Some(frame) {
+            return Ok(());
+        }
+        let force_full = self.previous.as_ref().is_none_or(|previous| {
+            previous.rows != frame.rows
+                || previous.cols != frame.cols
+                || previous.alternate_screen != frame.alternate_screen
+        });
+
+        render_screen_frame_with_previous(out, frame, self.previous.as_ref(), force_full)?;
+        self.previous = Some(frame.clone());
+        Ok(())
+    }
+
+    pub fn reset(&mut self) {
+        self.previous = None;
+    }
+}
+
+fn render_screen_frame_with_previous<W: Write>(
+    out: &mut W,
+    frame: &ScreenFrame,
+    previous: Option<&ScreenFrame>,
+    force_full: bool,
+) -> std::io::Result<()> {
     if frame.alternate_screen {
         out.write_all(b"\x1b[?1049h")?;
     }
-    out.write_all(b"\x1b[?2026h\x1b[?25l\x1b[0m\x1b[2J")?;
+    out.write_all(b"\x1b[?2026h\x1b[?25l\x1b[0m")?;
+    if force_full {
+        out.write_all(b"\x1b[2J")?;
+    }
 
     for (row_idx, row) in frame.rows_v2.iter().enumerate().take(frame.rows as usize) {
+        if !force_full
+            && previous.is_some_and(|previous| previous.rows_v2.get(row_idx) == Some(row))
+        {
+            continue;
+        }
         write!(out, "\x1b[{};{}H", row_idx + 1, 1)?;
         let mut col: u16 = 0;
         let mut last_bg = FrameColor::Default;
@@ -65,7 +110,9 @@ pub fn render_screen_frame<W: Write>(out: &mut W, frame: &ScreenFrame) -> std::i
         frame.cursor_row.saturating_add(1),
         frame.cursor_col.saturating_add(1)
     )?;
-    if frame.cursor_shape <= 6 {
+    if frame.cursor_shape <= 6
+        && previous.is_none_or(|previous| previous.cursor_shape != frame.cursor_shape)
+    {
         write!(out, "\x1b[{} q", frame.cursor_shape)?;
     }
     if !frame.hide_cursor {
@@ -162,6 +209,26 @@ impl TermScreen {
 mod tests {
     use super::*;
 
+    fn frame_with_rows(rows: &[&str]) -> ScreenFrame {
+        ScreenFrame {
+            rows: rows.len() as u16,
+            cols: rows.iter().map(|row| row.len()).max().unwrap_or(0) as u16,
+            rows_v2: rows
+                .iter()
+                .map(|row| {
+                    vec![ScreenRun {
+                        text: row.to_string(),
+                        fg: FrameColor::Default,
+                        bg: FrameColor::Default,
+                        flags: 0,
+                        width: row.len() as u16,
+                    }]
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn cleanup_attach_terminal_leaves_alternate_screen_after_sgr_reset() {
         let text = std::str::from_utf8(RESTORE_AFTER_ATTACH).unwrap();
@@ -207,5 +274,71 @@ mod tests {
 
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("\x1b[0 q"));
+    }
+
+    #[test]
+    fn frame_renderer_skips_unchanged_cursor_shape() {
+        let mut renderer = FrameRenderer::default();
+        let mut first = frame_with_rows(&["aa"]);
+        first.cursor_shape = 5;
+        renderer.render(&mut Vec::new(), &first).unwrap();
+        let mut second = frame_with_rows(&["bb"]);
+        second.cursor_shape = 5;
+        let mut out = Vec::new();
+
+        renderer.render(&mut out, &second).unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("\x1b[5 q"));
+    }
+
+    #[test]
+    fn frame_renderer_skips_clear_and_unchanged_rows_after_first_frame() {
+        let mut renderer = FrameRenderer::default();
+        let mut out = Vec::new();
+        renderer
+            .render(&mut out, &frame_with_rows(&["aa", "bb"]))
+            .unwrap();
+        out.clear();
+
+        renderer
+            .render(&mut out, &frame_with_rows(&["aa", "cc"]))
+            .unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("\x1b[2J"));
+        assert!(text.contains("\x1b[2;1H"));
+        assert!(!text.contains("aa"));
+        assert!(text.contains("cc"));
+    }
+
+    #[test]
+    fn frame_renderer_skips_identical_frame_body() {
+        let mut renderer = FrameRenderer::default();
+        let frame = frame_with_rows(&["aa"]);
+        let mut out = Vec::new();
+        renderer.render(&mut out, &frame).unwrap();
+        out.clear();
+
+        renderer.render(&mut out, &frame).unwrap();
+
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn frame_renderer_clears_on_size_change() {
+        let mut renderer = FrameRenderer::default();
+        let mut out = Vec::new();
+        renderer
+            .render(&mut out, &frame_with_rows(&["aa"]))
+            .unwrap();
+        out.clear();
+
+        renderer
+            .render(&mut out, &frame_with_rows(&["aaa"]))
+            .unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\x1b[2J"));
     }
 }
