@@ -1212,22 +1212,22 @@ fn render_session_list<W: Write>(
     term_size: (u16, u16),
 ) -> std::io::Result<()> {
     let (cols, rows_count) = term_size;
-    write!(out, "\x1b[?2026h\x1b[2J\x1b[H")?;
-    write!(out, "qscreen sessions\r\n")?;
-    write!(
+    write!(out, "\x1b[?2026h\x1b[0m\x1b[2J\x1b[H")?;
+    write_session_list_line(out, "qscreen sessions", cols)?;
+    write_session_list_line(
         out,
-        "Use Up/Down or k/j, Enter to switch, Esc/q to cancel\r\n"
+        "Use Up/Down or k/j, Enter to switch, Esc/q to cancel",
+        cols,
     )?;
-    write!(out, "\r\n")?;
+    write_session_list_line(out, "", cols)?;
 
     if rows.is_empty() {
-        write!(out, "  no sessions\r\n")?;
+        write_session_list_line(out, "  no sessions", cols)?;
     } else {
         for (idx, row) in rows.iter().enumerate() {
             let selector = if idx == selected { ">" } else { " " };
             let current = if row.is_current { "*" } else { " " };
-            write!(
-                out,
+            let line = format!(
                 "{} {} {:<4} {:<24} {:<14} {:>8}\r\n",
                 selector,
                 current,
@@ -1235,7 +1235,8 @@ fn render_session_list<W: Write>(
                 truncate_for_terminal(&row.name, 24),
                 truncate_for_terminal(&row.state, 14),
                 truncate_for_terminal(&row.size, 8)
-            )?;
+            );
+            write_session_list_line(out, line.trim_end_matches("\r\n"), cols)?;
         }
     }
 
@@ -1243,7 +1244,7 @@ fn render_session_list<W: Write>(
     if rows_count > used_lines + 1 {
         write!(out, "\x1b[{};1H", rows_count)?;
     } else {
-        write!(out, "\r\n")?;
+        write_session_list_line(out, "", cols)?;
     }
     let mut status_line = if status.is_empty() {
         "* marks current session".to_string()
@@ -1251,8 +1252,26 @@ fn render_session_list<W: Write>(
         status.to_string()
     };
     status_line = truncate_for_terminal(&status_line, cols as usize);
-    write!(out, "{}\x1b[?2026l", status_line)?;
+    write!(out, "\x1b[0m")?;
+    write_padded_line(out, &status_line, cols)?;
+    write!(out, "\x1b[?2026l")?;
     out.flush()
+}
+
+fn write_session_list_line<W: Write>(out: &mut W, line: &str, cols: u16) -> std::io::Result<()> {
+    write!(out, "\x1b[0m")?;
+    write_padded_line(out, line, cols)?;
+    write!(out, "\r\n")
+}
+
+fn write_padded_line<W: Write>(out: &mut W, line: &str, cols: u16) -> std::io::Result<()> {
+    let line = truncate_for_terminal(line, cols as usize);
+    write!(out, "{line}")?;
+    let width = line.chars().count().min(cols as usize);
+    for _ in width..cols as usize {
+        out.write_all(b" ")?;
+    }
+    Ok(())
 }
 
 fn truncate_for_terminal(value: &str, width: usize) -> String {
@@ -1831,6 +1850,19 @@ mod tests {
             }
         }
         assert!(out.windows(2).any(|window| window == b"\r\n"));
+    }
+
+    #[test]
+    fn render_session_list_resets_style_and_pads_lines() {
+        let rows = build_session_list_rows(&[session("1", "main", true, false, 80, 24)], "1");
+        let mut out = Vec::new();
+
+        render_session_list(&mut out, &rows, 0, "", (20, 8)).unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("\x1b[?2026h\x1b[0m\x1b[2J"));
+        assert!(text.contains("\x1b[0mqscreen sessions    \r\n"));
+        assert!(text.contains("\x1b[0m> * 1    main"));
     }
 
     #[test]
