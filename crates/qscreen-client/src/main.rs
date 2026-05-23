@@ -327,7 +327,7 @@ fn print_help() {
   qscn [--prefix C-a] new --name <name>
                                用参数指定显示名
   qscn [--prefix C-a] new --shell <shell>
-                               指定启动 shell（Windows: cmd 或 powershell）
+                               指定启动 shell（Windows: cmd 或 powershell；Unix: shell 路径）
   qscn [--prefix C-a] attach <session_id>
                                进入已有会话
   qscn [--prefix C-a] -r <session_id>
@@ -378,7 +378,7 @@ Usage:
   qscn [--prefix C-a] new --name <name>
                                specify the display name as an option
   qscn [--prefix C-a] new --shell <shell>
-                               specify the startup shell (Windows: cmd or powershell)
+                               specify the startup shell (Windows: cmd or powershell; Unix: shell path)
   qscn [--prefix C-a] attach <session_id>
                                attach to an existing session
   qscn [--prefix C-a] -r <session_id>
