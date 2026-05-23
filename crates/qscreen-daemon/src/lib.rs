@@ -17,7 +17,7 @@ use tokio::sync::{oneshot, watch};
 // ── Daemon 共享状态 ───────────────────────────────────────────────────────────
 
 struct State {
-    sessions: Mutex<HashMap<String, Arc<Session>>>,
+    sessions: Arc<Mutex<HashMap<String, Arc<Session>>>>,
     next_session_id: Mutex<u64>,
     stop_tx: watch::Sender<bool>,
 }
@@ -25,7 +25,7 @@ struct State {
 impl State {
     fn new(stop_tx: watch::Sender<bool>) -> Self {
         State {
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
             next_session_id: Mutex::new(1),
             stop_tx,
         }
@@ -33,6 +33,33 @@ impl State {
 
     fn get_session(&self, session_id: &str) -> Option<Arc<Session>> {
         self.sessions.lock().unwrap().get(session_id).cloned()
+    }
+
+    fn insert_session(&self, session_id: String, session: Arc<Session>) {
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), session.clone());
+        let mut exit_rx = session.subscribe_exit();
+        let sessions = self.sessions.clone();
+        tokio::spawn(async move {
+            if !*exit_rx.borrow() {
+                let _ = exit_rx.changed().await;
+            }
+            let removed = {
+                let mut guard = sessions.lock().unwrap();
+                match guard.get(&session_id) {
+                    Some(current) if Arc::ptr_eq(current, &session) => {
+                        guard.remove(&session_id).is_some()
+                    }
+                    _ => false,
+                }
+            };
+            if removed {
+                let name = session.name();
+                tracing::info!(session_id = %session_id, session = %name, "session cleaned up");
+            }
+        });
     }
 
     fn allocate_session_id(&self) -> String {
@@ -277,11 +304,7 @@ async fn dispatch_inner(msg: &Message, state: &State) -> anyhow::Result<Message>
                 Some(msg.shell.as_str()),
             )?;
             tracing::info!(session_id = %session_id, session = %session_name, "session created");
-            state
-                .sessions
-                .lock()
-                .unwrap()
-                .insert(session_id.clone(), sess);
+            state.insert_session(session_id.clone(), sess);
             Ok(Message {
                 kind: MessageKind::Response,
                 session_id,
@@ -701,11 +724,7 @@ mod tests {
 
     async fn insert_session(state: &State, session_id: &str, name: &str) -> Arc<Session> {
         let session = Session::new(session_id.to_string(), name.to_string(), 80, 24, None).unwrap();
-        state
-            .sessions
-            .lock()
-            .unwrap()
-            .insert(session_id.to_string(), session.clone());
+        state.insert_session(session_id.to_string(), session.clone());
         session
     }
 
@@ -969,6 +988,22 @@ mod tests {
         assert_eq!(recv_exit(&queue1), -1);
         assert_eq!(recv_exit(&queue2), -1);
         assert!(!session.is_attached());
+    }
+
+    #[tokio::test]
+    async fn exited_sessions_are_removed_from_state() {
+        let state = test_state();
+        let session = insert_session(&state, "1", "work").await;
+
+        session.close();
+
+        for _ in 0..50 {
+            if state.get_session("1").is_none() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("expected exited session to be removed");
     }
 
     #[tokio::test]

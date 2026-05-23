@@ -13,7 +13,7 @@ use qscreen_protocol::{
     FRAME_FLAG_ITALIC, FRAME_FLAG_STRIKETHROUGH, FRAME_FLAG_UNDERLINE, FrameColor, ScreenFrame,
     ScreenRun,
 };
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 pub const SCROLLBACK_LIMIT: usize = 256 * 1024;
 const FRAME_CHANNEL_CAPACITY: usize = 16;
@@ -125,6 +125,7 @@ pub struct Session {
     pub exited: Arc<AtomicBool>,
     pub exit_code: Arc<Mutex<Option<i32>>>,
     pub closed: Arc<AtomicBool>,
+    exit_tx: watch::Sender<bool>,
     /// PTY master：仅用于 resize（take_writer 后 write 走 pty_writer）
     pty_master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
     /// PTY writer：写 input
@@ -185,6 +186,7 @@ impl Session {
         let exited = Arc::new(AtomicBool::new(false));
         let exit_code: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
         let closed = Arc::new(AtomicBool::new(false));
+        let (exit_tx, _) = watch::channel(false);
         let pty_master = Arc::new(Mutex::new(Some(pair.master)));
         let pty_writer_arc = Arc::new(Mutex::new(Some(pty_writer)));
         let cursor_shape = Arc::new(Mutex::new(CURSOR_SHAPE_DEFAULT));
@@ -199,6 +201,7 @@ impl Session {
             exited: exited.clone(),
             exit_code: exit_code.clone(),
             closed: closed.clone(),
+            exit_tx: exit_tx.clone(),
             pty_master: pty_master.clone(),
             pty_writer: pty_writer_arc.clone(),
             child_killer: child_killer.clone(),
@@ -230,6 +233,7 @@ impl Session {
             let active_client_e = active_client_id.clone();
             let exited_e = exited.clone();
             let exit_code_e = exit_code.clone();
+            let exit_tx_e = exit_tx.clone();
             let name_e = name.clone();
             tokio::task::spawn_blocking(move || {
                 let mut child = child;
@@ -245,6 +249,7 @@ impl Session {
                     client.queue.push_exit(code);
                 }
                 *active_client_e.lock().unwrap() = None;
+                let _ = exit_tx_e.send(true);
             });
         }
 
@@ -253,6 +258,10 @@ impl Session {
 
     pub fn name(&self) -> String {
         self.name.lock().unwrap().clone()
+    }
+
+    pub fn subscribe_exit(&self) -> watch::Receiver<bool> {
+        self.exit_tx.subscribe()
     }
 
     pub fn rename(&self, name: String) {
