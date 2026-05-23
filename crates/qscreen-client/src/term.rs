@@ -8,7 +8,7 @@ use unicode_width::UnicodeWidthStr;
 
 const PREPARE_ATTACH: &[u8] = b"\x1b[?1004h\x1b[2J\x1b[H";
 const RESTORE_AFTER_ATTACH: &[u8] =
-    b"\x1b[?2026l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?25h\x1b[0m\x1b[0 q\x1b[?1049l\x1b[r";
+    b"\x1b[?2026l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?25h\x1b[0m\x1b[0 q\x1b[r";
 
 pub fn prepare_attach_terminal<W: Write>(out: &mut W) -> std::io::Result<()> {
     out.write_all(PREPARE_ATTACH)?;
@@ -56,9 +56,6 @@ fn render_screen_frame_with_previous<W: Write>(
     previous: Option<&ScreenFrame>,
     force_full: bool,
 ) -> std::io::Result<()> {
-    if frame.alternate_screen {
-        out.write_all(b"\x1b[?1049h")?;
-    }
     out.write_all(b"\x1b[?2026h\x1b[?25l\x1b[0m")?;
     if force_full {
         out.write_all(b"\x1b[2J")?;
@@ -225,16 +222,20 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_attach_terminal_leaves_alternate_screen_after_sgr_reset() {
+    fn prepare_attach_terminal_clears_without_host_alternate_screen() {
+        let text = std::str::from_utf8(PREPARE_ATTACH).unwrap();
+
+        assert!(!text.contains("\x1b[?1049h"));
+        assert!(text.contains("\x1b[2J"));
+    }
+
+    #[test]
+    fn cleanup_attach_terminal_does_not_leave_host_alternate_screen() {
         let text = std::str::from_utf8(RESTORE_AFTER_ATTACH).unwrap();
 
-        let sgr_reset = text.find("\x1b[0m").expect("missing sgr reset");
-        let cursor_reset = text.find("\x1b[0 q").expect("missing cursor shape reset");
-        let leave_alt = text
-            .find("\x1b[?1049l")
-            .expect("missing alternate-screen leave");
-        assert!(sgr_reset < leave_alt);
-        assert!(cursor_reset < leave_alt);
+        assert!(text.contains("\x1b[0m"));
+        assert!(text.contains("\x1b[0 q"));
+        assert!(!text.contains("\x1b[?1049l"));
     }
 
     #[test]
@@ -269,6 +270,18 @@ mod tests {
 
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("\x1b[0 q"));
+    }
+
+    #[test]
+    fn frame_renderer_does_not_reenter_host_alternate_screen() {
+        let mut frame = frame_with_rows(&["aa"]);
+        frame.alternate_screen = true;
+        let mut out = Vec::new();
+
+        FrameRenderer::default().render(&mut out, &frame).unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("\x1b[?1049h"));
     }
 
     #[test]

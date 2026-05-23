@@ -655,7 +655,6 @@ fn move_session_list_selection(selected: usize, len: usize, delta: isize) -> usi
 
 async fn attach_session_loop(initial_session_id: &str, config: ClientConfig) -> anyhow::Result<()> {
     let mut session_id = initial_session_id.to_string();
-    let _terminal = TerminalCleanupGuard::enter()?;
 
     loop {
         validate_session_id(&session_id)?;
@@ -700,7 +699,7 @@ async fn attach_session_once(
     let resp = recv_msg(&mut conn).await?;
     check_response(&resp, attach_id)?;
 
-    term::prepare_attach_terminal(&mut std::io::stdout())?;
+    let _terminal = TerminalCleanupGuard::enter()?;
 
     let session_id_owned = session_id.to_string();
     run_attach_loop(conn, session_id_owned, term_size, config.prefix).await
