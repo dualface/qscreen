@@ -3,7 +3,6 @@ use std::io::Write;
 use qscreen_protocol::{
     FRAME_FLAG_BLINK, FRAME_FLAG_BOLD, FRAME_FLAG_DIM, FRAME_FLAG_HIDDEN, FRAME_FLAG_INVERSE,
     FRAME_FLAG_ITALIC, FRAME_FLAG_STRIKETHROUGH, FRAME_FLAG_UNDERLINE, FrameColor, ScreenFrame,
-    ScreenRun,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -23,11 +22,6 @@ pub fn cleanup_attach_terminal<W: Write>(out: &mut W) -> std::io::Result<()> {
     out.write_all(b"\x1b[?9001l\x1b[!p")?;
     out.flush()?;
     raw_mode_result
-}
-
-pub fn render_screen_frame<W: Write>(out: &mut W, frame: &ScreenFrame) -> std::io::Result<()> {
-    let mut renderer = FrameRenderer::default();
-    renderer.render(out, frame)
 }
 
 #[derive(Default)]
@@ -208,6 +202,7 @@ impl TermScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qscreen_protocol::ScreenRun;
 
     fn frame_with_rows(rows: &[&str]) -> ScreenFrame {
         ScreenFrame {
@@ -253,7 +248,7 @@ mod tests {
         };
         let mut out = Vec::new();
 
-        render_screen_frame(&mut out, &frame).unwrap();
+        FrameRenderer::default().render(&mut out, &frame).unwrap();
 
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("\x1b[5 q"));
@@ -270,7 +265,7 @@ mod tests {
         };
         let mut out = Vec::new();
 
-        render_screen_frame(&mut out, &frame).unwrap();
+        FrameRenderer::default().render(&mut out, &frame).unwrap();
 
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("\x1b[0 q"));
