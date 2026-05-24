@@ -91,8 +91,7 @@ fn contents_formatted_includes_sgr9_for_strikethrough() {
     // The formatted output should contain SGR 9 (strikethrough on) somewhere
     assert!(
         s.contains("\x1b[9m") || s.contains(";9m") || s.contains(";9;"),
-        "contents_formatted() should emit SGR 9 for strikethrough text, got: {:?}",
-        s
+        "contents_formatted() should emit SGR 9 for strikethrough text, got: {s:?}",
     );
 }
 
@@ -113,8 +112,7 @@ fn contents_formatted_includes_sgr29_to_clear_strikethrough() {
             || after_strike.contains("\x1b[0m")
             || after_strike.contains(";0m")
             || after_strike.contains("\x1b[m"),
-        "contents_formatted() should reset strikethrough after struck text, remainder: {:?}",
-        after_strike
+        "contents_formatted() should reset strikethrough after struck text, remainder: {after_strike:?}",
     );
 }
 
@@ -126,8 +124,7 @@ fn contents_formatted_includes_sgr8_for_hidden() {
     let s = String::from_utf8_lossy(&formatted);
     assert!(
         s.contains("\x1b[8m") || s.contains(";8m") || s.contains(";8;"),
-        "contents_formatted() should emit SGR 8 for hidden text, got: {:?}",
-        s
+        "contents_formatted() should emit SGR 8 for hidden text, got: {s:?}",
     );
 }
 

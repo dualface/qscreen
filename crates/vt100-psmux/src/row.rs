@@ -33,7 +33,7 @@ impl Row {
     /// alt-screen-to-scrollback copy path (issue #88) to skip the
     /// trailing blank rows a TUI did not draw into.
     pub fn is_blank(&self) -> bool {
-        !self.cells.iter().any(|c| c.has_contents())
+        !self.cells.iter().any(crate::Cell::has_contents)
     }
 
     fn cells(&self) -> impl Iterator<Item = &crate::Cell> {
@@ -102,12 +102,10 @@ impl Row {
                 let attrs = *self.cells[next].attrs();
                 self.cells[next].clear(attrs);
             }
-        } else if cell.is_wide_continuation() {
-            if col > 0 {
-                let prev = usize::from(col - 1);
-                let attrs = *self.cells[prev].attrs();
-                self.cells[prev].clear(attrs);
-            }
+        } else if cell.is_wide_continuation() && col > 0 {
+            let prev = usize::from(col - 1);
+            let attrs = *self.cells[prev].attrs();
+            self.cells[prev].clear(attrs);
         }
     }
 

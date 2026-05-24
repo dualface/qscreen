@@ -5,16 +5,10 @@ use unicode_width::UnicodeWidthChar as _;
 /// Accepts `file://hostname/path`, `file:///path`, or a bare `/path`.
 /// Percent-decodes the path component.
 fn parse_osc7_uri(raw: &str) -> String {
-    let stripped = if let Some(rest) = raw.strip_prefix("file://") {
+    let stripped = raw.strip_prefix("file://").map_or(raw, |rest| {
         // Skip hostname: everything up to the next '/'
-        if let Some(slash) = rest.find('/') {
-            &rest[slash..]
-        } else {
-            rest
-        }
-    } else {
-        raw
-    };
+        rest.find('/').map_or(rest, |slash| &rest[slash..])
+    });
     percent_decode(stripped)
 }
 
@@ -154,11 +148,12 @@ pub struct Screen {
     /// after a TUI session sees what was on screen when the app left.
     ///
     /// We keep the option name `alternate-screen` to match tmux, but
-    /// the Windows implementation differs: ConPTY emits its own
+    /// the Windows implementation differs: `ConPTY` emits its own
     /// "clear + restore" sequences around 1049 toggles regardless of
     /// whether we honour the toggle, so simply dropping 1049 (the
     /// tmux approach) does not preserve content on this platform.
     /// Copy-on-exit is the equivalent end-user behaviour.
+    #[allow(clippy::struct_field_names)]
     pub(crate) allow_alternate_screen: bool,
 }
 
@@ -895,8 +890,7 @@ impl Screen {
         let last_nonblank = alt_rows
             .iter()
             .rposition(|r| !r.is_blank())
-            .map(|i| i + 1)
-            .unwrap_or(0);
+            .map_or(0, |i| i + 1);
 
         for row in alt_rows.into_iter().take(last_nonblank) {
             self.grid.push_row_to_scrollback(row);
@@ -1076,7 +1070,10 @@ impl Screen {
                 }
             }
 
-            let is_wide_at_pos = self.grid().drawing_cell(pos).map_or(false, |c| c.is_wide());
+            let is_wide_at_pos = self
+                .grid()
+                .drawing_cell(pos)
+                .is_some_and(crate::Cell::is_wide);
             if is_wide_at_pos {
                 if let Some(next_cell) = self.grid_mut().drawing_cell_mut(crate::grid::Pos {
                     row: pos.row,
@@ -1094,7 +1091,10 @@ impl Screen {
             self.grid_mut().col_inc(1);
             if width > 1 {
                 let pos = self.grid().pos();
-                let is_wide_here = self.grid().drawing_cell(pos).map_or(false, |c| c.is_wide());
+                let is_wide_here = self
+                    .grid()
+                    .drawing_cell(pos)
+                    .is_some_and(crate::Cell::is_wide);
                 if is_wide_here {
                     let next_next_pos = crate::grid::Pos {
                         row: pos.row,
@@ -1420,7 +1420,7 @@ impl Screen {
                 [2] => self.attrs.set_dim(),
                 [3] => self.attrs.set_italic(true),
                 [4] => self.attrs.set_underline(true),
-                [5] | [6] => self.attrs.set_blink(true),
+                [5 | 6] => self.attrs.set_blink(true),
                 [7] => self.attrs.set_inverse(true),
                 [8] => self.attrs.set_hidden(true),
                 [9] => self.attrs.set_strikethrough(true),
