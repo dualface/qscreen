@@ -9,9 +9,9 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use qscreen_protocol::{
-    FRAME_FLAG_BLINK, FRAME_FLAG_BOLD, FRAME_FLAG_DIM, FRAME_FLAG_HIDDEN, FRAME_FLAG_INVERSE,
-    FRAME_FLAG_ITALIC, FRAME_FLAG_STRIKETHROUGH, FRAME_FLAG_UNDERLINE, FrameColor, ScreenFrame,
-    ScreenRun,
+    AttachMode, FRAME_FLAG_BLINK, FRAME_FLAG_BOLD, FRAME_FLAG_DIM, FRAME_FLAG_HIDDEN,
+    FRAME_FLAG_INVERSE, FRAME_FLAG_ITALIC, FRAME_FLAG_STRIKETHROUGH, FRAME_FLAG_UNDERLINE,
+    FrameColor, MAX_PAYLOAD_SIZE, ScreenFrame, ScreenRun,
 };
 use tokio::sync::{Notify, watch};
 
@@ -32,6 +32,7 @@ pub type ClientId = u64;
 #[derive(Debug)]
 pub enum SessionEvent {
     Frame(ScreenFrame),
+    Output(Vec<u8>),
     Exit(i32),
 }
 
@@ -39,51 +40,115 @@ pub struct AttachedClient {
     pub queue: Arc<SessionEventQueue>,
     pub width: u16,
     pub height: u16,
+    pub attach_mode: AttachMode,
 }
 
 pub struct SessionEventQueue {
-    inner: Mutex<VecDeque<SessionEvent>>,
+    inner: Mutex<SessionEventQueueInner>,
     notify: Notify,
+}
+
+struct SessionEventQueueInner {
+    events: VecDeque<SessionEvent>,
+    pending_exit: Option<i32>,
+    closed: bool,
 }
 
 impl SessionEventQueue {
     pub fn new() -> Arc<Self> {
         Arc::new(SessionEventQueue {
-            inner: Mutex::new(VecDeque::with_capacity(FRAME_CHANNEL_CAPACITY)),
+            inner: Mutex::new(SessionEventQueueInner {
+                events: VecDeque::with_capacity(FRAME_CHANNEL_CAPACITY),
+                pending_exit: None,
+                closed: false,
+            }),
             notify: Notify::new(),
         })
     }
 
-    pub async fn recv(&self) -> SessionEvent {
+    pub async fn recv(&self) -> Option<SessionEvent> {
         loop {
-            if let Some(event) = self.inner.lock().unwrap().pop_front() {
-                return event;
+            {
+                let mut inner = self.inner.lock().unwrap();
+                if let Some(event) = inner.events.pop_front() {
+                    return Some(event);
+                }
+                if let Some(code) = inner.pending_exit.take() {
+                    inner.closed = true;
+                    return Some(SessionEvent::Exit(code));
+                }
+                if inner.closed {
+                    return None;
+                }
             }
             self.notify.notified().await;
         }
     }
 
     fn push_frame(&self, frame: ScreenFrame) {
-        let mut queue = self.inner.lock().unwrap();
-        if queue.len() >= FRAME_CHANNEL_CAPACITY {
-            queue.clear();
+        let mut inner = self.inner.lock().unwrap();
+        if inner.closed {
+            return;
         }
-        queue.push_back(SessionEvent::Frame(frame));
-        drop(queue);
+        if inner.events.len() >= FRAME_CHANNEL_CAPACITY {
+            inner.events.clear();
+        }
+        inner.events.push_back(SessionEvent::Frame(frame));
+        drop(inner);
         self.notify.notify_one();
     }
 
-    fn push_exit(&self, code: i32) {
-        let mut queue = self.inner.lock().unwrap();
-        queue.clear();
-        queue.push_back(SessionEvent::Exit(code));
-        drop(queue);
+    fn try_push_output(&self, output: Vec<u8>) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.closed || inner.events.len() >= FRAME_CHANNEL_CAPACITY {
+            return false;
+        }
+        inner.events.push_back(SessionEvent::Output(output));
+        drop(inner);
+        self.notify.notify_one();
+        true
+    }
+
+    fn push_exit_for_mode(&self, code: i32, attach_mode: AttachMode) {
+        let mut inner = self.inner.lock().unwrap();
+        match attach_mode {
+            AttachMode::Frame => {
+                inner.events.clear();
+                inner.pending_exit = None;
+                inner.events.push_back(SessionEvent::Exit(code));
+                inner.closed = true;
+            }
+            AttachMode::Bytes => {
+                if !inner.closed && inner.events.len() < FRAME_CHANNEL_CAPACITY {
+                    inner.events.push_back(SessionEvent::Exit(code));
+                } else {
+                    inner.pending_exit = Some(code);
+                }
+                inner.closed = true;
+            }
+        }
+        drop(inner);
+        self.notify.notify_one();
+    }
+
+    fn close_when_drained(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.closed = true;
+        drop(inner);
         self.notify.notify_one();
     }
 
     #[cfg(test)]
     pub(crate) fn try_recv(&self) -> Option<SessionEvent> {
-        self.inner.lock().unwrap().pop_front()
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(event) = inner.events.pop_front() {
+            return Some(event);
+        }
+        if let Some(code) = inner.pending_exit.take() {
+            inner.closed = true;
+            return Some(SessionEvent::Exit(code));
+        }
+        None
     }
 }
 
@@ -134,6 +199,7 @@ pub struct Session {
     cursor_shape: Arc<Mutex<u8>>,
     pub scrollback: Arc<Mutex<ScrollbackBuf>>,
     screen: Arc<Mutex<vt100::Parser>>,
+    event_lock: Arc<Mutex<()>>,
     /// 已 attach 客户端；空 map = detached
     pub attached_clients: Arc<Mutex<HashMap<ClientId, AttachedClient>>>,
     pub active_client_id: Arc<Mutex<Option<ClientId>>>,
@@ -191,6 +257,7 @@ impl Session {
         let pty_writer_arc = Arc::new(Mutex::new(Some(pty_writer)));
         let cursor_shape = Arc::new(Mutex::new(CURSOR_SHAPE_DEFAULT));
         let screen = Arc::new(Mutex::new(vt100::Parser::new(h, w, 0)));
+        let event_lock = Arc::new(Mutex::new(()));
 
         let sess = Arc::new(Session {
             session_id,
@@ -208,6 +275,7 @@ impl Session {
             cursor_shape: cursor_shape.clone(),
             scrollback: scrollback.clone(),
             screen: screen.clone(),
+            event_lock: event_lock.clone(),
             attached_clients: attached_clients.clone(),
             active_client_id: active_client_id.clone(),
             next_client_id,
@@ -217,13 +285,16 @@ impl Session {
         {
             spawn_coalesced_reader(
                 pty_reader,
-                scrollback.clone(),
-                screen.clone(),
-                cursor_shape.clone(),
-                attached_clients.clone(),
-                active_client_id.clone(),
-                exited.clone(),
-                name.clone(),
+                OutputReaderState {
+                    scrollback: scrollback.clone(),
+                    screen: screen.clone(),
+                    cursor_shape: cursor_shape.clone(),
+                    event_lock: event_lock.clone(),
+                    attached_clients: attached_clients.clone(),
+                    active_client_id: active_client_id.clone(),
+                    exited: exited.clone(),
+                    name: name.clone(),
+                },
             );
         }
 
@@ -246,7 +317,7 @@ impl Session {
                 exited_e.store(true, Ordering::SeqCst);
                 let mut attached = attached_e.lock().unwrap();
                 for (_, client) in attached.drain() {
-                    client.queue.push_exit(code);
+                    client.queue.push_exit_for_mode(code, client.attach_mode);
                 }
                 *active_client_e.lock().unwrap() = None;
                 let _ = exit_tx_e.send(true);
@@ -335,23 +406,35 @@ impl Session {
         self.resize_pty(width as u16, height as u16)
     }
 
-    /// Attach 一个客户端：返回当前 screen frame + 注册事件发送端
+    /// Attach 一个客户端：注册事件发送端并返回初始事件（frame 或 scrollback bytes）
     /// 返回 Err 如果 session 已退出
     pub fn attach(
         &self,
         queue: Arc<SessionEventQueue>,
         width: u32,
         height: u32,
-    ) -> anyhow::Result<(ClientId, ScreenFrame)> {
+        attach_mode: AttachMode,
+    ) -> anyhow::Result<(ClientId, Option<SessionEvent>)> {
         if self.exited.load(Ordering::SeqCst) {
             anyhow::bail!("session has exited");
         }
         if self.closed.load(Ordering::SeqCst) {
             anyhow::bail!("session is closed");
         }
+        let _event_guard = self.event_lock.lock().unwrap();
         self.resize(width, height)?;
 
-        let screen_frame = self.screen_frame();
+        let initial_event = match attach_mode {
+            AttachMode::Frame => Some(SessionEvent::Frame(self.screen_frame())),
+            AttachMode::Bytes => {
+                let snapshot = self.scrollback.lock().unwrap().snapshot();
+                if snapshot.is_empty() {
+                    None
+                } else {
+                    Some(SessionEvent::Output(snapshot))
+                }
+            }
+        };
         let mut next_id = self.next_client_id.lock().unwrap();
         let client_id = *next_id;
         *next_id += 1;
@@ -366,10 +449,11 @@ impl Session {
                 queue,
                 width: w,
                 height: h,
+                attach_mode,
             },
         );
         *self.active_client_id.lock().unwrap() = Some(client_id);
-        Ok((client_id, screen_frame))
+        Ok((client_id, initial_event))
     }
 
     fn screen_frame(&self) -> ScreenFrame {
@@ -429,7 +513,7 @@ impl Session {
         // 通知已 attach 的客户端
         let mut attached = self.attached_clients.lock().unwrap();
         for (_, client) in attached.drain() {
-            client.queue.push_exit(-1);
+            client.queue.push_exit_for_mode(-1, client.attach_mode);
         }
         *self.active_client_id.lock().unwrap() = None;
     }
@@ -619,18 +703,31 @@ fn last_row_has_content(screen: &vt100::Screen, rows: u16, cols: u16) -> bool {
     false
 }
 
-fn spawn_coalesced_reader(
-    mut reader: Box<dyn Read + Send>,
+struct OutputReaderState {
     scrollback: Arc<Mutex<ScrollbackBuf>>,
     screen: Arc<Mutex<vt100::Parser>>,
     cursor_shape: Arc<Mutex<u8>>,
+    event_lock: Arc<Mutex<()>>,
     attached_clients: Arc<Mutex<HashMap<ClientId, AttachedClient>>>,
     active_client_id: Arc<Mutex<Option<ClientId>>>,
     exited: Arc<AtomicBool>,
     name: String,
-) {
+}
+
+fn spawn_coalesced_reader(mut reader: Box<dyn Read + Send>, state: OutputReaderState) {
     const COALESCE_TICK_MS: u64 = 1;
     const COALESCE_MAX_MS: u128 = 8;
+
+    let OutputReaderState {
+        scrollback,
+        screen,
+        cursor_shape,
+        event_lock,
+        attached_clients,
+        active_client_id,
+        exited,
+        name,
+    } = state;
 
     let staging = Arc::new((
         Mutex::new(Vec::<u8>::with_capacity(128 * 1024)),
@@ -673,6 +770,7 @@ fn spawn_coalesced_reader(
                     if reader_done.load(Ordering::Acquire) {
                         tracing::debug!(session = %name, "pty reader ended");
                         let cleanup_frame = {
+                            let _event_guard = event_lock.lock().unwrap();
                             let mut parser = screen.lock().unwrap();
                             cleanup_alt_screen_frame(&mut parser, &cursor_shape)
                         };
@@ -711,6 +809,7 @@ fn spawn_coalesced_reader(
                 continue;
             }
 
+            let _event_guard = event_lock.lock().unwrap();
             scrollback.lock().unwrap().append(&bytes);
             let current_cursor_shape = {
                 let mut cursor_shape = cursor_shape.lock().unwrap();
@@ -727,7 +826,7 @@ fn spawn_coalesced_reader(
                 parser.process(&bytes);
                 screen_frame_from_parser(&parser, current_cursor_shape)
             };
-            broadcast_frame(&attached_clients, &active_client_id, frame);
+            broadcast_output_or_frame(&attached_clients, &active_client_id, &bytes, frame);
         }
 
         tracing::debug!(session = %name, "pty parser ended");
@@ -742,7 +841,55 @@ fn broadcast_frame(
 ) {
     let attached = attached_clients.lock().unwrap();
     for client in attached.values() {
-        client.queue.push_frame(frame.clone());
+        if client.attach_mode == AttachMode::Frame {
+            client.queue.push_frame(frame.clone());
+        }
+    }
+}
+
+pub(crate) fn output_chunks(data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    data.chunks(MAX_PAYLOAD_SIZE)
+}
+
+fn broadcast_output_or_frame(
+    attached_clients: &Arc<Mutex<HashMap<ClientId, AttachedClient>>>,
+    active_client_id: &Arc<Mutex<Option<ClientId>>>,
+    output: &[u8],
+    frame: ScreenFrame,
+) {
+    let mut overflowed_clients = Vec::new();
+    {
+        let attached = attached_clients.lock().unwrap();
+        for (&client_id, client) in attached.iter() {
+            match client.attach_mode {
+                AttachMode::Frame => client.queue.push_frame(frame.clone()),
+                AttachMode::Bytes => {
+                    for chunk in output_chunks(output) {
+                        if !client.queue.try_push_output(chunk.to_vec()) {
+                            overflowed_clients.push(client_id);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if overflowed_clients.is_empty() {
+        return;
+    }
+
+    let mut attached = attached_clients.lock().unwrap();
+    let mut removed_active = false;
+    for client_id in overflowed_clients {
+        if let Some(client) = attached.remove(&client_id) {
+            client.queue.close_when_drained();
+            removed_active |= *active_client_id.lock().unwrap() == Some(client_id);
+            tracing::debug!(client_id, "byte attach queue overflow; client removed");
+        }
+    }
+    if removed_active {
+        *active_client_id.lock().unwrap() = None;
     }
 }
 
@@ -863,6 +1010,12 @@ mod tests {
                     return;
                 }
                 SessionEvent::Frame(_) => {}
+                SessionEvent::Output(output) => {
+                    panic!(
+                        "expected frame, got output {}",
+                        String::from_utf8_lossy(&output)
+                    )
+                }
                 SessionEvent::Exit(code) => panic!("expected frame, got exit {code}"),
             }
         }
@@ -873,10 +1026,24 @@ mod tests {
         for _ in 0..16 {
             match queue.try_recv().expect("expected session event") {
                 SessionEvent::Frame(_) => {}
+                SessionEvent::Output(_) => {}
                 SessionEvent::Exit(code) => return code,
             }
         }
         panic!("expected exit");
+    }
+
+    fn expect_frame(event: Option<SessionEvent>) -> ScreenFrame {
+        match event.expect("expected initial event") {
+            SessionEvent::Frame(frame) => frame,
+            SessionEvent::Output(output) => {
+                panic!(
+                    "expected frame, got output {}",
+                    String::from_utf8_lossy(&output)
+                )
+            }
+            SessionEvent::Exit(code) => panic!("expected frame, got exit {code}"),
+        }
     }
 
     #[tokio::test]
@@ -886,8 +1053,10 @@ mod tests {
         let queue1 = SessionEventQueue::new();
         let queue2 = SessionEventQueue::new();
 
-        let (client1, frame1) = session.attach(queue1, 80, 24).unwrap();
-        let (client2, frame2) = session.attach(queue2, 100, 30).unwrap();
+        let (client1, frame1) = session.attach(queue1, 80, 24, AttachMode::Frame).unwrap();
+        let (client2, frame2) = session.attach(queue2, 100, 30, AttachMode::Frame).unwrap();
+        let frame1 = expect_frame(frame1);
+        let frame2 = expect_frame(frame2);
 
         assert_ne!(client1, client2);
         assert_eq!((frame1.cols, frame1.rows), (80, 24));
@@ -918,9 +1087,13 @@ mod tests {
         let queue2 = SessionEventQueue::new();
         let queue3 = SessionEventQueue::new();
 
-        let (client1, _) = session.attach(queue1.clone(), 80, 24).unwrap();
-        let (_middle_client, _) = session.attach(queue2, 80, 24).unwrap();
-        let (client3, _) = session.attach(queue3.clone(), 80, 24).unwrap();
+        let (client1, _) = session
+            .attach(queue1.clone(), 80, 24, AttachMode::Frame)
+            .unwrap();
+        let (_middle_client, _) = session.attach(queue2, 80, 24, AttachMode::Frame).unwrap();
+        let (client3, _) = session
+            .attach(queue3.clone(), 80, 24, AttachMode::Frame)
+            .unwrap();
 
         let frame = ScreenFrame {
             rows: 1,
@@ -966,6 +1139,12 @@ mod tests {
 
         let first = match queue.try_recv().unwrap() {
             SessionEvent::Frame(frame) => frame.rows_v2[0][0].text.clone(),
+            SessionEvent::Output(output) => {
+                panic!(
+                    "expected frame, got output {}",
+                    String::from_utf8_lossy(&output)
+                )
+            }
             SessionEvent::Exit(code) => panic!("expected frame, got exit {code}"),
         };
 
@@ -1008,8 +1187,12 @@ mod tests {
         let queue1 = SessionEventQueue::new();
         let queue2 = SessionEventQueue::new();
 
-        let _ = session.attach(queue1.clone(), 80, 24).unwrap();
-        let _ = session.attach(queue2.clone(), 80, 24).unwrap();
+        let _ = session
+            .attach(queue1.clone(), 80, 24, AttachMode::Frame)
+            .unwrap();
+        let _ = session
+            .attach(queue2.clone(), 80, 24, AttachMode::Frame)
+            .unwrap();
 
         session.close();
 
@@ -1026,8 +1209,8 @@ mod tests {
         let queue1 = SessionEventQueue::new();
         let queue2 = SessionEventQueue::new();
 
-        let (client1, _) = session.attach(queue1, 80, 24).unwrap();
-        let (client2, _) = session.attach(queue2, 100, 30).unwrap();
+        let (client1, _) = session.attach(queue1, 80, 24, AttachMode::Frame).unwrap();
+        let (client2, _) = session.attach(queue2, 100, 30, AttachMode::Frame).unwrap();
 
         assert_eq!(*session.active_client_id.lock().unwrap(), Some(client2));
         assert_eq!((session.width(), session.height()), (100, 30));
@@ -1063,8 +1246,8 @@ mod tests {
         let queue1 = SessionEventQueue::new();
         let queue2 = SessionEventQueue::new();
 
-        let (client1, _) = session.attach(queue1, 80, 24).unwrap();
-        let (client2, _) = session.attach(queue2, 100, 30).unwrap();
+        let (client1, _) = session.attach(queue1, 80, 24, AttachMode::Frame).unwrap();
+        let (client2, _) = session.attach(queue2, 100, 30, AttachMode::Frame).unwrap();
         session.resize_client(client1, 90, 20).unwrap();
 
         assert_eq!(*session.active_client_id.lock().unwrap(), Some(client2));
@@ -1092,7 +1275,8 @@ mod tests {
         }
         let queue = SessionEventQueue::new();
 
-        let (_, frame) = session.attach(queue, 80, 24).unwrap();
+        let (_, frame) = session.attach(queue, 80, 24, AttachMode::Frame).unwrap();
+        let frame = expect_frame(frame);
         let frame_text = frame
             .rows_v2
             .iter()
@@ -1105,5 +1289,196 @@ mod tests {
         assert!(!frame_text.contains("old history"));
 
         session.close();
+    }
+
+    #[test]
+    fn output_chunks_split_over_limit_payload() {
+        let data = vec![b'x'; MAX_PAYLOAD_SIZE * 2 + 3];
+        let chunks = output_chunks(&data)
+            .map(|chunk| chunk.len())
+            .collect::<Vec<_>>();
+
+        assert_eq!(chunks, vec![MAX_PAYLOAD_SIZE, MAX_PAYLOAD_SIZE, 3]);
+    }
+
+    #[test]
+    fn mixed_frame_bytes_client_behavior() {
+        let attached_clients = Arc::new(Mutex::new(HashMap::new()));
+        let active_client_id = Arc::new(Mutex::new(None));
+        let frame_queue = SessionEventQueue::new();
+        let bytes_queue = SessionEventQueue::new();
+        attached_clients.lock().unwrap().insert(
+            1,
+            AttachedClient {
+                queue: frame_queue.clone(),
+                width: 80,
+                height: 24,
+                attach_mode: AttachMode::Frame,
+            },
+        );
+        attached_clients.lock().unwrap().insert(
+            2,
+            AttachedClient {
+                queue: bytes_queue.clone(),
+                width: 80,
+                height: 24,
+                attach_mode: AttachMode::Bytes,
+            },
+        );
+
+        let frame = ScreenFrame {
+            rows: 1,
+            cols: 4,
+            rows_v2: vec![vec![ScreenRun {
+                text: "live".to_string(),
+                fg: FrameColor::Default,
+                bg: FrameColor::Default,
+                flags: 0,
+                width: 4,
+            }]],
+            ..Default::default()
+        };
+        broadcast_output_or_frame(&attached_clients, &active_client_id, b"\x1b[31mlive", frame);
+
+        match frame_queue.try_recv().unwrap() {
+            SessionEvent::Frame(frame) => assert_eq!(frame.rows_v2[0][0].text, "live"),
+            SessionEvent::Output(_) => panic!("frame client received output"),
+            SessionEvent::Exit(code) => panic!("expected frame, got exit {code}"),
+        }
+        match bytes_queue.try_recv().unwrap() {
+            SessionEvent::Output(output) => assert_eq!(output, b"\x1b[31mlive"),
+            SessionEvent::Frame(_) => panic!("bytes client received frame"),
+            SessionEvent::Exit(code) => panic!("expected output, got exit {code}"),
+        }
+    }
+
+    #[test]
+    fn byte_queue_overflow_disconnects_and_removes_client() {
+        let attached_clients = Arc::new(Mutex::new(HashMap::new()));
+        let active_client_id = Arc::new(Mutex::new(Some(1)));
+        let bytes_queue = SessionEventQueue::new();
+        attached_clients.lock().unwrap().insert(
+            1,
+            AttachedClient {
+                queue: bytes_queue.clone(),
+                width: 80,
+                height: 24,
+                attach_mode: AttachMode::Bytes,
+            },
+        );
+        for idx in 0..FRAME_CHANNEL_CAPACITY {
+            assert!(bytes_queue.try_push_output(vec![idx as u8]));
+        }
+
+        broadcast_output_or_frame(
+            &attached_clients,
+            &active_client_id,
+            b"overflow",
+            ScreenFrame::default(),
+        );
+
+        assert!(attached_clients.lock().unwrap().is_empty());
+        assert_eq!(*active_client_id.lock().unwrap(), None);
+        for idx in 0..FRAME_CHANNEL_CAPACITY {
+            match bytes_queue.try_recv().unwrap() {
+                SessionEvent::Output(output) => assert_eq!(output, vec![idx as u8]),
+                SessionEvent::Frame(_) => panic!("expected output, got frame"),
+                SessionEvent::Exit(code) => panic!("expected output, got exit {code}"),
+            }
+        }
+        assert!(bytes_queue.try_recv().is_none());
+    }
+
+    #[test]
+    fn byte_exit_preserves_pending_output_and_appends_exit_when_capacity_available() {
+        let queue = SessionEventQueue::new();
+        assert!(queue.try_push_output(b"first".to_vec()));
+        assert!(queue.try_push_output(b"second".to_vec()));
+
+        queue.push_exit_for_mode(7, AttachMode::Bytes);
+
+        match queue.try_recv().unwrap() {
+            SessionEvent::Output(output) => assert_eq!(output, b"first"),
+            SessionEvent::Frame(_) => panic!("expected output, got frame"),
+            SessionEvent::Exit(code) => panic!("expected output, got exit {code}"),
+        }
+        match queue.try_recv().unwrap() {
+            SessionEvent::Output(output) => assert_eq!(output, b"second"),
+            SessionEvent::Frame(_) => panic!("expected output, got frame"),
+            SessionEvent::Exit(code) => panic!("expected output, got exit {code}"),
+        }
+        match queue.try_recv().unwrap() {
+            SessionEvent::Exit(code) => assert_eq!(code, 7),
+            SessionEvent::Frame(_) => panic!("expected exit, got frame"),
+            SessionEvent::Output(output) => {
+                panic!(
+                    "expected exit, got output {}",
+                    String::from_utf8_lossy(&output)
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn byte_exit_preserves_pending_output_and_exit_when_queue_full() {
+        let queue = SessionEventQueue::new();
+        for idx in 0..FRAME_CHANNEL_CAPACITY {
+            assert!(queue.try_push_output(vec![idx as u8]));
+        }
+
+        queue.push_exit_for_mode(7, AttachMode::Bytes);
+
+        for idx in 0..FRAME_CHANNEL_CAPACITY {
+            match queue.try_recv().unwrap() {
+                SessionEvent::Output(output) => assert_eq!(output, vec![idx as u8]),
+                SessionEvent::Frame(_) => panic!("expected output, got frame"),
+                SessionEvent::Exit(code) => panic!("expected output, got exit {code}"),
+            }
+        }
+        match queue.try_recv().unwrap() {
+            SessionEvent::Exit(code) => assert_eq!(code, 7),
+            SessionEvent::Frame(_) => panic!("expected exit, got frame"),
+            SessionEvent::Output(output) => {
+                panic!(
+                    "expected exit, got output {}",
+                    String::from_utf8_lossy(&output)
+                )
+            }
+        }
+        assert!(queue.try_recv().is_none());
+        assert!(!queue.try_push_output(b"after-close".to_vec()));
+    }
+
+    #[test]
+    fn frame_exit_clears_pending_events_and_keeps_only_exit() {
+        let queue = SessionEventQueue::new();
+        for idx in 0..3 {
+            queue.push_frame(ScreenFrame {
+                rows: 1,
+                cols: 1,
+                rows_v2: vec![vec![ScreenRun {
+                    text: idx.to_string(),
+                    fg: FrameColor::Default,
+                    bg: FrameColor::Default,
+                    flags: 0,
+                    width: 1,
+                }]],
+                ..Default::default()
+            });
+        }
+
+        queue.push_exit_for_mode(9, AttachMode::Frame);
+
+        match queue.try_recv().unwrap() {
+            SessionEvent::Exit(code) => assert_eq!(code, 9),
+            SessionEvent::Frame(_) => panic!("expected exit, got frame"),
+            SessionEvent::Output(output) => {
+                panic!(
+                    "expected exit, got output {}",
+                    String::from_utf8_lossy(&output)
+                )
+            }
+        }
+        assert!(queue.try_recv().is_none());
     }
 }

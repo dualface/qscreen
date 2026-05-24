@@ -468,23 +468,25 @@ async fn handle_attach<R, W>(
 
     // 注册事件接收 queue
     let event_queue = SessionEventQueue::new();
-    let (client_id, screen_frame) = match sess.attach(event_queue.clone(), msg.width, msg.height) {
-        Ok(result) => result,
-        Err(e) => {
-            let resp = Message {
-                kind: MessageKind::Response,
-                id: attach_id,
-                error: session_error(&session_id, e).to_string(),
-                ..Default::default()
-            };
-            let _ = writer
-                .lock()
-                .await
-                .write_all(&resp.to_json_line().unwrap_or_default())
-                .await;
-            return;
-        }
-    };
+    let attach_mode = msg.attach_mode;
+    let (client_id, initial_event) =
+        match sess.attach(event_queue.clone(), msg.width, msg.height, attach_mode) {
+            Ok(result) => result,
+            Err(e) => {
+                let resp = Message {
+                    kind: MessageKind::Response,
+                    id: attach_id,
+                    error: session_error(&session_id, e).to_string(),
+                    ..Default::default()
+                };
+                let _ = writer
+                    .lock()
+                    .await
+                    .write_all(&resp.to_json_line().unwrap_or_default())
+                    .await;
+                return;
+            }
+        };
 
     let attached_name = sess.name();
     tracing::info!(session_id = %session_id, session = %attached_name, client_id, "client attached");
@@ -509,24 +511,21 @@ async fn handle_attach<R, W>(
         return;
     }
 
-    let frame_event = Message {
-        kind: MessageKind::Event,
-        event: Some(EventType::Frame),
-        session_id: session_id.clone(),
-        frame: Some(screen_frame),
-        ..Default::default()
-    };
-    let frame_bytes = match frame_event.to_json_line() {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::warn!(session_id = %session_id, error = %e, "serialize screen frame failed");
-            sess.detach(client_id);
-            return;
+    if let Some(event) = initial_event {
+        for initial_msg in event_messages(&session_id, event) {
+            let initial_bytes = match initial_msg.to_json_line() {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(session_id = %session_id, error = %e, "serialize attach initial event failed");
+                    sess.detach(client_id);
+                    return;
+                }
+            };
+            if writer.lock().await.write_all(&initial_bytes).await.is_err() {
+                sess.detach(client_id);
+                return;
+            }
         }
-    };
-    if writer.lock().await.write_all(&frame_bytes).await.is_err() {
-        sess.detach(client_id);
-        return;
     }
 
     // 启动 writer 任务：PTY 输出 → client
@@ -537,35 +536,23 @@ async fn handle_attach<R, W>(
         let name_c = sess.name();
         tokio::spawn(async move {
             loop {
-                let event = event_queue.recv().await;
-                let msg = match event {
-                    SessionEvent::Frame(frame) => Message {
-                        kind: MessageKind::Event,
-                        event: Some(EventType::Frame),
-                        session_id: session_id_c.clone(),
-                        frame: Some(frame),
-                        ..Default::default()
-                    },
-                    SessionEvent::Exit(code) => Message {
-                        kind: MessageKind::Event,
-                        event: Some(EventType::Exit),
-                        session_id: session_id_c.clone(),
-                        exit_code: code as i64,
-                        ..Default::default()
-                    },
-                };
-                let bytes = match msg.to_json_line() {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        tracing::warn!(session_id = %session_id_c, error = %e, "serialize attach event failed");
-                        break;
-                    }
-                };
-                if writer_c.lock().await.write_all(&bytes).await.is_err() {
+                let Some(event) = event_queue.recv().await else {
                     break;
+                };
+                let is_exit = matches!(event, SessionEvent::Exit(_));
+                for msg in event_messages(&session_id_c, event) {
+                    let bytes = match msg.to_json_line() {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            tracing::warn!(session_id = %session_id_c, error = %e, "serialize attach event failed");
+                            return;
+                        }
+                    };
+                    if writer_c.lock().await.write_all(&bytes).await.is_err() {
+                        return;
+                    }
                 }
-                // exit event 后退出 writer 任务
-                if msg.event == Some(EventType::Exit) {
+                if is_exit {
                     break;
                 }
             }
@@ -701,6 +688,34 @@ async fn handle_attach<R, W>(
     tracing::debug!(session_id = %session_id, session = %session_name, client_id, "client disconnected");
 }
 
+fn event_messages(session_id: &str, event: SessionEvent) -> Vec<Message> {
+    match event {
+        SessionEvent::Frame(frame) => vec![Message {
+            kind: MessageKind::Event,
+            event: Some(EventType::Frame),
+            session_id: session_id.to_string(),
+            frame: Some(frame),
+            ..Default::default()
+        }],
+        SessionEvent::Output(output) => session::output_chunks(&output)
+            .map(|chunk| Message {
+                kind: MessageKind::Event,
+                event: Some(EventType::Output),
+                session_id: session_id.to_string(),
+                payload: chunk.to_vec(),
+                ..Default::default()
+            })
+            .collect(),
+        SessionEvent::Exit(code) => vec![Message {
+            kind: MessageKind::Event,
+            event: Some(EventType::Exit),
+            session_id: session_id.to_string(),
+            exit_code: code as i64,
+            ..Default::default()
+        }],
+    }
+}
+
 fn session_error(session_id: &str, e: anyhow::Error) -> anyhow::Error {
     let msg = e.to_string();
     if msg.contains("already attached") {
@@ -715,6 +730,7 @@ fn session_error(session_id: &str, e: anyhow::Error) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qscreen_protocol::AttachMode;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     fn test_state() -> Arc<State> {
@@ -732,6 +748,7 @@ mod tests {
         for _ in 0..16 {
             match queue.try_recv().expect("expected session event") {
                 SessionEvent::Frame(_) => {}
+                SessionEvent::Output(_) => {}
                 SessionEvent::Exit(code) => return code,
             }
         }
@@ -794,6 +811,15 @@ mod tests {
                 return msg;
             }
         }
+    }
+
+    async fn read_message<S>(reader: &mut BufReader<S>) -> Message
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        Message::from_json(&line).unwrap()
     }
 
     #[tokio::test]
@@ -929,11 +955,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_attach_default_first_event_is_frame() {
+        let state = test_state();
+        let session = insert_session(&state, "1", "work").await;
+
+        let (client, server) = tokio::io::duplex(4096);
+        let handle = tokio::spawn(handle_connection(server, state));
+        let mut reader = BufReader::new(client);
+
+        let attach = Message {
+            kind: MessageKind::Request,
+            id: "attach-1".to_string(),
+            command: Some(Command::Attach),
+            session_id: "1".to_string(),
+            width: 80,
+            height: 24,
+            ..Default::default()
+        };
+        reader
+            .get_mut()
+            .write_all(&attach.to_json_line().unwrap())
+            .await
+            .unwrap();
+
+        let response = read_message(&mut reader).await;
+        assert!(response.ok);
+        let first_event = read_message(&mut reader).await;
+        assert_eq!(first_event.kind, MessageKind::Event);
+        assert_eq!(first_event.event, Some(EventType::Frame));
+        assert!(first_event.frame.is_some());
+        assert!(first_event.payload.is_empty());
+
+        drop(reader);
+        handle.await.unwrap();
+        session.close();
+    }
+
+    #[tokio::test]
+    async fn handle_attach_bytes_first_event_is_output_and_snapshot_chunks() {
+        let state = test_state();
+        let session = insert_session(&state, "1", "work").await;
+        let snapshot = vec![b'x'; qscreen_protocol::MAX_PAYLOAD_SIZE + 3];
+        session.scrollback.lock().unwrap().append(&snapshot);
+
+        let (client, server) = tokio::io::duplex(512 * 1024);
+        let handle = tokio::spawn(handle_connection(server, state));
+        let mut reader = BufReader::new(client);
+
+        let attach = Message {
+            kind: MessageKind::Request,
+            id: "attach-1".to_string(),
+            command: Some(Command::Attach),
+            session_id: "1".to_string(),
+            width: 80,
+            height: 24,
+            attach_mode: AttachMode::Bytes,
+            ..Default::default()
+        };
+        reader
+            .get_mut()
+            .write_all(&attach.to_json_line().unwrap())
+            .await
+            .unwrap();
+
+        let response = read_message(&mut reader).await;
+        assert!(response.ok);
+
+        let first_event = read_message(&mut reader).await;
+        assert_eq!(first_event.kind, MessageKind::Event);
+        assert_eq!(first_event.event, Some(EventType::Output));
+        assert_eq!(
+            first_event.payload.len(),
+            qscreen_protocol::MAX_PAYLOAD_SIZE
+        );
+        assert!(first_event.frame.is_none());
+
+        let second_event = read_message(&mut reader).await;
+        assert_eq!(second_event.kind, MessageKind::Event);
+        assert_eq!(second_event.event, Some(EventType::Output));
+        assert_eq!(second_event.payload.len(), 3);
+
+        let mut replayed = first_event.payload;
+        replayed.extend_from_slice(&second_event.payload);
+        assert_eq!(replayed, snapshot);
+
+        drop(reader);
+        handle.await.unwrap();
+        session.close();
+    }
+
+    #[tokio::test]
     async fn handle_attach_detach_removes_only_that_client() {
         let state = test_state();
         let session = insert_session(&state, "1", "work").await;
         let queue = SessionEventQueue::new();
-        let (kept_client, _) = session.attach(queue, 80, 24).unwrap();
+        let (kept_client, _) = session.attach(queue, 80, 24, AttachMode::Frame).unwrap();
 
         let messages = attach_with_script(
             state.clone(),
@@ -967,8 +1083,12 @@ mod tests {
         let queue1 = SessionEventQueue::new();
         let queue2 = SessionEventQueue::new();
 
-        let _ = session.attach(queue1.clone(), 80, 24).unwrap();
-        let _ = session.attach(queue2.clone(), 100, 30).unwrap();
+        let _ = session
+            .attach(queue1.clone(), 80, 24, AttachMode::Frame)
+            .unwrap();
+        let _ = session
+            .attach(queue2.clone(), 100, 30, AttachMode::Frame)
+            .unwrap();
 
         let response = dispatch_command(
             &Message {
@@ -1011,7 +1131,7 @@ mod tests {
         let state = test_state();
         let session = insert_session(&state, "1", "work").await;
         let queue = SessionEventQueue::new();
-        let (first_client, _) = session.attach(queue, 80, 24).unwrap();
+        let (first_client, _) = session.attach(queue, 80, 24, AttachMode::Frame).unwrap();
 
         let (client, server) = tokio::io::duplex(4096);
         let handle = tokio::spawn(handle_connection(server, state.clone()));

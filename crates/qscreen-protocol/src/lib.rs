@@ -50,6 +50,14 @@ pub enum EventType {
     Exit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AttachMode {
+    #[default]
+    Frame,
+    Bytes,
+}
+
 pub const FRAME_FLAG_DIM: u8 = 0b0000_0001;
 pub const FRAME_FLAG_BOLD: u8 = 0b0000_0010;
 pub const FRAME_FLAG_ITALIC: u8 = 0b0000_0100;
@@ -131,6 +139,7 @@ pub struct Message {
     pub exit_code: i64,
     pub payload: Vec<u8>,
     pub frame: Option<ScreenFrame>,
+    pub attach_mode: AttachMode,
 }
 
 // ── Wire 格式 (JSON 序列化用) ────────────────────────────────────────────────
@@ -170,6 +179,8 @@ struct WireMessage {
     payload_b64: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     frame: Option<ScreenFrame>,
+    #[serde(skip_serializing_if = "is_attach_mode_frame", default)]
+    attach_mode: AttachMode,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -183,6 +194,9 @@ fn is_zero_u8(v: &u8) -> bool {
 }
 fn is_zero_i64(v: &i64) -> bool {
     *v == 0
+}
+fn is_attach_mode_frame(v: &AttachMode) -> bool {
+    *v == AttachMode::Frame
 }
 
 // ── 编解码 ────────────────────────────────────────────────────────────────
@@ -217,6 +231,7 @@ impl Message {
                 B64.encode(&self.payload)
             },
             frame: self.frame.clone(),
+            attach_mode: self.attach_mode,
         };
         let mut bytes = serde_json::to_vec(&wire)?;
         bytes.push(b'\n');
@@ -259,6 +274,7 @@ impl Message {
             exit_code: wire.exit_code,
             payload,
             frame: wire.frame,
+            attach_mode: wire.attach_mode,
         })
     }
 }
@@ -441,6 +457,74 @@ mod tests {
         );
         let decoded = Message::from_json(json_str).unwrap();
         assert_eq!(decoded.payload, payload);
+    }
+
+    #[test]
+    fn attach_mode_defaults_to_frame() {
+        let decoded = Message::from_json(
+            r#"{"kind":"request","id":"1","command":"attach","session_id":"42","width":80,"height":24}"#,
+        )
+        .unwrap();
+
+        assert_eq!(decoded.attach_mode, AttachMode::Frame);
+
+        let line = Message {
+            kind: MessageKind::Request,
+            command: Some(Command::Attach),
+            attach_mode: AttachMode::Frame,
+            ..Default::default()
+        }
+        .to_json_line()
+        .unwrap();
+        let json = std::str::from_utf8(&line).unwrap();
+        assert!(!json.contains("attach_mode"));
+    }
+
+    #[test]
+    fn attach_mode_bytes_round_trip() {
+        let msg = Message {
+            kind: MessageKind::Request,
+            id: "1".to_string(),
+            command: Some(Command::Attach),
+            attach_mode: AttachMode::Bytes,
+            ..Default::default()
+        };
+        let line = msg.to_json_line().unwrap();
+        let json = std::str::from_utf8(&line).unwrap();
+
+        assert!(json.contains(r#""attach_mode":"bytes""#));
+        assert_eq!(
+            Message::from_json(json).unwrap().attach_mode,
+            AttachMode::Bytes
+        );
+    }
+
+    #[test]
+    fn output_event_uses_payload_b64() {
+        let msg = Message {
+            kind: MessageKind::Event,
+            event: Some(EventType::Output),
+            payload: b"bytes".to_vec(),
+            ..Default::default()
+        };
+        let line = msg.to_json_line().unwrap();
+        let json = std::str::from_utf8(&line).unwrap();
+
+        assert!(json.contains(r#""event":"output""#));
+        assert!(json.contains("payload_b64"));
+        assert!(!json.contains(r#""payload":"#));
+    }
+
+    #[test]
+    fn output_payload_over_limit_is_rejected() {
+        let msg = Message {
+            kind: MessageKind::Event,
+            event: Some(EventType::Output),
+            payload: vec![b'x'; MAX_PAYLOAD_SIZE + 1],
+            ..Default::default()
+        };
+
+        assert!(msg.to_json_line().is_err());
     }
 
     #[test]

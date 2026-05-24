@@ -104,6 +104,12 @@ or sent input. Resize events from an inactive client update that client's stored
 size without immediately resizing the PTY; the stored size is applied when that
 client next becomes active.
 
+Machine clients can request byte-stream attach by sending an attach request with
+`"attach_mode":"bytes"`. The daemon replies with `output` events using
+`payload_b64`, starting with the current scrollback snapshot when non-empty, then
+live PTY bytes. Omitting `attach_mode` keeps the default frame attach used by
+`qscn`.
+
 ## Project Layout
 
 - `crates/qscreen-client`: CLI binary, terminal UI, daemon launcher.

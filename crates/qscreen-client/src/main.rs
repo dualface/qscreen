@@ -684,15 +684,7 @@ async fn attach_session_once(
     let attach_id = "1";
     send_msg(
         &mut conn,
-        Message {
-            kind: MessageKind::Request,
-            id: attach_id.to_string(),
-            command: Some(Command::Attach),
-            session_id: session_id.to_string(),
-            width: term_width as u32,
-            height: term_height as u32,
-            ..Default::default()
-        },
+        attach_request_message(attach_id, session_id, term_width, term_height),
     )
     .await?;
 
@@ -703,6 +695,23 @@ async fn attach_session_once(
 
     let session_id_owned = session_id.to_string();
     run_attach_loop(conn, session_id_owned, term_size, config.prefix).await
+}
+
+fn attach_request_message(
+    attach_id: &str,
+    session_id: &str,
+    term_width: u16,
+    term_height: u16,
+) -> Message {
+    Message {
+        kind: MessageKind::Request,
+        id: attach_id.to_string(),
+        command: Some(Command::Attach),
+        session_id: session_id.to_string(),
+        width: term_width as u32,
+        height: term_height as u32,
+        ..Default::default()
+    }
 }
 
 struct TerminalCleanupGuard;
@@ -1875,5 +1884,15 @@ mod tests {
             None
         );
         assert_eq!(next_attach_target_after_outcome(AttachOutcome::Ended), None);
+    }
+
+    #[test]
+    fn default_attach_request_remains_frame_omitted() {
+        let msg = attach_request_message("1", "42", 80, 24);
+
+        assert_eq!(msg.attach_mode, qscreen_protocol::AttachMode::Frame);
+        let line = msg.to_json_line().unwrap();
+        let json = std::str::from_utf8(&line).unwrap();
+        assert!(!json.contains("attach_mode"));
     }
 }
