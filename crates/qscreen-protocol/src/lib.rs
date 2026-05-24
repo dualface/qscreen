@@ -9,9 +9,9 @@ pub const MAX_WIRE_MESSAGE_SIZE: usize =
     MAX_CONTROL_MESSAGE_SIZE + 4 * MAX_PAYLOAD_SIZE.div_ceil(3);
 
 pub const MIN_TERMINAL_WIDTH: u32 = 1;
-pub const MAX_TERMINAL_WIDTH: u32 = 500;
+pub const MAX_TERMINAL_WIDTH: u32 = 1000;
 pub const MIN_TERMINAL_HEIGHT: u32 = 1;
-pub const MAX_TERMINAL_HEIGHT: u32 = 200;
+pub const MAX_TERMINAL_HEIGHT: u32 = 500;
 
 pub const DEFAULT_WIDTH: u32 = 80;
 pub const DEFAULT_HEIGHT: u32 = 24;
@@ -677,5 +677,20 @@ mod tests {
     #[test]
     fn validate_attach_size_accepts_valid_size() {
         validate_attach_size(80, 24).unwrap();
+    }
+
+    #[test]
+    fn validate_attach_size_accepts_quicktui_max_size() {
+        validate_attach_size(1000, 500).unwrap();
+    }
+
+    #[test]
+    fn validate_attach_size_rejects_above_quicktui_max_width() {
+        assert!(validate_attach_size(1001, 500).is_err());
+    }
+
+    #[test]
+    fn validate_attach_size_rejects_above_quicktui_max_height() {
+        assert!(validate_attach_size(1000, 501).is_err());
     }
 }

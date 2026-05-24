@@ -41,6 +41,7 @@ pub struct AttachedClient {
     pub width: u16,
     pub height: u16,
     pub attach_mode: AttachMode,
+    pub attached: bool,
 }
 
 pub struct SessionEventQueue {
@@ -450,6 +451,7 @@ impl Session {
                 width: w,
                 height: h,
                 attach_mode,
+                attached: true,
             },
         );
         *self.active_client_id.lock().unwrap() = Some(client_id);
@@ -463,6 +465,7 @@ impl Session {
 
     pub fn focus_client(&self, client_id: ClientId) -> anyhow::Result<()> {
         let (width, height) = self.client_size(client_id)?;
+        self.mark_client_attached(client_id)?;
         *self.active_client_id.lock().unwrap() = Some(client_id);
         self.resize_pty(width, height)
     }
@@ -479,13 +482,19 @@ impl Session {
         height: u32,
     ) -> anyhow::Result<()> {
         self.ensure_open()?;
-        {
+        let was_detached = {
             let mut attached = self.attached_clients.lock().unwrap();
             let client = attached
                 .get_mut(&client_id)
                 .ok_or_else(|| anyhow::anyhow!("client {client_id} is not attached"))?;
+            let was_detached = !client.attached;
             client.width = width as u16;
             client.height = height as u16;
+            client.attached = true;
+            was_detached
+        };
+        if was_detached {
+            *self.active_client_id.lock().unwrap() = Some(client_id);
         }
         if *self.active_client_id.lock().unwrap() == Some(client_id) {
             self.resize_pty(width as u16, height as u16)?;
@@ -493,8 +502,33 @@ impl Session {
         Ok(())
     }
 
+    fn mark_client_attached(&self, client_id: ClientId) -> anyhow::Result<()> {
+        let mut attached = self.attached_clients.lock().unwrap();
+        let client = attached
+            .get_mut(&client_id)
+            .ok_or_else(|| anyhow::anyhow!("client {client_id} is not attached"))?;
+        client.attached = true;
+        Ok(())
+    }
+
     /// Detach 指定客户端（幂等）
     pub fn detach(&self, client_id: ClientId) {
+        let mut attached = self.attached_clients.lock().unwrap();
+        if let Some(client) = attached.get_mut(&client_id) {
+            if client.attach_mode == AttachMode::Bytes {
+                client.attached = false;
+            } else {
+                attached.remove(&client_id);
+            }
+        }
+        drop(attached);
+        if *self.active_client_id.lock().unwrap() == Some(client_id) {
+            *self.active_client_id.lock().unwrap() = None;
+        }
+    }
+
+    /// Disconnect 指定客户端连接（幂等）
+    pub fn disconnect(&self, client_id: ClientId) {
         self.attached_clients.lock().unwrap().remove(&client_id);
         if *self.active_client_id.lock().unwrap() == Some(client_id) {
             *self.active_client_id.lock().unwrap() = None;
@@ -519,7 +553,11 @@ impl Session {
     }
 
     pub fn is_attached(&self) -> bool {
-        !self.attached_clients.lock().unwrap().is_empty()
+        self.attached_clients
+            .lock()
+            .unwrap()
+            .values()
+            .any(|client| client.attached)
     }
 }
 
@@ -1314,6 +1352,7 @@ mod tests {
                 width: 80,
                 height: 24,
                 attach_mode: AttachMode::Frame,
+                attached: true,
             },
         );
         attached_clients.lock().unwrap().insert(
@@ -1323,6 +1362,7 @@ mod tests {
                 width: 80,
                 height: 24,
                 attach_mode: AttachMode::Bytes,
+                attached: true,
             },
         );
 
@@ -1352,6 +1392,46 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn byte_detach_keeps_observer_stream_and_reattaches_on_resize() {
+        let session =
+            Session::new("1".to_string(), "byte-detach".to_string(), 80, 24, None).unwrap();
+        let queue = SessionEventQueue::new();
+        let (client_id, _) = session
+            .attach(queue.clone(), 80, 24, AttachMode::Bytes)
+            .unwrap();
+
+        assert!(session.is_attached());
+        session.detach(client_id);
+        assert!(!session.is_attached());
+        {
+            let attached = session.attached_clients.lock().unwrap();
+            let client = attached.get(&client_id).expect("byte observer kept");
+            assert_eq!(client.attach_mode, AttachMode::Bytes);
+            assert!(!client.attached);
+        }
+
+        let frame = ScreenFrame::default();
+        broadcast_output_or_frame(
+            &session.attached_clients,
+            &session.active_client_id,
+            b"live",
+            frame,
+        );
+        match queue.try_recv().unwrap() {
+            SessionEvent::Output(output) => assert_eq!(output, b"live"),
+            SessionEvent::Frame(_) => panic!("expected output, got frame"),
+            SessionEvent::Exit(code) => panic!("expected output, got exit {code}"),
+        }
+
+        session.resize_client(client_id, 100, 30).unwrap();
+        assert!(session.is_attached());
+        assert_eq!(*session.active_client_id.lock().unwrap(), Some(client_id));
+        assert_eq!((session.width(), session.height()), (100, 30));
+
+        session.close();
+    }
+
     #[test]
     fn byte_queue_overflow_disconnects_and_removes_client() {
         let attached_clients = Arc::new(Mutex::new(HashMap::new()));
@@ -1364,6 +1444,7 @@ mod tests {
                 width: 80,
                 height: 24,
                 attach_mode: AttachMode::Bytes,
+                attached: true,
             },
         );
         for idx in 0..FRAME_CHANNEL_CAPACITY {

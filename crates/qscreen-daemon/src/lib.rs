@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use qscreen_protocol::{
-    Command, EventType, Message, MessageKind, SessionInfo, attached_session_error,
+    AttachMode, Command, EventType, Message, MessageKind, SessionInfo, attached_session_error,
     exited_session_error, missing_session_error, validate_attach_size, validate_new_size,
     validate_resize, validate_session_id, validate_session_name,
 };
@@ -507,7 +507,7 @@ async fn handle_attach<R, W>(
         .await
         .is_err()
     {
-        sess.detach(client_id);
+        sess.disconnect(client_id);
         return;
     }
 
@@ -517,12 +517,12 @@ async fn handle_attach<R, W>(
                 Ok(bytes) => bytes,
                 Err(e) => {
                     tracing::warn!(session_id = %session_id, error = %e, "serialize attach initial event failed");
-                    sess.detach(client_id);
+                    sess.disconnect(client_id);
                     return;
                 }
             };
             if writer.lock().await.write_all(&initial_bytes).await.is_err() {
-                sess.detach(client_id);
+                sess.disconnect(client_id);
                 return;
             }
         }
@@ -639,15 +639,23 @@ async fn handle_attach<R, W>(
                 }
             }
             Some(Command::Resize) => {
-                if cmd.width > 0 && cmd.height > 0 {
-                    let _ = sess.resize_client(client_id, cmd.width, cmd.height);
-                }
-                let resp = Message {
-                    kind: MessageKind::Response,
-                    id: cmd.id.clone(),
-                    session_id: session_id.clone(),
-                    ok: true,
-                    ..Default::default()
+                let resp = match validate_resize(cmd.width, cmd.height)
+                    .and_then(|_| sess.resize_client(client_id, cmd.width, cmd.height))
+                {
+                    Ok(()) => Message {
+                        kind: MessageKind::Response,
+                        id: cmd.id.clone(),
+                        session_id: session_id.clone(),
+                        ok: true,
+                        ..Default::default()
+                    },
+                    Err(e) => Message {
+                        kind: MessageKind::Response,
+                        id: cmd.id.clone(),
+                        session_id: session_id.clone(),
+                        error: e.to_string(),
+                        ..Default::default()
+                    },
                 };
                 if writer
                     .lock()
@@ -675,14 +683,16 @@ async fn handle_attach<R, W>(
                     .await;
                 let session_name = sess.name();
                 tracing::info!(session_id = %session_id, session = %session_name, client_id, "client detached");
-                writer_task_handle.abort();
-                return;
+                if attach_mode != AttachMode::Bytes {
+                    writer_task_handle.abort();
+                    return;
+                }
             }
             _ => break,
         }
     }
 
-    sess.detach(client_id);
+    sess.disconnect(client_id);
     writer_task_handle.abort();
     let session_name = sess.name();
     tracing::debug!(session_id = %session_id, session = %session_name, client_id, "client disconnected");
@@ -1073,6 +1083,128 @@ mod tests {
         assert!(attached.contains_key(&kept_client));
         drop(attached);
 
+        session.close();
+    }
+
+    #[tokio::test]
+    async fn handle_attach_bytes_detach_keeps_stream_and_resize_reattaches() {
+        let state = test_state();
+        let session = insert_session(&state, "1", "work").await;
+
+        let (client, server) = tokio::io::duplex(4096);
+        let handle = tokio::spawn(handle_connection(server, state.clone()));
+        let mut reader = BufReader::new(client);
+
+        let attach = Message {
+            kind: MessageKind::Request,
+            id: "attach-1".to_string(),
+            command: Some(Command::Attach),
+            session_id: "1".to_string(),
+            width: 80,
+            height: 24,
+            attach_mode: AttachMode::Bytes,
+            ..Default::default()
+        };
+        reader
+            .get_mut()
+            .write_all(&attach.to_json_line().unwrap())
+            .await
+            .unwrap();
+        let attach_resp = read_response_with_id(&mut reader, "attach-1").await;
+        assert!(attach_resp.ok);
+
+        let detach = Message {
+            kind: MessageKind::Request,
+            id: "detach-1".to_string(),
+            command: Some(Command::Detach),
+            session_id: "1".to_string(),
+            ..Default::default()
+        };
+        reader
+            .get_mut()
+            .write_all(&detach.to_json_line().unwrap())
+            .await
+            .unwrap();
+        let detach_resp = read_response_with_id(&mut reader, "detach-1").await;
+        assert!(detach_resp.ok);
+        assert!(!state.list_sessions()[0].attached);
+        assert_eq!(session.attached_clients.lock().unwrap().len(), 1);
+
+        let resize = Message {
+            kind: MessageKind::Request,
+            id: "resize-1".to_string(),
+            command: Some(Command::Resize),
+            session_id: "1".to_string(),
+            width: 100,
+            height: 30,
+            ..Default::default()
+        };
+        reader
+            .get_mut()
+            .write_all(&resize.to_json_line().unwrap())
+            .await
+            .unwrap();
+        let resize_resp = read_response_with_id(&mut reader, "resize-1").await;
+        assert!(resize_resp.ok);
+        assert!(state.list_sessions()[0].attached);
+        assert_eq!((session.width(), session.height()), (100, 30));
+
+        drop(reader);
+        handle.await.unwrap();
+        session.close();
+    }
+
+    #[tokio::test]
+    async fn handle_attach_rejects_invalid_resize_without_changing_session_size() {
+        let state = test_state();
+        let session = insert_session(&state, "1", "work").await;
+
+        let (client, server) = tokio::io::duplex(4096);
+        let handle = tokio::spawn(handle_connection(server, state));
+        let mut reader = BufReader::new(client);
+
+        let attach = Message {
+            kind: MessageKind::Request,
+            id: "attach-1".to_string(),
+            command: Some(Command::Attach),
+            session_id: "1".to_string(),
+            width: 80,
+            height: 24,
+            attach_mode: AttachMode::Bytes,
+            ..Default::default()
+        };
+        reader
+            .get_mut()
+            .write_all(&attach.to_json_line().unwrap())
+            .await
+            .unwrap();
+        let attach_resp = read_response_with_id(&mut reader, "attach-1").await;
+        assert!(attach_resp.ok);
+        assert_eq!((session.width(), session.height()), (80, 24));
+
+        for (id, width, height) in [("resize-width", 1001, 500), ("resize-height", 1000, 501)] {
+            let resize = Message {
+                kind: MessageKind::Request,
+                id: id.to_string(),
+                command: Some(Command::Resize),
+                session_id: "1".to_string(),
+                width,
+                height,
+                ..Default::default()
+            };
+            reader
+                .get_mut()
+                .write_all(&resize.to_json_line().unwrap())
+                .await
+                .unwrap();
+            let resize_resp = read_response_with_id(&mut reader, id).await;
+            assert!(!resize_resp.ok);
+            assert!(!resize_resp.error.is_empty());
+            assert_eq!((session.width(), session.height()), (80, 24));
+        }
+
+        drop(reader);
+        handle.await.unwrap();
         session.close();
     }
 
