@@ -23,6 +23,44 @@ Tests are currently inline in crate source files with `#[cfg(test)] mod tests`. 
 
 The pinned toolchain is stable Rust with the `x86_64-pc-windows-gnu` target in `rust-toolchain.toml`. Daemon runtime support is Windows-only because it uses ConPTY and Windows named pipes.
 
+## Release Process
+
+Formal releases use tags named `YYYYMMDD-NN`, where `NN` is the 2-digit release count for that date. Before tagging, fetch remote tags and choose the next unused number for the current date, for example `20260525-01`.
+
+Release `qscn` as prebuilt binaries for:
+
+- Linux x86_64: `x86_64-unknown-linux-gnu`
+- Linux arm64: `aarch64-unknown-linux-gnu`
+- macOS arm64: `aarch64-apple-darwin`
+- Windows x86_64: `x86_64-pc-windows-gnu`
+- Windows arm64: `aarch64-pc-windows-gnullvm`
+
+Build optimized binaries with `--locked --bin qscn`. On macOS hosts, use `cargo zigbuild` for Linux and Windows cross builds when the native linker tools are unavailable:
+
+- `cargo build --release --locked --bin qscn --target aarch64-apple-darwin`
+- `cargo zigbuild --release --locked --bin qscn --target x86_64-unknown-linux-gnu`
+- `cargo zigbuild --release --locked --bin qscn --target aarch64-unknown-linux-gnu`
+- `cargo zigbuild --release --locked --bin qscn --target x86_64-pc-windows-gnu`
+- `cargo zigbuild --release --locked --bin qscn --target aarch64-pc-windows-gnullvm`
+
+Package each archive with a single executable at the archive root: `qscn` for Unix archives and `qscn.exe` for Windows archives. Use these asset names:
+
+- `qscreen-<tag>-linux-x86_64.tar.gz`
+- `qscreen-<tag>-linux-arm64.tar.gz`
+- `qscreen-<tag>-macos-arm64.tar.gz`
+- `qscreen-<tag>-windows-x86_64.zip`
+- `qscreen-<tag>-windows-arm64.zip`
+- `SHA256SUMS`
+
+Create the GitHub Release as a formal latest release, not a draft or prerelease:
+
+- `git tag -a <tag> -m "Release <tag>"`
+- `git push origin <tag>`
+- `gh release create <tag> --title "<tag>" --generate-notes --latest`
+- `gh release upload <tag> dist/<tag>/qscreen-<tag>-* dist/<tag>/SHA256SUMS`
+
+Verify the release before handing off: `shasum -a 256 -c SHA256SUMS` must pass locally, `gh release view <tag> --json assets,isDraft,isPrerelease,tagName,url` must show all six assets uploaded, and the latest release should point at the new tag.
+
 ## Coding Style & Naming Conventions
 
 Use Rust 2024 edition idioms and `rustfmt` defaults. Keep module names, file names, and functions in `snake_case`; types and enum variants use `PascalCase`; constants use `SCREAMING_SNAKE_CASE`. Prefer workspace dependencies in the root `Cargo.toml` for shared crates. Keep protocol JSON field names and compatibility behavior stable, especially `payload_b64` and size limits.
