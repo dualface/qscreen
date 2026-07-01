@@ -2,13 +2,14 @@ use std::io::Write;
 
 use qscreen_protocol::{
     FRAME_FLAG_BLINK, FRAME_FLAG_BOLD, FRAME_FLAG_DIM, FRAME_FLAG_HIDDEN, FRAME_FLAG_INVERSE,
-    FRAME_FLAG_ITALIC, FRAME_FLAG_STRIKETHROUGH, FRAME_FLAG_UNDERLINE, FrameColor, ScreenFrame,
+    FRAME_FLAG_ITALIC, FRAME_FLAG_STRIKETHROUGH, FRAME_FLAG_UNDERLINE, FrameColor,
+    FrameMouseEncoding, FrameMouseMode, ScreenFrame,
 };
 use unicode_width::UnicodeWidthStr;
 
-const PREPARE_ATTACH: &[u8] = b"\x1b[?1004h\x1b[2J\x1b[H";
+const PREPARE_ATTACH: &[u8] = b"\x1b[?1049h\x1b[?1004h\x1b[2J\x1b[H";
 const RESTORE_AFTER_ATTACH: &[u8] =
-    b"\x1b[?2026l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?25h\x1b[0m\x1b[0 q\x1b[r";
+    b"\x1b[?2026l\x1b[?1l\x1b[?2004l\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1004l\x1b[?25h\x1b[0m\x1b[0 q\x1b[r\x1b[?1049l";
 
 pub fn prepare_attach_terminal<W: Write>(out: &mut W) -> std::io::Result<()> {
     out.write_all(PREPARE_ATTACH)?;
@@ -27,6 +28,7 @@ pub fn cleanup_attach_terminal<W: Write>(out: &mut W) -> std::io::Result<()> {
 #[derive(Default)]
 pub struct FrameRenderer {
     previous: Option<ScreenFrame>,
+    input_modes: InputModeState,
 }
 
 impl FrameRenderer {
@@ -40,6 +42,7 @@ impl FrameRenderer {
                 || previous.alternate_screen != frame.alternate_screen
         });
 
+        render_input_mode_diff(out, &mut self.input_modes, frame)?;
         render_screen_frame_with_previous(out, frame, self.previous.as_ref(), force_full)?;
         self.previous = Some(frame.clone());
         Ok(())
@@ -48,6 +51,80 @@ impl FrameRenderer {
     pub fn reset(&mut self) {
         self.previous = None;
     }
+
+    pub fn input_modes(&self) -> InputModeState {
+        self.input_modes
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InputModeState {
+    pub application_cursor: bool,
+    pub bracketed_paste: bool,
+    pub mouse_mode: FrameMouseMode,
+    pub mouse_encoding: FrameMouseEncoding,
+}
+
+fn render_input_mode_diff<W: Write>(
+    out: &mut W,
+    current: &mut InputModeState,
+    frame: &ScreenFrame,
+) -> std::io::Result<()> {
+    if current.application_cursor != frame.application_cursor {
+        out.write_all(if frame.application_cursor {
+            b"\x1b[?1h"
+        } else {
+            b"\x1b[?1l"
+        })?;
+        current.application_cursor = frame.application_cursor;
+    }
+    if current.bracketed_paste != frame.bracketed_paste {
+        out.write_all(if frame.bracketed_paste {
+            b"\x1b[?2004h"
+        } else {
+            b"\x1b[?2004l"
+        })?;
+        current.bracketed_paste = frame.bracketed_paste;
+    }
+    if current.mouse_mode != frame.mouse_mode {
+        write_mouse_mode(out, current.mouse_mode, false)?;
+        write_mouse_mode(out, frame.mouse_mode, true)?;
+        current.mouse_mode = frame.mouse_mode;
+    }
+    if current.mouse_encoding != frame.mouse_encoding {
+        write_mouse_encoding(out, current.mouse_encoding, false)?;
+        write_mouse_encoding(out, frame.mouse_encoding, true)?;
+        current.mouse_encoding = frame.mouse_encoding;
+    }
+    Ok(())
+}
+
+fn write_mouse_mode<W: Write>(
+    out: &mut W,
+    mode: FrameMouseMode,
+    enabled: bool,
+) -> std::io::Result<()> {
+    let code = match mode {
+        FrameMouseMode::None => return Ok(()),
+        FrameMouseMode::Press => 9,
+        FrameMouseMode::PressRelease => 1000,
+        FrameMouseMode::ButtonMotion => 1002,
+        FrameMouseMode::AnyMotion => 1003,
+    };
+    write!(out, "\x1b[?{}{}", code, if enabled { "h" } else { "l" })
+}
+
+fn write_mouse_encoding<W: Write>(
+    out: &mut W,
+    encoding: FrameMouseEncoding,
+    enabled: bool,
+) -> std::io::Result<()> {
+    let code = match encoding {
+        FrameMouseEncoding::Default => return Ok(()),
+        FrameMouseEncoding::Utf8 => 1005,
+        FrameMouseEncoding::Sgr => 1006,
+    };
+    write!(out, "\x1b[?{}{}", code, if enabled { "h" } else { "l" })
 }
 
 fn render_screen_frame_with_previous<W: Write>(
@@ -222,20 +299,20 @@ mod tests {
     }
 
     #[test]
-    fn prepare_attach_terminal_clears_without_host_alternate_screen() {
+    fn prepare_attach_terminal_enters_host_alternate_screen() {
         let text = std::str::from_utf8(PREPARE_ATTACH).unwrap();
 
-        assert!(!text.contains("\x1b[?1049h"));
+        assert!(text.contains("\x1b[?1049h"));
         assert!(text.contains("\x1b[2J"));
     }
 
     #[test]
-    fn cleanup_attach_terminal_does_not_leave_host_alternate_screen() {
+    fn cleanup_attach_terminal_leaves_host_alternate_screen() {
         let text = std::str::from_utf8(RESTORE_AFTER_ATTACH).unwrap();
 
         assert!(text.contains("\x1b[0m"));
         assert!(text.contains("\x1b[0 q"));
-        assert!(!text.contains("\x1b[?1049l"));
+        assert!(text.contains("\x1b[?1049l"));
     }
 
     #[test]
@@ -348,5 +425,24 @@ mod tests {
 
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("\x1b[2J"));
+    }
+
+    #[test]
+    fn frame_renderer_applies_input_modes() {
+        let mut renderer = FrameRenderer::default();
+        let mut frame = frame_with_rows(&["aa"]);
+        frame.application_cursor = true;
+        frame.bracketed_paste = true;
+        frame.mouse_mode = FrameMouseMode::PressRelease;
+        frame.mouse_encoding = FrameMouseEncoding::Sgr;
+        let mut out = Vec::new();
+
+        renderer.render(&mut out, &frame).unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\x1b[?1h"));
+        assert!(text.contains("\x1b[?2004h"));
+        assert!(text.contains("\x1b[?1000h"));
+        assert!(text.contains("\x1b[?1006h"));
     }
 }

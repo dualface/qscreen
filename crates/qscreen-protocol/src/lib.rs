@@ -7,6 +7,7 @@ pub const MAX_CONTROL_MESSAGE_SIZE: usize = 64 * 1024;
 pub const MAX_PAYLOAD_SIZE: usize = 64 * 1024;
 pub const MAX_WIRE_MESSAGE_SIZE: usize =
     MAX_CONTROL_MESSAGE_SIZE + 4 * MAX_PAYLOAD_SIZE.div_ceil(3);
+pub const MAX_FRAME_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 pub const MIN_TERMINAL_WIDTH: u32 = 1;
 pub const MAX_TERMINAL_WIDTH: u32 = 1000;
@@ -67,6 +68,26 @@ pub const FRAME_FLAG_BLINK: u8 = 0b0010_0000;
 pub const FRAME_FLAG_HIDDEN: u8 = 0b0100_0000;
 pub const FRAME_FLAG_STRIKETHROUGH: u8 = 0b1000_0000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FrameMouseMode {
+    #[default]
+    None,
+    Press,
+    PressRelease,
+    ButtonMotion,
+    AnyMotion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FrameMouseEncoding {
+    #[default]
+    Default,
+    Utf8,
+    Sgr,
+}
+
 /// Structured visible terminal state, copied from psmux's row/run model.
 /// This avoids replaying a vt100 ANSI dump into an xterm host on reattach.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -79,6 +100,14 @@ pub struct ScreenFrame {
     pub alternate_screen: bool,
     #[serde(skip_serializing_if = "is_zero_u8", default)]
     pub cursor_shape: u8,
+    #[serde(skip_serializing_if = "is_false", default)]
+    pub application_cursor: bool,
+    #[serde(skip_serializing_if = "is_false", default)]
+    pub bracketed_paste: bool,
+    #[serde(skip_serializing_if = "is_frame_mouse_mode_none", default)]
+    pub mouse_mode: FrameMouseMode,
+    #[serde(skip_serializing_if = "is_frame_mouse_encoding_default", default)]
+    pub mouse_encoding: FrameMouseEncoding,
     pub rows_v2: Vec<Vec<ScreenRun>>,
 }
 
@@ -198,6 +227,12 @@ fn is_zero_i64(v: &i64) -> bool {
 fn is_attach_mode_frame(v: &AttachMode) -> bool {
     *v == AttachMode::Frame
 }
+fn is_frame_mouse_mode_none(v: &FrameMouseMode) -> bool {
+    *v == FrameMouseMode::None
+}
+fn is_frame_mouse_encoding_default(v: &FrameMouseEncoding) -> bool {
+    *v == FrameMouseEncoding::Default
+}
 
 // ── 编解码 ────────────────────────────────────────────────────────────────
 
@@ -234,6 +269,14 @@ impl Message {
             attach_mode: self.attach_mode,
         };
         let mut bytes = serde_json::to_vec(&wire)?;
+        let limit = if self.frame.is_some() {
+            MAX_FRAME_MESSAGE_SIZE
+        } else {
+            MAX_WIRE_MESSAGE_SIZE
+        };
+        if bytes.len() > limit {
+            anyhow::bail!("message too large: {} > {}", bytes.len(), limit);
+        }
         bytes.push(b'\n');
         Ok(bytes)
     }
@@ -241,10 +284,22 @@ impl Message {
     /// 从 JSON 字符串（含可选尾部空白）解析
     pub fn from_json(s: &str) -> anyhow::Result<Self> {
         let s = s.trim();
-        if !s.contains(r#""frame""#) && s.len() > MAX_WIRE_MESSAGE_SIZE {
-            anyhow::bail!("message too large: {} > {}", s.len(), MAX_WIRE_MESSAGE_SIZE);
+        if s.len() > MAX_FRAME_MESSAGE_SIZE {
+            anyhow::bail!(
+                "message too large: {} > {}",
+                s.len(),
+                MAX_FRAME_MESSAGE_SIZE
+            );
         }
         let wire: WireMessage = serde_json::from_str(s)?;
+        let limit = if wire.frame.is_some() {
+            MAX_FRAME_MESSAGE_SIZE
+        } else {
+            MAX_WIRE_MESSAGE_SIZE
+        };
+        if s.len() > limit {
+            anyhow::bail!("message too large: {} > {}", s.len(), limit);
+        }
         let payload = if wire.payload_b64.is_empty() {
             Vec::new()
         } else {
@@ -561,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_event_does_not_use_payload_limit() {
+    fn frame_event_uses_frame_size_limit() {
         let long_text = "x".repeat(MAX_PAYLOAD_SIZE + 1);
         let frame = ScreenFrame {
             rows: 1,
@@ -589,6 +644,42 @@ mod tests {
             decoded.frame.unwrap().rows_v2[0][0].text.len(),
             long_text.len()
         );
+    }
+
+    #[test]
+    fn frame_event_over_frame_size_limit_is_rejected() {
+        let long_text = "x".repeat(MAX_FRAME_MESSAGE_SIZE + 1);
+        let frame = ScreenFrame {
+            rows: 1,
+            cols: 1,
+            rows_v2: vec![vec![ScreenRun {
+                text: long_text,
+                fg: FrameColor::Default,
+                bg: FrameColor::Default,
+                flags: 0,
+                width: 1,
+            }]],
+            ..Default::default()
+        };
+        let msg = Message {
+            kind: MessageKind::Event,
+            event: Some(EventType::Frame),
+            frame: Some(frame),
+            ..Default::default()
+        };
+
+        assert!(msg.to_json_line().is_err());
+    }
+
+    #[test]
+    fn frame_null_does_not_bypass_wire_size_limit() {
+        let oversized_error = "x".repeat(MAX_WIRE_MESSAGE_SIZE + 1);
+        let json = format!(
+            r#"{{"kind":"response","id":"1","error":"{}","frame":null}}"#,
+            oversized_error
+        );
+
+        assert!(Message::from_json(&json).is_err());
     }
 
     #[test]

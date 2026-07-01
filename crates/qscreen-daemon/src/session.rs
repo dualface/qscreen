@@ -11,7 +11,7 @@ use portable_pty::{ChildKiller, CommandBuilder, MasterPty, NativePtySystem, PtyS
 use qscreen_protocol::{
     AttachMode, FRAME_FLAG_BLINK, FRAME_FLAG_BOLD, FRAME_FLAG_DIM, FRAME_FLAG_HIDDEN,
     FRAME_FLAG_INVERSE, FRAME_FLAG_ITALIC, FRAME_FLAG_STRIKETHROUGH, FRAME_FLAG_UNDERLINE,
-    FrameColor, MAX_PAYLOAD_SIZE, ScreenFrame, ScreenRun,
+    FrameColor, FrameMouseEncoding, FrameMouseMode, MAX_PAYLOAD_SIZE, ScreenFrame, ScreenRun,
 };
 use tokio::sync::{Notify, watch};
 
@@ -407,6 +407,10 @@ impl Session {
         self.resize_pty(width as u16, height as u16)
     }
 
+    pub fn scrollback_snapshot(&self) -> Vec<u8> {
+        self.scrollback.lock().unwrap().snapshot()
+    }
+
     /// Attach 一个客户端：注册事件发送端并返回初始事件（frame 或 scrollback bytes）
     /// 返回 Err 如果 session 已退出
     pub fn attach(
@@ -638,7 +642,29 @@ fn screen_frame_from_parser(parser: &vt100::Parser, cursor_shape: u8) -> ScreenF
         hide_cursor: screen.hide_cursor(),
         alternate_screen: screen.alternate_screen() || last_row_has_content(screen, rows, cols),
         cursor_shape,
+        application_cursor: screen.application_cursor(),
+        bracketed_paste: screen.bracketed_paste(),
+        mouse_mode: frame_mouse_mode(screen.mouse_protocol_mode()),
+        mouse_encoding: frame_mouse_encoding(screen.mouse_protocol_encoding()),
         rows_v2,
+    }
+}
+
+fn frame_mouse_mode(mode: vt100::MouseProtocolMode) -> FrameMouseMode {
+    match mode {
+        vt100::MouseProtocolMode::None => FrameMouseMode::None,
+        vt100::MouseProtocolMode::Press => FrameMouseMode::Press,
+        vt100::MouseProtocolMode::PressRelease => FrameMouseMode::PressRelease,
+        vt100::MouseProtocolMode::ButtonMotion => FrameMouseMode::ButtonMotion,
+        vt100::MouseProtocolMode::AnyMotion => FrameMouseMode::AnyMotion,
+    }
+}
+
+fn frame_mouse_encoding(encoding: vt100::MouseProtocolEncoding) -> FrameMouseEncoding {
+    match encoding {
+        vt100::MouseProtocolEncoding::Default => FrameMouseEncoding::Default,
+        vt100::MouseProtocolEncoding::Utf8 => FrameMouseEncoding::Utf8,
+        vt100::MouseProtocolEncoding::Sgr => FrameMouseEncoding::Sgr,
     }
 }
 
@@ -1309,7 +1335,7 @@ mod tests {
             .append(b"old history\r\n");
         {
             let mut screen = session.screen.lock().unwrap();
-            screen.process(b"\x1b[2J\x1b[Hcurrent");
+            screen.process(b"\x1b[?1h\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[2J\x1b[Hcurrent");
         }
         let queue = SessionEventQueue::new();
 
@@ -1325,6 +1351,10 @@ mod tests {
         assert_eq!((frame.cols, frame.rows), (80, 24));
         assert!(frame_text.contains("current"));
         assert!(!frame_text.contains("old history"));
+        assert!(frame.application_cursor);
+        assert!(frame.bracketed_paste);
+        assert_eq!(frame.mouse_mode, FrameMouseMode::PressRelease);
+        assert_eq!(frame.mouse_encoding, FrameMouseEncoding::Sgr);
 
         session.close();
     }

@@ -9,6 +9,8 @@ use qscreen_protocol::{
     exited_session_error, missing_session_error, validate_attach_size, validate_new_size,
     validate_resize, validate_session_id, validate_session_name,
 };
+#[cfg(unix)]
+use qscreen_shared::daemon_lock_path;
 use qscreen_shared::pipe_name;
 use session::{Session, SessionEvent, SessionEventQueue};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -18,6 +20,7 @@ use tokio::sync::{oneshot, watch};
 
 struct State {
     sessions: Arc<Mutex<HashMap<String, Arc<Session>>>>,
+    exited_sessions: Arc<Mutex<HashMap<String, SessionInfo>>>,
     next_session_id: Mutex<u64>,
     stop_tx: watch::Sender<bool>,
 }
@@ -26,6 +29,7 @@ impl State {
     fn new(stop_tx: watch::Sender<bool>) -> Self {
         State {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            exited_sessions: Arc::new(Mutex::new(HashMap::new())),
             next_session_id: Mutex::new(1),
             stop_tx,
         }
@@ -35,17 +39,28 @@ impl State {
         self.sessions.lock().unwrap().get(session_id).cloned()
     }
 
+    fn get_exited_session(&self, session_id: &str) -> Option<SessionInfo> {
+        self.exited_sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .cloned()
+    }
+
     fn insert_session(&self, session_id: String, session: Arc<Session>) {
+        self.exited_sessions.lock().unwrap().remove(&session_id);
         self.sessions
             .lock()
             .unwrap()
             .insert(session_id.clone(), session.clone());
         let mut exit_rx = session.subscribe_exit();
         let sessions = self.sessions.clone();
+        let exited_sessions = self.exited_sessions.clone();
         tokio::spawn(async move {
             if !*exit_rx.borrow() {
                 let _ = exit_rx.changed().await;
             }
+            let info = session_info(&session);
             let removed = {
                 let mut guard = sessions.lock().unwrap();
                 match guard.get(&session_id) {
@@ -57,6 +72,10 @@ impl State {
             };
             if removed {
                 let name = session.name();
+                exited_sessions
+                    .lock()
+                    .unwrap()
+                    .insert(session_id.clone(), info);
                 tracing::info!(session_id = %session_id, session = %name, "session cleaned up");
             }
         });
@@ -76,6 +95,8 @@ impl State {
     fn list_sessions(&self) -> Vec<SessionInfo> {
         let guard = self.sessions.lock().unwrap();
         let mut infos: Vec<SessionInfo> = guard.values().map(|s| session_info(s)).collect();
+        drop(guard);
+        infos.extend(self.exited_sessions.lock().unwrap().values().cloned());
         infos.sort_by_key(|info| info.session_id.parse::<u64>().unwrap_or(u64::MAX));
         infos
     }
@@ -95,6 +116,12 @@ impl State {
         for s in sessions {
             s.close();
         }
+        self.exited_sessions.lock().unwrap().clear();
+    }
+
+    fn remove_session(&self, session_id: &str) {
+        self.sessions.lock().unwrap().remove(session_id);
+        self.exited_sessions.lock().unwrap().remove(session_id);
     }
 }
 
@@ -167,6 +194,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     #[cfg(unix)]
     {
+        let _lock_guard = DaemonLockGuard::acquire()?;
         let _ = std::fs::remove_file(&pipe);
         let listener = tokio::net::UnixListener::bind(&pipe)
             .with_context(|| format!("bind unix socket {}", pipe))?;
@@ -198,6 +226,46 @@ pub async fn run() -> anyhow::Result<()> {
     state.kill_all();
     tracing::info!("daemon stopped");
     Ok(())
+}
+
+#[cfg(unix)]
+struct DaemonLockGuard {
+    path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl DaemonLockGuard {
+    fn acquire() -> anyhow::Result<Self> {
+        let path = daemon_lock_path();
+        match std::fs::create_dir(&path) {
+            Ok(()) => {
+                let pid_path = path.join("pid");
+                let _ = std::fs::write(&pid_path, std::process::id().to_string());
+                Ok(Self { path })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let socket = pipe_name();
+                let stale = !std::path::Path::new(&socket).exists()
+                    || std::os::unix::net::UnixStream::connect(&socket).is_err();
+                if stale {
+                    let _ = std::fs::remove_dir_all(&path);
+                    std::fs::create_dir(&path)
+                        .with_context(|| format!("create daemon lock {}", path.display()))?;
+                    let _ = std::fs::write(path.join("pid"), std::process::id().to_string());
+                    return Ok(Self { path });
+                }
+                anyhow::bail!("daemon already running")
+            }
+            Err(e) => Err(e).with_context(|| format!("create daemon lock {}", path.display())),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DaemonLockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.path);
+    }
 }
 
 // ── 连接处理 ─────────────────────────────────────────────────────────────────
@@ -323,13 +391,17 @@ async fn dispatch_inner(msg: &Message, state: &State) -> anyhow::Result<Message>
 
         Some(Command::Kill) => {
             validate_session_id(&msg.session_id)?;
-            let sess = state
-                .get_session(&msg.session_id)
-                .ok_or_else(|| anyhow::anyhow!("{}", missing_session_error(&msg.session_id)))?;
-            let session_name = sess.name();
-            sess.close();
-            state.sessions.lock().unwrap().remove(&msg.session_id);
-            tracing::info!(session_id = %msg.session_id, session = %session_name, "session killed");
+            if let Some(sess) = state.get_session(&msg.session_id) {
+                let session_name = sess.name();
+                sess.close();
+                state.remove_session(&msg.session_id);
+                tracing::info!(session_id = %msg.session_id, session = %session_name, "session killed");
+            } else if state.get_exited_session(&msg.session_id).is_some() {
+                state.remove_session(&msg.session_id);
+                tracing::info!(session_id = %msg.session_id, "exited session removed");
+            } else {
+                anyhow::bail!("{}", missing_session_error(&msg.session_id));
+            }
             Ok(Message {
                 kind: MessageKind::Response,
                 session_id: msg.session_id.clone(),
@@ -341,10 +413,18 @@ async fn dispatch_inner(msg: &Message, state: &State) -> anyhow::Result<Message>
         Some(Command::Rename) => {
             validate_session_id(&msg.session_id)?;
             validate_session_name(&msg.name)?;
-            let sess = state
-                .get_session(&msg.session_id)
-                .ok_or_else(|| anyhow::anyhow!("{}", missing_session_error(&msg.session_id)))?;
-            sess.rename(msg.name.clone());
+            if let Some(sess) = state.get_session(&msg.session_id) {
+                sess.rename(msg.name.clone());
+            } else if let Some(mut info) = state.get_exited_session(&msg.session_id) {
+                info.name = msg.name.clone();
+                state
+                    .exited_sessions
+                    .lock()
+                    .unwrap()
+                    .insert(msg.session_id.clone(), info);
+            } else {
+                anyhow::bail!("{}", missing_session_error(&msg.session_id));
+            }
             tracing::info!(session_id = %msg.session_id, session = %msg.name, "session renamed");
             Ok(Message {
                 kind: MessageKind::Response,
@@ -451,10 +531,15 @@ async fn handle_attach<R, W>(
     let sess = match state.get_session(&session_id) {
         Some(s) => s,
         None => {
+            let error = if state.get_exited_session(&session_id).is_some() {
+                exited_session_error(&session_id)
+            } else {
+                missing_session_error(&session_id)
+            };
             let resp = Message {
                 kind: MessageKind::Response,
                 id: attach_id,
-                error: missing_session_error(&session_id),
+                error,
                 ..Default::default()
             };
             let _ = writer
@@ -509,6 +594,26 @@ async fn handle_attach<R, W>(
     {
         sess.disconnect(client_id);
         return;
+    }
+
+    if attach_mode == AttachMode::Frame {
+        let snapshot = sess.scrollback_snapshot();
+        if !snapshot.is_empty() {
+            for replay_msg in event_messages(&session_id, SessionEvent::Output(snapshot)) {
+                let bytes = match replay_msg.to_json_line() {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        tracing::warn!(session_id = %session_id, error = %e, "serialize attach replay event failed");
+                        sess.disconnect(client_id);
+                        return;
+                    }
+                };
+                if writer.lock().await.write_all(&bytes).await.is_err() {
+                    sess.disconnect(client_id);
+                    return;
+                }
+            }
+        }
     }
 
     if let Some(event) = initial_event {
@@ -968,6 +1073,7 @@ mod tests {
     async fn handle_attach_default_first_event_is_frame() {
         let state = test_state();
         let session = insert_session(&state, "1", "work").await;
+        session.scrollback.lock().unwrap().append(b"history\r\n");
 
         let (client, server) = tokio::io::duplex(4096);
         let handle = tokio::spawn(handle_connection(server, state));
@@ -990,6 +1096,10 @@ mod tests {
 
         let response = read_message(&mut reader).await;
         assert!(response.ok);
+        let replay_event = read_message(&mut reader).await;
+        assert_eq!(replay_event.kind, MessageKind::Event);
+        assert_eq!(replay_event.event, Some(EventType::Output));
+        assert_eq!(replay_event.payload, b"history\r\n");
         let first_event = read_message(&mut reader).await;
         assert_eq!(first_event.kind, MessageKind::Event);
         assert_eq!(first_event.event, Some(EventType::Frame));
@@ -1243,7 +1353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exited_sessions_are_removed_from_state() {
+    async fn exited_sessions_are_kept_as_list_tombstones() {
         let state = test_state();
         let session = insert_session(&state, "1", "work").await;
 
@@ -1251,11 +1361,16 @@ mod tests {
 
         for _ in 0..50 {
             if state.get_session("1").is_none() {
+                let infos = state.list_sessions();
+                assert_eq!(infos.len(), 1);
+                assert_eq!(infos[0].session_id, "1");
+                assert!(infos[0].exited);
+                assert!(!infos[0].attached);
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        panic!("expected exited session to be removed");
+        panic!("expected exited session tombstone");
     }
 
     #[tokio::test]

@@ -6,10 +6,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use qscreen_protocol::{
-    Command, EventType, Message, MessageKind, SessionInfo, exited_session_error,
-    validate_session_id, validate_session_name,
+    Command, EventType, FrameMouseEncoding, FrameMouseMode, Message, MessageKind, SessionInfo,
+    exited_session_error, validate_session_id, validate_session_name,
 };
 use qscreen_shared::{daemon_log_path, pipe_name};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -742,28 +744,46 @@ impl Drop for TerminalCleanupGuard {
 
 // ── 键盘事件 → PTY 字节序列 ───────────────────────────────────────────────────
 
-fn key_event_to_bytes(event: crossterm::event::KeyEvent) -> Vec<u8> {
+fn key_event_to_bytes(
+    event: crossterm::event::KeyEvent,
+    input_modes: term::InputModeState,
+) -> Vec<u8> {
     let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
     let alt = event.modifiers.contains(KeyModifiers::ALT);
+    let shift = event.modifiers.contains(KeyModifiers::SHIFT);
+    let modifier = csi_modifier(event.modifiers);
+    let cursor_prefix = if input_modes.application_cursor {
+        b'O'
+    } else {
+        b'['
+    };
 
     match event.code {
         // Backspace → BS (0x08)，Windows Terminal raw mode 发 DEL (0x7f) 会让 PSReadLine 误删整行
         KeyCode::Backspace => vec![0x08],
         KeyCode::Enter => vec![b'\r'],
-        KeyCode::Tab => vec![b'\t'],
+        KeyCode::Tab if shift => b"\x1b[Z".to_vec(),
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
+        KeyCode::Tab => {
+            if modifier > 1 {
+                modified_csi('u', 9, modifier)
+            } else {
+                vec![b'\t']
+            }
+        }
         KeyCode::Esc => vec![0x1b],
+        KeyCode::Delete if modifier > 1 => tilde_key(3, modifier),
         KeyCode::Delete => vec![0x7f],
 
-        KeyCode::Up => vec![0x1b, b'[', b'A'],
-        KeyCode::Down => vec![0x1b, b'[', b'B'],
-        KeyCode::Right => vec![0x1b, b'[', b'C'],
-        KeyCode::Left => vec![0x1b, b'[', b'D'],
-        KeyCode::Home => vec![0x1b, b'[', b'H'],
-        KeyCode::End => vec![0x1b, b'[', b'F'],
-        KeyCode::PageUp => vec![0x1b, b'[', b'5', b'~'],
-        KeyCode::PageDown => vec![0x1b, b'[', b'6', b'~'],
-        KeyCode::Insert => vec![0x1b, b'[', b'2', b'~'],
-
+        KeyCode::Up => cursor_key(cursor_prefix, 'A', modifier),
+        KeyCode::Down => cursor_key(cursor_prefix, 'B', modifier),
+        KeyCode::Right => cursor_key(cursor_prefix, 'C', modifier),
+        KeyCode::Left => cursor_key(cursor_prefix, 'D', modifier),
+        KeyCode::Home => cursor_key(cursor_prefix, 'H', modifier),
+        KeyCode::End => cursor_key(cursor_prefix, 'F', modifier),
+        KeyCode::PageUp => tilde_key(5, modifier),
+        KeyCode::PageDown => tilde_key(6, modifier),
+        KeyCode::Insert => tilde_key(2, modifier),
         KeyCode::F(1) => vec![0x1b, b'O', b'P'],
         KeyCode::F(2) => vec![0x1b, b'O', b'Q'],
         KeyCode::F(3) => vec![0x1b, b'O', b'R'],
@@ -805,6 +825,125 @@ fn key_event_to_bytes(event: crossterm::event::KeyEvent) -> Vec<u8> {
     }
 }
 
+fn csi_modifier(modifiers: KeyModifiers) -> u8 {
+    let mut value = 1;
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        value += 1;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        value += 2;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        value += 4;
+    }
+    value
+}
+
+fn cursor_key(prefix: u8, final_byte: char, modifier: u8) -> Vec<u8> {
+    if modifier > 1 {
+        format!("\x1b[1;{}{}", modifier, final_byte).into_bytes()
+    } else {
+        vec![0x1b, prefix, final_byte as u8]
+    }
+}
+
+fn tilde_key(code: u8, modifier: u8) -> Vec<u8> {
+    if modifier > 1 {
+        format!("\x1b[{};{}~", code, modifier).into_bytes()
+    } else {
+        format!("\x1b[{}~", code).into_bytes()
+    }
+}
+
+fn modified_csi(final_byte: char, code: u8, modifier: u8) -> Vec<u8> {
+    format!("\x1b[{};{}{}", code, modifier, final_byte).into_bytes()
+}
+
+fn mouse_event_to_bytes(event: MouseEvent, input_modes: term::InputModeState) -> Option<Vec<u8>> {
+    if input_modes.mouse_mode == FrameMouseMode::None {
+        return None;
+    }
+
+    let (button_code, final_byte, motion, button_down) = match event.kind {
+        MouseEventKind::Down(button) => (mouse_button_code(button), b'M', false, true),
+        MouseEventKind::Up(_) => (3, b'm', false, false),
+        MouseEventKind::Drag(button) => (mouse_button_code(button) | 32, b'M', true, true),
+        MouseEventKind::Moved => (35, b'M', true, false),
+        MouseEventKind::ScrollUp => (64, b'M', false, true),
+        MouseEventKind::ScrollDown => (65, b'M', false, true),
+        MouseEventKind::ScrollLeft => (66, b'M', false, true),
+        MouseEventKind::ScrollRight => (67, b'M', false, true),
+    };
+
+    if !mouse_mode_reports(input_modes.mouse_mode, button_down, motion) {
+        return None;
+    }
+
+    let mut code = button_code;
+    if event.modifiers.contains(KeyModifiers::SHIFT) {
+        code |= 4;
+    }
+    if event.modifiers.contains(KeyModifiers::ALT) {
+        code |= 8;
+    }
+    if event.modifiers.contains(KeyModifiers::CONTROL) {
+        code |= 16;
+    }
+
+    let x = event.column.saturating_add(1);
+    let y = event.row.saturating_add(1);
+    match input_modes.mouse_encoding {
+        FrameMouseEncoding::Sgr => {
+            Some(format!("\x1b[<{};{};{}{}", code, x, y, final_byte as char).into_bytes())
+        }
+        FrameMouseEncoding::Default => {
+            if x > 223 || y > 223 {
+                return None;
+            }
+            Some(vec![
+                0x1b,
+                b'[',
+                b'M',
+                code.saturating_add(32),
+                (x as u8).saturating_add(32),
+                (y as u8).saturating_add(32),
+            ])
+        }
+        FrameMouseEncoding::Utf8 => {
+            let mut out = vec![0x1b, b'[', b'M'];
+            push_mouse_utf8(&mut out, u16::from(code))?;
+            push_mouse_utf8(&mut out, x)?;
+            push_mouse_utf8(&mut out, y)?;
+            Some(out)
+        }
+    }
+}
+
+fn mouse_button_code(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
+fn push_mouse_utf8(buf: &mut Vec<u8>, value: u16) -> Option<()> {
+    let ch = char::from_u32(u32::from(value) + 32)?;
+    let mut encoded = [0; 4];
+    buf.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
+    Some(())
+}
+
+fn mouse_mode_reports(mode: FrameMouseMode, pressed: bool, motion: bool) -> bool {
+    match mode {
+        FrameMouseMode::None => false,
+        FrameMouseMode::Press => pressed && !motion,
+        FrameMouseMode::PressRelease => !motion,
+        FrameMouseMode::ButtonMotion => !motion || pressed,
+        FrameMouseMode::AnyMotion => true,
+    }
+}
+
 // ── Attach 主循环 ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -841,6 +980,7 @@ impl PrefixState {
         &mut self,
         key_event: crossterm::event::KeyEvent,
         prefix: PrefixKey,
+        input_modes: term::InputModeState,
     ) -> Vec<AttachAction> {
         if is_prefix_key_event(key_event, prefix) {
             if self.pending {
@@ -861,14 +1001,14 @@ impl PrefixState {
             }
 
             let mut actions = vec![AttachAction::Input(vec![prefix.byte])];
-            let bytes = key_event_to_bytes(key_event);
+            let bytes = key_event_to_bytes(key_event, input_modes);
             if !bytes.is_empty() {
                 actions.push(AttachAction::Input(bytes));
             }
             return actions;
         }
 
-        let bytes = key_event_to_bytes(key_event);
+        let bytes = key_event_to_bytes(key_event, input_modes);
         if bytes.is_empty() {
             Vec::new()
         } else {
@@ -914,7 +1054,13 @@ async fn run_attach_loop(
 
     let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel::<AttachAction>();
     let stop_input = Arc::new(AtomicBool::new(false));
-    let mut input_handle = spawn_attach_input_reader(action_tx.clone(), stop_input.clone(), prefix);
+    let input_modes = Arc::new(std::sync::Mutex::new(frame_renderer.input_modes()));
+    let mut input_handle = spawn_attach_input_reader(
+        action_tx.clone(),
+        stop_input.clone(),
+        prefix,
+        input_modes.clone(),
+    );
 
     let mut stdout = std::io::stdout();
     let mut pending_messages: VecDeque<Message> = VecDeque::new();
@@ -928,6 +1074,7 @@ async fn run_attach_loop(
                 match msg.kind {
                     MessageKind::Event => match msg.event {
                         Some(EventType::Output) => {
+                            frame_renderer.reset();
                             let _ = stdout.write_all(&msg.payload);
                             let _ = stdout.flush();
                         }
@@ -950,6 +1097,7 @@ async fn run_attach_loop(
                             }
                             if let Some(frame) = latest_frame.as_ref() {
                                 let _ = frame_renderer.render(&mut stdout, frame);
+                                *input_modes.lock().unwrap() = frame_renderer.input_modes();
                             }
                         }
                         Some(EventType::Exit) => break AttachOutcome::Ended,
@@ -1054,6 +1202,7 @@ async fn run_attach_loop(
                                     action_tx.clone(),
                                     stop_input.clone(),
                                     prefix,
+                                    input_modes.clone(),
                                 );
                             }
                         }
@@ -1081,6 +1230,7 @@ fn spawn_attach_input_reader(
     action_tx: tokio::sync::mpsc::UnboundedSender<AttachAction>,
     stop_input: Arc<AtomicBool>,
     prefix: PrefixKey,
+    input_modes: Arc<std::sync::Mutex<term::InputModeState>>,
 ) -> tokio::task::JoinHandle<()> {
     // Keyboard/resize reading uses a bounded poll so attach cleanup can finish without process exit.
     tokio::task::spawn_blocking(move || {
@@ -1099,7 +1249,8 @@ fn spawn_attach_input_reader(
                 Event::Key(key_event)
                     if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
-                    for action in prefix_state.handle_key(key_event, prefix) {
+                    let modes = *input_modes.lock().unwrap();
+                    for action in prefix_state.handle_key(key_event, prefix, modes) {
                         let should_stop =
                             matches!(action, AttachAction::Detach | AttachAction::OpenSessionList);
                         let _ = action_tx.send(action);
@@ -1114,6 +1265,12 @@ fn spawn_attach_input_reader(
                 }
                 Event::FocusGained => {
                     let _ = action_tx.send(AttachAction::Focus);
+                }
+                Event::Mouse(mouse_event) => {
+                    let modes = *input_modes.lock().unwrap();
+                    if let Some(bytes) = mouse_event_to_bytes(mouse_event, modes) {
+                        let _ = action_tx.send(AttachAction::Input(bytes));
+                    }
                 }
 
                 _ => {}
@@ -1293,7 +1450,7 @@ fn is_prefix_key_event(event: crossterm::event::KeyEvent, prefix: PrefixKey) -> 
         return true;
     }
 
-    key_event_to_bytes(event) == [prefix.byte]
+    key_event_to_bytes(event, term::InputModeState::default()) == [prefix.byte]
 }
 
 fn key_char_eq_ignore_ascii_case(code: KeyCode, expected: char) -> bool {
@@ -1647,12 +1804,108 @@ mod tests {
     }
 
     #[test]
+    fn key_mapping_uses_application_cursor_and_modifiers() {
+        assert_eq!(
+            key_event_to_bytes(
+                crossterm::event::KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+                term::InputModeState::default()
+            ),
+            b"\x1b[A".to_vec()
+        );
+        assert_eq!(
+            key_event_to_bytes(
+                crossterm::event::KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+                term::InputModeState {
+                    application_cursor: true,
+                    ..Default::default()
+                }
+            ),
+            b"\x1bOA".to_vec()
+        );
+        assert_eq!(
+            key_event_to_bytes(
+                crossterm::event::KeyEvent::new(
+                    KeyCode::Right,
+                    KeyModifiers::SHIFT | KeyModifiers::CONTROL
+                ),
+                term::InputModeState::default()
+            ),
+            b"\x1b[1;6C".to_vec()
+        );
+        assert_eq!(
+            key_event_to_bytes(
+                crossterm::event::KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+                term::InputModeState::default()
+            ),
+            b"\x1b[Z".to_vec()
+        );
+    }
+
+    #[test]
+    fn mouse_mapping_uses_sgr_mode() {
+        let modes = term::InputModeState {
+            mouse_mode: FrameMouseMode::PressRelease,
+            mouse_encoding: FrameMouseEncoding::Sgr,
+            ..Default::default()
+        };
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 9,
+            modifiers: KeyModifiers::CONTROL,
+        };
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 4,
+            row: 9,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(
+            mouse_event_to_bytes(down, modes).unwrap(),
+            b"\x1b[<16;5;10M".to_vec()
+        );
+        assert_eq!(
+            mouse_event_to_bytes(up, modes).unwrap(),
+            b"\x1b[<3;5;10m".to_vec()
+        );
+        assert!(mouse_event_to_bytes(down, term::InputModeState::default()).is_none());
+    }
+
+    #[test]
+    fn mouse_mapping_uses_utf8_mode_for_large_coordinates() {
+        let modes = term::InputModeState {
+            mouse_mode: FrameMouseMode::PressRelease,
+            mouse_encoding: FrameMouseEncoding::Utf8,
+            ..Default::default()
+        };
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 300,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let mut expected = b"\x1b[M ".to_vec();
+        expected.extend_from_slice("ō".as_bytes());
+        expected.push(b'"');
+        assert_eq!(mouse_event_to_bytes(event, modes).unwrap(), expected);
+    }
+
+    #[test]
     fn prefix_state_detaches_for_default_and_custom_prefixes() {
         for prefix in [DEFAULT_PREFIX, PrefixKey::parse("C-b").unwrap()] {
             let mut state = PrefixState::default();
-            assert_eq!(state.handle_key(ctrl_key(prefix.ctrl_char), prefix), vec![]);
             assert_eq!(
-                state.handle_key(char_key('d'), prefix),
+                state.handle_key(
+                    ctrl_key(prefix.ctrl_char),
+                    prefix,
+                    term::InputModeState::default()
+                ),
+                vec![]
+            );
+            assert_eq!(
+                state.handle_key(char_key('d'), prefix, term::InputModeState::default()),
                 vec![AttachAction::Detach]
             );
         }
@@ -1661,16 +1914,38 @@ mod tests {
     #[test]
     fn prefix_state_accepts_uppercase_actions() {
         let mut state = PrefixState::default();
-        assert_eq!(state.handle_key(ctrl_key('a'), DEFAULT_PREFIX), vec![]);
         assert_eq!(
-            state.handle_key(char_key('D'), DEFAULT_PREFIX),
+            state.handle_key(
+                ctrl_key('a'),
+                DEFAULT_PREFIX,
+                term::InputModeState::default()
+            ),
+            vec![]
+        );
+        assert_eq!(
+            state.handle_key(
+                char_key('D'),
+                DEFAULT_PREFIX,
+                term::InputModeState::default()
+            ),
             vec![AttachAction::Detach]
         );
 
         let mut state = PrefixState::default();
-        assert_eq!(state.handle_key(ctrl_key('a'), DEFAULT_PREFIX), vec![]);
         assert_eq!(
-            state.handle_key(char_key('S'), DEFAULT_PREFIX),
+            state.handle_key(
+                ctrl_key('a'),
+                DEFAULT_PREFIX,
+                term::InputModeState::default()
+            ),
+            vec![]
+        );
+        assert_eq!(
+            state.handle_key(
+                char_key('S'),
+                DEFAULT_PREFIX,
+                term::InputModeState::default()
+            ),
             vec![AttachAction::OpenSessionList]
         );
     }
@@ -1679,9 +1954,20 @@ mod tests {
     fn prefix_state_sends_literal_prefix_for_double_prefix() {
         for prefix in [DEFAULT_PREFIX, PrefixKey::parse("C-b").unwrap()] {
             let mut state = PrefixState::default();
-            assert_eq!(state.handle_key(ctrl_key(prefix.ctrl_char), prefix), vec![]);
             assert_eq!(
-                state.handle_key(ctrl_key(prefix.ctrl_char), prefix),
+                state.handle_key(
+                    ctrl_key(prefix.ctrl_char),
+                    prefix,
+                    term::InputModeState::default()
+                ),
+                vec![]
+            );
+            assert_eq!(
+                state.handle_key(
+                    ctrl_key(prefix.ctrl_char),
+                    prefix,
+                    term::InputModeState::default()
+                ),
                 vec![AttachAction::Input(vec![prefix.byte])]
             );
         }
@@ -1691,9 +1977,16 @@ mod tests {
     fn prefix_state_falls_back_to_literal_prefix_then_normal_byte() {
         for prefix in [DEFAULT_PREFIX, PrefixKey::parse("C-b").unwrap()] {
             let mut state = PrefixState::default();
-            assert_eq!(state.handle_key(ctrl_key(prefix.ctrl_char), prefix), vec![]);
             assert_eq!(
-                state.handle_key(char_key('x'), prefix),
+                state.handle_key(
+                    ctrl_key(prefix.ctrl_char),
+                    prefix,
+                    term::InputModeState::default()
+                ),
+                vec![]
+            );
+            assert_eq!(
+                state.handle_key(char_key('x'), prefix, term::InputModeState::default()),
                 vec![
                     AttachAction::Input(vec![prefix.byte]),
                     AttachAction::Input(vec![b'x'])
@@ -1706,7 +1999,11 @@ mod tests {
     fn prefix_state_treats_detach_key_as_normal_without_pending_prefix() {
         let mut state = PrefixState::default();
         assert_eq!(
-            state.handle_key(char_key('d'), DEFAULT_PREFIX),
+            state.handle_key(
+                char_key('d'),
+                DEFAULT_PREFIX,
+                term::InputModeState::default()
+            ),
             vec![AttachAction::Input(vec![b'd'])]
         );
     }
@@ -1715,9 +2012,16 @@ mod tests {
     fn prefix_state_opens_session_list_for_default_and_custom_prefixes() {
         for prefix in [DEFAULT_PREFIX, PrefixKey::parse("C-b").unwrap()] {
             let mut state = PrefixState::default();
-            assert_eq!(state.handle_key(ctrl_key(prefix.ctrl_char), prefix), vec![]);
             assert_eq!(
-                state.handle_key(char_key('s'), prefix),
+                state.handle_key(
+                    ctrl_key(prefix.ctrl_char),
+                    prefix,
+                    term::InputModeState::default()
+                ),
+                vec![]
+            );
+            assert_eq!(
+                state.handle_key(char_key('s'), prefix, term::InputModeState::default()),
                 vec![AttachAction::OpenSessionList]
             );
         }
@@ -1728,16 +2032,22 @@ mod tests {
         let prefix = PrefixKey::parse("C-b").unwrap();
 
         let mut state = PrefixState::default();
-        assert_eq!(state.handle_key(raw_char_key(0x02), prefix), vec![]);
         assert_eq!(
-            state.handle_key(char_key('d'), prefix),
+            state.handle_key(raw_char_key(0x02), prefix, term::InputModeState::default()),
+            vec![]
+        );
+        assert_eq!(
+            state.handle_key(char_key('d'), prefix, term::InputModeState::default()),
             vec![AttachAction::Detach]
         );
 
         let mut state = PrefixState::default();
-        assert_eq!(state.handle_key(raw_char_key(0x02), prefix), vec![]);
         assert_eq!(
-            state.handle_key(char_key('s'), prefix),
+            state.handle_key(raw_char_key(0x02), prefix, term::InputModeState::default()),
+            vec![]
+        );
+        assert_eq!(
+            state.handle_key(char_key('s'), prefix, term::InputModeState::default()),
             vec![AttachAction::OpenSessionList]
         );
     }

@@ -34,6 +34,15 @@ pub fn daemon_log_path() -> PathBuf {
     }
 }
 
+/// Daemon single-instance lock path.
+#[cfg(unix)]
+pub fn daemon_lock_path() -> PathBuf {
+    unix_runtime_dir().join(format!(
+        "qscreen-{}.lock",
+        sanitize_pipe_user(&current_user())
+    ))
+}
+
 pub fn current_user() -> String {
     std::env::var("USERNAME")
         .or_else(|_| std::env::var("USER"))
