@@ -52,14 +52,21 @@ Package each archive with a single executable at the archive root: `qscn` for Un
 - `qscreen-<tag>-windows-arm64.zip`
 - `SHA256SUMS`
 
+Additionally run `scripts/package-windows-gz.sh <tag>` to produce the per-asset Windows gz artifacts consumed by quicktui-installer's automatic qscn install:
+
+- `qscn-windows-amd64.exe.gz` + `qscn-windows-amd64.exe.gz.sha256` + `qscn-windows-amd64.exe.sha256`
+- `qscn-windows-arm64.exe.gz` + `qscn-windows-arm64.exe.gz.sha256` + `qscn-windows-arm64.exe.sha256`
+
+These names carry no tag (release download URLs are tag-scoped) and use amd64/arm64 to match QuickTUI asset naming. Include them in `SHA256SUMS` as well.
+
 Create the GitHub Release as a formal latest release, not a draft or prerelease:
 
 - `git tag -a <tag> -m "Release <tag>"`
 - `git push origin <tag>`
 - `gh release create <tag> --title "<tag>" --generate-notes --latest`
-- `gh release upload <tag> dist/<tag>/qscreen-<tag>-* dist/<tag>/SHA256SUMS`
+- `gh release upload <tag> dist/<tag>/qscreen-<tag>-* dist/<tag>/qscn-windows-* dist/<tag>/SHA256SUMS`
 
-Verify the release before handing off: `shasum -a 256 -c SHA256SUMS` must pass locally, `gh release view <tag> --json assets,isDraft,isPrerelease,tagName,url` must show all six assets uploaded, and the latest release should point at the new tag.
+Verify the release before handing off: `shasum -a 256 -c SHA256SUMS` must pass locally, `gh release view <tag> --json assets,isDraft,isPrerelease,tagName,url` must show all twelve assets uploaded (five archives, six `qscn-windows-*` files, `SHA256SUMS`), and the latest release should point at the new tag.
 
 ## Coding Style & Naming Conventions
 
