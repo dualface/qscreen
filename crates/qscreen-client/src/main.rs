@@ -486,6 +486,7 @@ async fn cmd_new_and_attach(
     if !name.is_empty() {
         validate_session_name(name)?;
     }
+    let cwd = cwd_for_request(cwd)?;
     let mut conn = ensure_and_connect().await?;
     let resp = send_recv_ok(
         &mut conn,
@@ -495,7 +496,7 @@ async fn cmd_new_and_attach(
             command: Some(Command::New),
             name: name.to_string(),
             shell: shell.unwrap_or_default().to_string(),
-            cwd: cwd.unwrap_or_default().to_string(),
+            cwd,
             ..Default::default()
         },
     )
@@ -503,6 +504,21 @@ async fn cmd_new_and_attach(
     validate_session_id(&resp.session_id)?;
     drop(conn);
     attach_session_loop(&resp.session_id, config).await
+}
+
+fn cwd_for_request(cwd: Option<&str>) -> anyhow::Result<String> {
+    let Some(cwd) = cwd.filter(|value| !value.is_empty()) else {
+        return Ok(String::new());
+    };
+    let path = std::path::Path::new(cwd);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolve current directory for --cwd")?
+            .join(path)
+    };
+    Ok(path.to_string_lossy().into_owned())
 }
 
 async fn cmd_attach(session_id: &str, config: ClientConfig) -> anyhow::Result<()> {
@@ -1784,6 +1800,26 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Use --name <name>"), "{err}");
+    }
+
+    #[test]
+    fn cwd_for_request_resolves_relative_path_from_client_directory() {
+        let expected = std::env::current_dir().unwrap().join("project");
+
+        assert_eq!(
+            cwd_for_request(Some("project")).unwrap(),
+            expected.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn cwd_for_request_preserves_absolute_path() {
+        let path = std::env::current_dir().unwrap().join("project");
+
+        assert_eq!(
+            cwd_for_request(path.to_str()).unwrap(),
+            path.to_string_lossy()
+        );
     }
 
     #[test]
