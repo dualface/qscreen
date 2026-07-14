@@ -252,7 +252,7 @@ impl Session {
         let pty_writer = pair.master.take_writer().context("take_writer")?;
 
         let mut cmd = default_shell_command(shell).context("resolve shell command")?;
-        apply_working_directory(&mut cmd, cwd);
+        apply_working_directory(&mut cmd, cwd)?;
         let child = pair.slave.spawn_command(cmd).context("spawn shell")?;
         let child_killer = Arc::new(Mutex::new(Some(child.clone_killer())));
         drop(pair.slave);
@@ -1009,10 +1009,17 @@ fn default_shell_command(shell: Option<&str>) -> anyhow::Result<CommandBuilder> 
     }
 }
 
-fn apply_working_directory(cmd: &mut CommandBuilder, cwd: Option<&str>) {
-    if let Some(cwd) = cwd.map(str::trim).filter(|value| !value.is_empty()) {
-        cmd.cwd(cwd);
+fn apply_working_directory(cmd: &mut CommandBuilder, cwd: Option<&str>) -> anyhow::Result<()> {
+    let Some(cwd) = cwd.filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let metadata = std::fs::metadata(cwd)
+        .with_context(|| format!("working directory does not exist: {cwd}"))?;
+    if !metadata.is_dir() {
+        anyhow::bail!("working directory is not a directory: {cwd}");
     }
+    cmd.cwd(cwd);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1023,20 +1030,44 @@ mod tests {
     #[test]
     fn working_directory_uses_non_empty_request_value() {
         let mut cmd = default_shell_command(None).unwrap();
-        apply_working_directory(&mut cmd, Some("  /tmp/project  "));
+        let cwd = std::env::current_dir().unwrap();
+        apply_working_directory(&mut cmd, cwd.to_str()).unwrap();
 
         assert_eq!(
             cmd.get_cwd().map(|value| value.as_os_str()),
-            Some(OsStr::new("/tmp/project"))
+            Some(cwd.as_os_str())
         );
     }
 
     #[test]
     fn working_directory_ignores_empty_request_value() {
         let mut cmd = default_shell_command(None).unwrap();
-        apply_working_directory(&mut cmd, Some("  "));
+        apply_working_directory(&mut cmd, Some("")).unwrap();
 
         assert_eq!(cmd.get_cwd(), None);
+    }
+
+    #[test]
+    fn working_directory_rejects_missing_path() {
+        let mut cmd = default_shell_command(None).unwrap();
+        let missing =
+            std::env::temp_dir().join(format!("qscreen-missing-cwd-{}", std::process::id()));
+
+        let err = apply_working_directory(&mut cmd, missing.to_str()).unwrap_err();
+
+        assert!(err.to_string().contains("does not exist"), "{err:#}");
+    }
+
+    #[test]
+    fn working_directory_rejects_file() {
+        let mut cmd = default_shell_command(None).unwrap();
+        let file = std::env::temp_dir().join(format!("qscreen-file-cwd-{}", std::process::id()));
+        std::fs::write(&file, b"not a directory").unwrap();
+
+        let err = apply_working_directory(&mut cmd, file.to_str()).unwrap_err();
+        let _ = std::fs::remove_file(file);
+
+        assert!(err.to_string().contains("not a directory"), "{err:#}");
     }
 
     #[test]
