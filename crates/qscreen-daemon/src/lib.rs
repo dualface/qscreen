@@ -378,6 +378,7 @@ async fn dispatch_inner(msg: &Message, state: &State) -> anyhow::Result<Message>
                 kind: MessageKind::Response,
                 session_id,
                 name: session_name,
+                cwd: msg.cwd.clone(),
                 ok: true,
                 ..Default::default()
             })
@@ -1001,6 +1002,30 @@ mod tests {
             vec![("1", "1"), ("2", "work"), ("3", "work")]
         );
 
+        state.kill_all();
+    }
+
+    #[tokio::test]
+    async fn dispatch_new_acknowledges_working_directory() {
+        let state = test_state();
+        let cwd = std::env::current_dir().unwrap();
+
+        let response = dispatch_command(
+            &Message {
+                kind: MessageKind::Request,
+                id: "new-cwd".to_string(),
+                command: Some(Command::New),
+                cwd: cwd.to_string_lossy().into_owned(),
+                width: 80,
+                height: 24,
+                ..Default::default()
+            },
+            &state,
+        )
+        .await;
+
+        assert!(response.ok);
+        assert_eq!(response.cwd, cwd.to_string_lossy());
         state.kill_all();
     }
 

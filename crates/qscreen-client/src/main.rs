@@ -487,6 +487,7 @@ async fn cmd_new_and_attach(
         validate_session_name(name)?;
     }
     let cwd = cwd_for_request(cwd)?;
+    let requested_cwd = cwd.clone();
     let mut conn = ensure_and_connect().await?;
     let resp = send_recv_ok(
         &mut conn,
@@ -502,8 +503,26 @@ async fn cmd_new_and_attach(
     )
     .await?;
     validate_session_id(&resp.session_id)?;
+    if !cwd_acknowledged(&requested_cwd, &resp.cwd) {
+        let _ = send_recv_ok(
+            &mut conn,
+            Message {
+                kind: MessageKind::Request,
+                id: "2".to_string(),
+                command: Some(Command::Kill),
+                session_id: resp.session_id,
+                ..Default::default()
+            },
+        )
+        .await;
+        anyhow::bail!("daemon does not support --cwd; restart qscn daemon and retry");
+    }
     drop(conn);
     attach_session_loop(&resp.session_id, config).await
+}
+
+fn cwd_acknowledged(requested: &str, acknowledged: &str) -> bool {
+    requested.is_empty() || requested == acknowledged
 }
 
 fn cwd_for_request(cwd: Option<&str>) -> anyhow::Result<String> {
@@ -1820,6 +1839,14 @@ mod tests {
             cwd_for_request(path.to_str()).unwrap(),
             path.to_string_lossy()
         );
+    }
+
+    #[test]
+    fn cwd_ack_requires_matching_non_empty_response() {
+        assert!(cwd_acknowledged("", ""));
+        assert!(cwd_acknowledged("/work", "/work"));
+        assert!(!cwd_acknowledged("/work", ""));
+        assert!(!cwd_acknowledged("/work", "/other"));
     }
 
     #[test]
