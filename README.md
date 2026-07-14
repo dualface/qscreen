@@ -16,6 +16,7 @@
 
 - Windows uses named pipes and starts `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe` by default. Use `qscn new --shell cmd --name work` to start `C:\Windows\System32\cmd.exe` for a single session, or set the daemon environment variable `QSCREEN_WINDOWS_SHELL=cmd` or `QSCREEN_WINDOWS_SHELL=cmd.exe` to make cmd the daemon default. Explicit `powershell` and `powershell.exe` values keep the default PowerShell behavior. Unsupported values return an error and prevent session creation.
 - Linux/macOS use Unix domain sockets and start `$SHELL -l`, falling back to `/bin/sh -l`. `qscn new --shell <path>` overrides the shell path for one session.
+- `qscn new --cwd <path>` starts the session shell in the requested working directory.
 - Sessions are addressed by daemon-assigned numeric `session_id` values. The
   session name is only a display name, and custom names must match
   `[A-Za-z0-9._-]` and be at most 64 characters.
@@ -48,6 +49,7 @@ qscn new --name work         # create and attach with display name work
 qscn new --shell cmd         # create an auto-named cmd session on Windows
 qscn new --shell /bin/zsh     # create an auto-named zsh session on Unix
 qscn new --shell cmd --name work
+qscn new --cwd C:\work --name work
 qscn attach 1                # reattach to session_id 1
 qscn -r 1                    # alias for attach
 qscn ls                      # list sessions

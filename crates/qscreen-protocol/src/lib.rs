@@ -160,6 +160,7 @@ pub struct Message {
     pub session_id: String,
     pub name: String,
     pub shell: String,
+    pub cwd: String,
     pub width: u32,
     pub height: u32,
     pub ok: bool,
@@ -188,6 +189,8 @@ struct WireMessage {
     name: String,
     #[serde(skip_serializing_if = "String::is_empty", default)]
     shell: String,
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    cwd: String,
     #[serde(skip_serializing_if = "is_zero_u32", default)]
     width: u32,
     #[serde(skip_serializing_if = "is_zero_u32", default)]
@@ -254,6 +257,7 @@ impl Message {
             session_id: self.session_id.clone(),
             name: self.name.clone(),
             shell: self.shell.clone(),
+            cwd: self.cwd.clone(),
             width: self.width,
             height: self.height,
             ok: self.ok,
@@ -321,6 +325,7 @@ impl Message {
             session_id: wire.session_id,
             name: wire.name,
             shell: wire.shell,
+            cwd: wire.cwd,
             width: wire.width,
             height: wire.height,
             ok: wire.ok,
@@ -429,6 +434,7 @@ mod tests {
             session_id: "42".to_string(),
             name: "test".to_string(),
             shell: "cmd".to_string(),
+            cwd: r"C:\work".to_string(),
             width: 80,
             height: 24,
             ..Default::default()
@@ -441,6 +447,7 @@ mod tests {
         assert_eq!(decoded.session_id, "42");
         assert_eq!(decoded.name, "test");
         assert_eq!(decoded.shell, "cmd");
+        assert_eq!(decoded.cwd, r"C:\work");
         assert_eq!(decoded.width, 80);
         assert_eq!(decoded.height, 24);
     }
@@ -457,6 +464,7 @@ mod tests {
         let json_str = std::str::from_utf8(&line).unwrap();
 
         assert!(!json_str.contains("\"shell\""));
+        assert!(!json_str.contains("\"cwd\""));
     }
 
     #[test]

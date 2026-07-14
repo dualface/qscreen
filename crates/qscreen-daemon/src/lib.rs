@@ -364,12 +364,13 @@ async fn dispatch_inner(msg: &Message, state: &State) -> anyhow::Result<Message>
             } else {
                 msg.name.clone()
             };
-            let sess = Session::new(
+            let sess = Session::new_with_cwd(
                 session_id.clone(),
                 session_name.clone(),
                 msg.width,
                 msg.height,
                 Some(msg.shell.as_str()),
+                Some(msg.cwd.as_str()),
             )?;
             tracing::info!(session_id = %session_id, session = %session_name, "session created");
             state.insert_session(session_id.clone(), sess);

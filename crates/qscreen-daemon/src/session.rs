@@ -215,6 +215,17 @@ impl Session {
         height: u32,
         shell: Option<&str>,
     ) -> anyhow::Result<Arc<Self>> {
+        Self::new_with_cwd(session_id, name, width, height, shell, None)
+    }
+
+    pub fn new_with_cwd(
+        session_id: String,
+        name: String,
+        width: u32,
+        height: u32,
+        shell: Option<&str>,
+        cwd: Option<&str>,
+    ) -> anyhow::Result<Arc<Self>> {
         let w = if width > 0 {
             width as u16
         } else {
@@ -240,7 +251,8 @@ impl Session {
         let pty_reader = pair.master.try_clone_reader().context("try_clone_reader")?;
         let pty_writer = pair.master.take_writer().context("take_writer")?;
 
-        let cmd = default_shell_command(shell).context("resolve shell command")?;
+        let mut cmd = default_shell_command(shell).context("resolve shell command")?;
+        apply_working_directory(&mut cmd, cwd);
         let child = pair.slave.spawn_command(cmd).context("spawn shell")?;
         let child_killer = Arc::new(Mutex::new(Some(child.clone_killer())));
         drop(pair.slave);
@@ -997,10 +1009,35 @@ fn default_shell_command(shell: Option<&str>) -> anyhow::Result<CommandBuilder> 
     }
 }
 
+fn apply_working_directory(cmd: &mut CommandBuilder, cwd: Option<&str>) {
+    if let Some(cwd) = cwd.map(str::trim).filter(|value| !value.is_empty()) {
+        cmd.cwd(cwd);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[test]
+    fn working_directory_uses_non_empty_request_value() {
+        let mut cmd = default_shell_command(None).unwrap();
+        apply_working_directory(&mut cmd, Some("  /tmp/project  "));
+
+        assert_eq!(
+            cmd.get_cwd().map(|value| value.as_os_str()),
+            Some(OsStr::new("/tmp/project"))
+        );
+    }
+
+    #[test]
+    fn working_directory_ignores_empty_request_value() {
+        let mut cmd = default_shell_command(None).unwrap();
+        apply_working_directory(&mut cmd, Some("  "));
+
+        assert_eq!(cmd.get_cwd(), None);
+    }
 
     #[test]
     fn windows_shell_preference_defaults_to_powershell_for_unset_or_empty() {

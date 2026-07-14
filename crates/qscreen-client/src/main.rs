@@ -192,7 +192,13 @@ fn run_client(args: Vec<String>) -> anyhow::Result<()> {
             [cmd] if cmd == "shutdown" => cmd_shutdown().await,
             [cmd, rest @ ..] if cmd == "new" => {
                 let opts = parse_new_options(rest)?;
-                cmd_new(opts.name.as_deref(), opts.shell.as_deref(), config).await
+                cmd_new(
+                    opts.name.as_deref(),
+                    opts.shell.as_deref(),
+                    opts.cwd.as_deref(),
+                    config,
+                )
+                .await
             }
             [cmd, session_id] if cmd == "attach" || cmd == "-r" => {
                 cmd_attach(session_id, config).await
@@ -214,11 +220,13 @@ fn run_client(args: Vec<String>) -> anyhow::Result<()> {
 struct NewOptions {
     name: Option<String>,
     shell: Option<String>,
+    cwd: Option<String>,
 }
 
 fn parse_new_options(args: &[String]) -> anyhow::Result<NewOptions> {
     let mut name = None;
     let mut shell = None;
+    let mut cwd = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -237,6 +245,11 @@ fn parse_new_options(args: &[String]) -> anyhow::Result<NewOptions> {
                     .with_context(|| missing_option_value("--shell"))?;
                 set_once(&mut shell, value.clone(), "--shell")?;
             }
+            "--cwd" => {
+                i += 1;
+                let value = args.get(i).with_context(|| missing_option_value("--cwd"))?;
+                set_once(&mut cwd, value.clone(), "--cwd")?;
+            }
             value if value.starts_with("--name=") => {
                 let value = value.trim_start_matches("--name=");
                 if value.is_empty() {
@@ -251,6 +264,13 @@ fn parse_new_options(args: &[String]) -> anyhow::Result<NewOptions> {
                 }
                 set_once(&mut shell, value.to_string(), "--shell")?;
             }
+            value if value.starts_with("--cwd=") => {
+                let value = value.trim_start_matches("--cwd=");
+                if value.is_empty() {
+                    anyhow::bail!("{}", missing_option_value("--cwd"));
+                }
+                set_once(&mut cwd, value.to_string(), "--cwd")?;
+            }
             value if value.starts_with('-') => {
                 anyhow::bail!("unknown new option: {value}");
             }
@@ -261,7 +281,7 @@ fn parse_new_options(args: &[String]) -> anyhow::Result<NewOptions> {
         i += 1;
     }
 
-    Ok(NewOptions { name, shell })
+    Ok(NewOptions { name, shell, cwd })
 }
 
 fn set_once(slot: &mut Option<String>, value: String, label: &str) -> anyhow::Result<()> {
@@ -330,6 +350,8 @@ fn print_help() {
                                用参数指定显示名
   qscn [--prefix C-a] new --shell <shell>
                                指定启动 shell（Windows: cmd 或 powershell；Unix: shell 路径）
+  qscn [--prefix C-a] new --cwd <path>
+                               指定会话启动工作目录
   qscn [--prefix C-a] attach <session_id>
                                进入已有会话
   qscn [--prefix C-a] -r <session_id>
@@ -361,6 +383,7 @@ ls 输出格式:
   qscn new                     # 新建自动分配 session_id 的会话
   qscn new --name work         # 新建显示名为 work 的会话
   qscn new --shell cmd --name work
+  qscn new --cwd C:\work --name work
   qscn --prefix C-b attach 1   # 使用 Ctrl+B 作为前缀进入 session_id=1
   qscn attach 1                # 重新进入 session_id=1
   qscn rename 1 work           # 修改 session_id=1 的显示名
@@ -381,6 +404,8 @@ Usage:
                                specify the display name as an option
   qscn [--prefix C-a] new --shell <shell>
                                specify the startup shell (Windows: cmd or powershell; Unix: shell path)
+  qscn [--prefix C-a] new --cwd <path>
+                               specify the session working directory
   qscn [--prefix C-a] attach <session_id>
                                attach to an existing session
   qscn [--prefix C-a] -r <session_id>
@@ -412,6 +437,7 @@ Examples:
   qscn new                     # create a session with an auto-assigned session_id
   qscn new --name work         # create a session with display name 'work'
   qscn new --shell cmd --name work
+  qscn new --cwd C:\work --name work
   qscn --prefix C-b attach 1   # attach to session_id=1 using Ctrl+B as the prefix
   qscn attach 1                # reattach to session_id=1
   qscn rename 1 work           # change the display name for session_id=1
@@ -427,7 +453,7 @@ Examples:
 async fn cmd_default(config: ClientConfig) -> anyhow::Result<()> {
     let sessions = list_sessions().await?;
     match sessions.len() {
-        0 => cmd_new_and_attach("", None, config).await,
+        0 => cmd_new_and_attach("", None, None, config).await,
         1 => cmd_attach(&sessions[0].session_id.clone(), config).await,
         _ => {
             print_sessions(&sessions);
@@ -445,14 +471,16 @@ async fn cmd_list() -> anyhow::Result<()> {
 async fn cmd_new(
     name: Option<&str>,
     shell: Option<&str>,
+    cwd: Option<&str>,
     config: ClientConfig,
 ) -> anyhow::Result<()> {
-    cmd_new_and_attach(name.unwrap_or_default(), shell, config).await
+    cmd_new_and_attach(name.unwrap_or_default(), shell, cwd, config).await
 }
 
 async fn cmd_new_and_attach(
     name: &str,
     shell: Option<&str>,
+    cwd: Option<&str>,
     config: ClientConfig,
 ) -> anyhow::Result<()> {
     if !name.is_empty() {
@@ -467,6 +495,7 @@ async fn cmd_new_and_attach(
             command: Some(Command::New),
             name: name.to_string(),
             shell: shell.unwrap_or_default().to_string(),
+            cwd: cwd.unwrap_or_default().to_string(),
             ..Default::default()
         },
     )
@@ -1740,10 +1769,13 @@ mod tests {
             "--name".to_string(),
             "work".to_string(),
             "--shell=cmd".to_string(),
+            "--cwd".to_string(),
+            r"C:\work".to_string(),
         ])
         .unwrap();
         assert_eq!(opts.name.as_deref(), Some("work"));
         assert_eq!(opts.shell.as_deref(), Some("cmd"));
+        assert_eq!(opts.cwd.as_deref(), Some(r"C:\work"));
     }
 
     #[test]
