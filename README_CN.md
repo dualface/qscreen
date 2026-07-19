@@ -14,7 +14,7 @@
 
 ## 平台说明
 
-- Windows 使用 named pipe，默认启动 `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`。使用 `qscn new --shell cmd --name work` 可为单个会话启动 `C:\Windows\System32\cmd.exe`；也可以在 daemon 环境中设置 `QSCREEN_WINDOWS_SHELL=cmd` 或 `QSCREEN_WINDOWS_SHELL=cmd.exe`，把 cmd 设为 daemon 默认。显式设置 `powershell` 或 `powershell.exe` 会保持默认 PowerShell 行为。不支持的取值会返回错误并阻止创建会话。
+- Windows 使用 named pipe，默认启动 `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`。使用 `qscn new --shell cmd --name work` 可为单个会话启动 `C:\Windows\System32\cmd.exe`；也可以在 daemon 环境中设置 `QSCREEN_WINDOWS_SHELL=cmd` 或 `QSCREEN_WINDOWS_SHELL=cmd.exe`，把 cmd 设为 daemon 默认。显式设置 `powershell` 或 `powershell.exe` 会保持默认 PowerShell 行为。其他取值一律按 shell 可执行文件处理：完整路径（如 `C:\Program Files\PowerShell\7\pwsh.exe`）会校验文件是否存在，裸命令名（如 `pwsh`）则通过 `PATH` 解析。路径不存在会返回错误并阻止创建会话。
 - Linux/macOS 使用 Unix domain socket，并启动 `$SHELL -l`，缺失时回退 `/bin/sh -l`。`qscn new --shell <path>` 可为单个会话覆盖 shell 路径。
 - 会话通过 daemon 分配的数字 `session_id` 访问。会话名只是显示名；自定义显示名必须匹配
   `[A-Za-z0-9._-]`，最长 64 字符。

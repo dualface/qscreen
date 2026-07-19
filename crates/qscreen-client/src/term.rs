@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 use qscreen_protocol::{
     FRAME_FLAG_BLINK, FRAME_FLAG_BOLD, FRAME_FLAG_DIM, FRAME_FLAG_HIDDEN, FRAME_FLAG_INVERSE,
@@ -10,6 +10,60 @@ use unicode_width::UnicodeWidthStr;
 const PREPARE_ATTACH: &[u8] = b"\x1b[?1049h\x1b[?1004h\x1b[2J\x1b[H";
 const RESTORE_AFTER_ATTACH: &[u8] =
     b"\x1b[?2026l\x1b[?1l\x1b[?2004l\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1004l\x1b[?25h\x1b[0m\x1b[0 q\x1b[r\x1b[?1049l";
+
+/// attach 前的运行环境预检:
+/// 1. 要求 stdin/stdout 都是交互式终端(否则渲染转义序列没有意义);
+/// 2. 在 Windows 上主动开启控制台 VT 输出处理,这样连传统 conhost 也能正确渲染,
+///    失败时只警告、不中断(交给用户换 Windows Terminal)。
+pub fn preflight_interactive() -> anyhow::Result<()> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        anyhow::bail!(
+            "qscn attach 需要交互式终端,但 stdin/stdout 被重定向了;\
+             请直接在终端窗口里运行,不要通过管道或重定向"
+        );
+    }
+
+    #[cfg(windows)]
+    if let Err(e) = enable_virtual_terminal_output() {
+        eprintln!(
+            "warning: 无法开启终端 VT 输出处理({e});画面可能显示为乱码,建议使用 Windows Terminal"
+        );
+    }
+
+    Ok(())
+}
+
+/// 打开 stdout 控制台的 `ENABLE_VIRTUAL_TERMINAL_PROCESSING`,让裸 ANSI/VT
+/// 转义序列在 Windows 控制台(含传统 conhost)里被正确解释。
+#[cfg(windows)]
+fn enable_virtual_terminal_output() -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_OUTPUT_HANDLE,
+        SetConsoleMode,
+    };
+
+    // SAFETY: 只是获取标准输出句柄并读改控制台模式,句柄无需释放。
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut mode: u32 = 0;
+        if GetConsoleMode(handle, &mut mode) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        if mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING == 0
+            && SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    Ok(())
+}
 
 pub fn prepare_attach_terminal<W: Write>(out: &mut W) -> std::io::Result<()> {
     out.write_all(PREPARE_ATTACH)?;

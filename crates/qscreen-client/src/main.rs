@@ -314,7 +314,7 @@ fn detect_chinese() -> bool {
     }
     #[cfg(windows)]
     {
-        return windows_locale_is_chinese();
+        windows_locale_is_chinese()
     }
     #[cfg(not(windows))]
     false
@@ -349,7 +349,7 @@ fn print_help() {
   qscn [--prefix C-a] new --name <name>
                                用参数指定显示名
   qscn [--prefix C-a] new --shell <shell>
-                               指定启动 shell（Windows: cmd 或 powershell；Unix: shell 路径）
+                               指定启动 shell（Windows: cmd、powershell 或可执行文件路径；Unix: shell 路径）
   qscn [--prefix C-a] new --cwd <path>
                                指定会话启动工作目录
   qscn [--prefix C-a] attach <session_id>
@@ -403,7 +403,7 @@ Usage:
   qscn [--prefix C-a] new --name <name>
                                specify the display name as an option
   qscn [--prefix C-a] new --shell <shell>
-                               specify the startup shell (Windows: cmd or powershell; Unix: shell path)
+                               specify the startup shell (Windows: cmd, powershell, or an executable path; Unix: shell path)
   qscn [--prefix C-a] new --cwd <path>
                                specify the session working directory
   qscn [--prefix C-a] attach <session_id>
@@ -483,6 +483,8 @@ async fn cmd_new_and_attach(
     cwd: Option<&str>,
     config: ClientConfig,
 ) -> anyhow::Result<()> {
+    // 预检放在创建 session 之前,避免预检失败时留下无法 attach 的孤儿 session。
+    term::preflight_interactive()?;
     if !name.is_empty() {
         validate_session_name(name)?;
     }
@@ -527,7 +529,10 @@ fn cwd_acknowledged(requested: &str, acknowledged: &str) -> bool {
 
 fn cwd_for_request(cwd: Option<&str>) -> anyhow::Result<String> {
     let Some(cwd) = cwd.filter(|value| !value.is_empty()) else {
-        return Ok(String::new());
+        // 未显式指定 --cwd 时,继承客户端(父环境)的当前工作目录,
+        // 否则 session 会落到常驻 daemon 的启动目录而非用户执行 `qscn new` 的目录。
+        let path = std::env::current_dir().context("resolve current directory for session cwd")?;
+        return Ok(path.to_string_lossy().into_owned());
     };
     let path = std::path::Path::new(cwd);
     let path = if path.is_absolute() {
@@ -541,6 +546,7 @@ fn cwd_for_request(cwd: Option<&str>) -> anyhow::Result<String> {
 }
 
 async fn cmd_attach(session_id: &str, config: ClientConfig) -> anyhow::Result<()> {
+    term::preflight_interactive()?;
     validate_session_id(session_id)?;
     attach_session_loop(session_id, config).await
 }
@@ -1822,6 +1828,17 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Use --name <name>"), "{err}");
+    }
+
+    #[test]
+    fn cwd_for_request_defaults_to_client_directory() {
+        let expected = std::env::current_dir().unwrap();
+
+        assert_eq!(cwd_for_request(None).unwrap(), expected.to_string_lossy());
+        assert_eq!(
+            cwd_for_request(Some("")).unwrap(),
+            expected.to_string_lossy()
+        );
     }
 
     #[test]

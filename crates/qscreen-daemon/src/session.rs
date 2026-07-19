@@ -970,13 +970,27 @@ fn broadcast_output_or_frame(
 }
 
 #[cfg(any(windows, test))]
-fn resolve_windows_shell_preference(preference: Option<&str>) -> anyhow::Result<&'static str> {
-    match preference.map(str::trim).filter(|value| !value.is_empty()) {
-        None => Ok(DEFAULT_WINDOWS_SHELL),
-        Some("cmd" | "cmd.exe") => Ok(CMD_WINDOWS_SHELL),
-        Some("powershell" | "powershell.exe") => Ok(DEFAULT_WINDOWS_SHELL),
-        Some(value) => anyhow::bail!("unsupported Windows shell value: {value}"),
+fn resolve_windows_shell_preference(preference: Option<&str>) -> anyhow::Result<String> {
+    let Some(value) = preference.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(DEFAULT_WINDOWS_SHELL.to_string());
+    };
+    match value {
+        "cmd" | "cmd.exe" => return Ok(CMD_WINDOWS_SHELL.to_string()),
+        "powershell" | "powershell.exe" => return Ok(DEFAULT_WINDOWS_SHELL.to_string()),
+        _ => {}
     }
+    // Any other value is treated as a path to a shell executable. When it looks
+    // like a path (contains a separator), require that the file exists so typos
+    // fail fast with a clear message; bare command names are passed through for
+    // PATH resolution, mirroring the Unix branch.
+    if value.contains('\\') || value.contains('/') {
+        let metadata = std::fs::metadata(value)
+            .with_context(|| format!("Windows shell executable not found: {value}"))?;
+        if !metadata.is_file() {
+            anyhow::bail!("Windows shell path is not a file: {value}");
+        }
+    }
+    Ok(value.to_string())
 }
 
 fn default_shell_command(shell: Option<&str>) -> anyhow::Result<CommandBuilder> {
@@ -1111,12 +1125,43 @@ mod tests {
     }
 
     #[test]
-    fn windows_shell_preference_rejects_unsupported_values() {
-        let err = resolve_windows_shell_preference(Some("pwsh"))
-            .expect_err("unsupported shell should fail")
+    fn windows_shell_preference_passes_through_bare_command() {
+        // Bare command names (no path separator) are forwarded for PATH
+        // resolution, e.g. `pwsh` for PowerShell 7.
+        assert_eq!(
+            resolve_windows_shell_preference(Some("pwsh")).unwrap(),
+            "pwsh"
+        );
+    }
+
+    #[test]
+    fn windows_shell_preference_accepts_existing_executable_path() {
+        let exe = std::env::current_exe().expect("current exe path");
+        let path = exe.to_str().expect("exe path is utf-8");
+        assert_eq!(
+            resolve_windows_shell_preference(Some(path)).unwrap(),
+            path.to_string()
+        );
+    }
+
+    #[test]
+    fn windows_shell_preference_rejects_missing_path() {
+        let err = resolve_windows_shell_preference(Some(r"C:\does\not\exist\pwsh.exe"))
+            .expect_err("missing path should fail")
             .to_string();
 
-        assert!(err.contains("unsupported Windows shell value: pwsh"));
+        assert!(err.contains("Windows shell executable not found"), "{err}");
+    }
+
+    #[test]
+    fn windows_shell_preference_rejects_directory_path() {
+        let dir = std::env::temp_dir();
+        let path = dir.to_str().expect("temp dir path is utf-8");
+        let err = resolve_windows_shell_preference(Some(path))
+            .expect_err("directory should fail")
+            .to_string();
+
+        assert!(err.contains("is not a file"), "{err}");
     }
 
     #[test]
