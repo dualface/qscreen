@@ -53,6 +53,8 @@ pub mod sgr {
     pub const HEADER: &str = "1;36";
     /// 次要提示行:暗淡。
     pub const HINT: &str = "2";
+    /// 提示行里的快捷键:加粗黄色,从暗淡的描述文字里跳出来。
+    pub const KEY: &str = "1;33";
     /// 错误信息:加粗红色。
     pub const ERROR: &str = "1;31";
     /// 当前会话标记 `*`:绿色。

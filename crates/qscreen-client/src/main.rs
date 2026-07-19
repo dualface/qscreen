@@ -695,8 +695,10 @@ async fn list_sessions() -> anyhow::Result<Vec<SessionInfo>> {
 }
 
 /// 通过 daemon 新建一个使用默认名称/shell 的 session，返回其 session_id。
-async fn create_session() -> anyhow::Result<String> {
-    create_session_with_options("", None, None).await
+/// `cwd` 为 `Some(非空)` 时新 session 继承该目录,否则回退到客户端当前目录。
+async fn create_session_in(cwd: Option<&str>) -> anyhow::Result<String> {
+    let cwd = cwd.filter(|value| !value.is_empty());
+    create_session_with_options("", None, cwd).await
 }
 
 /// 为指定 session 改名。名字先经过校验，再发送 Rename 请求。
@@ -791,6 +793,8 @@ struct SessionListRow {
     state: String,
     size: String,
     cwd: String,
+    /// 未经转义的原始工作目录,供「在列表里创建 session」继承 cwd 使用。
+    cwd_raw: String,
     is_current: bool,
     exited: bool,
     attached: bool,
@@ -815,6 +819,7 @@ fn build_session_list_rows(
             state: session_state_label(session),
             size: session_size_label(session),
             cwd: session_cwd_label(session),
+            cwd_raw: session.cwd.clone(),
             is_current: session.session_id == current_session_id,
             exited: session.exited,
             attached: session.attached,
@@ -1521,13 +1526,18 @@ async fn run_session_list_mode<W: Write>(
                 render_session_list(stdout, &rows, selected, &status, term_size)?;
             }
             SessionListAction::Cancel => return Ok(SessionListSelection::Close),
-            SessionListAction::Create => match create_session().await {
-                Ok(new_session_id) => return Ok(SessionListSelection::Switch(new_session_id)),
-                Err(e) => {
-                    status = format!("create failed: {e}");
-                    render_session_list(stdout, &rows, selected, &status, term_size)?;
+            SessionListAction::Create => {
+                // 继承光标所在 session 的 cwd,让新 session 开在同一目录;
+                // 该 session 无已知 cwd 时回退到 create_session 的默认行为(客户端当前目录)。
+                let inherit_cwd = rows.get(selected).map(|row| row.cwd_raw.clone());
+                match create_session_in(inherit_cwd.as_deref()).await {
+                    Ok(new_session_id) => return Ok(SessionListSelection::Switch(new_session_id)),
+                    Err(e) => {
+                        status = format!("create failed: {e}");
+                        render_session_list(stdout, &rows, selected, &status, term_size)?;
+                    }
                 }
-            },
+            }
             SessionListAction::Rename => {
                 if rows.is_empty() {
                     status = "no sessions".to_string();
@@ -1709,12 +1719,7 @@ fn render_session_list<W: Write>(
     let (cols, rows_count) = term_size;
     write!(out, "\x1b[?2026h\x1b[0m\x1b[2J\x1b[H")?;
     write_text_line(out, "qscreen sessions", Some(color::sgr::HEADER), cols)?;
-    write_text_line(
-        out,
-        "Up/Down or k/j, Enter switch, c create, r rename, Esc/q cancel",
-        Some(color::sgr::HINT),
-        cols,
-    )?;
+    write_session_list_hint(out, cols)?;
     write_text_line(out, "", None, cols)?;
 
     if rows.is_empty() {
@@ -1769,6 +1774,47 @@ fn status_style(status: &str) -> &'static str {
     } else {
         color::sgr::HINT
     }
+}
+
+/// 会话列表的操作提示行:把快捷键片段高亮(加粗黄),描述文字保持暗淡。
+/// 无色环境下退化为纯文本,可见宽度与上色前一致,布局不受影响。
+fn write_session_list_hint<W: Write>(out: &mut W, cols: u16) -> std::io::Result<()> {
+    // (片段文本, 是否为快捷键)。拼接后即原提示串,便于按可见宽度截断。
+    const SEGMENTS: &[(&str, bool)] = &[
+        ("Up/Down", true),
+        (" or ", false),
+        ("k/j", true),
+        (", ", false),
+        ("Enter", true),
+        (" switch, ", false),
+        ("c", true),
+        (" create, ", false),
+        ("r", true),
+        (" rename, ", false),
+        ("Esc/q", true),
+        (" cancel", false),
+    ];
+    let limit = cols as usize;
+    let mut content = String::new();
+    let mut visible = 0usize;
+    for (text, is_key) in SEGMENTS {
+        if visible >= limit {
+            break;
+        }
+        let piece = truncate_for_terminal(text, limit - visible);
+        if piece.is_empty() {
+            continue;
+        }
+        visible += UnicodeWidthStr::width(piece.as_str());
+        let sgr = if *is_key {
+            color::sgr::KEY
+        } else {
+            color::sgr::HINT
+        };
+        // color::paint 在无色环境下原样返回,因此此分支同时覆盖有色/无色两种情况。
+        content.push_str(&color::paint(&piece, sgr));
+    }
+    write_list_line(out, &content, visible, None, cols)
 }
 
 /// 写一整行文本:截断到 `cols`、按需整体着色、右侧补空格填满、以 CRLF 结束。
@@ -2157,6 +2203,37 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(err.starts_with("invalid prefix"), "{err}");
+    }
+
+    #[test]
+    fn session_list_hint_renders_full_text_and_pads_to_width() {
+        // 无色环境(测试默认)下提示行应为纯文本,且右侧补空格填满整行。
+        let cols = 80u16;
+        let mut out = Vec::new();
+        write_session_list_hint(&mut out, cols).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.ends_with("\r\n"));
+        let line = rendered.strip_suffix("\r\n").unwrap();
+        assert!(
+            line.contains("Up/Down or k/j, Enter switch, c create, r rename, Esc/q cancel"),
+            "{line:?}"
+        );
+        // 去掉可能存在的 SGR 重置前缀后,可见内容应恰好填满 cols 列。
+        let visible = line.trim_start_matches("\x1b[0m");
+        assert_eq!(UnicodeWidthStr::width(visible), cols as usize);
+    }
+
+    #[test]
+    fn session_list_hint_truncates_to_narrow_width() {
+        // 极窄终端下按可见宽度截断,不 panic 且不超宽。
+        let cols = 5u16;
+        let mut out = Vec::new();
+        write_session_list_hint(&mut out, cols).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        let line = rendered.strip_suffix("\r\n").unwrap();
+        let visible = line.trim_start_matches("\x1b[0m");
+        assert_eq!(UnicodeWidthStr::width(visible), cols as usize);
+        assert!(visible.starts_with("Up/Do"), "{visible:?}");
     }
 
     fn ctrl_key(c: char) -> crossterm::event::KeyEvent {
