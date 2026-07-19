@@ -92,11 +92,12 @@ impl State {
         }
     }
 
+    /// 列出存活的 session。已退出的 session 仅作为墓碑保留（用于 attach 错误提示），
+    /// 不出现在列表里。
     fn list_sessions(&self) -> Vec<SessionInfo> {
         let guard = self.sessions.lock().unwrap();
         let mut infos: Vec<SessionInfo> = guard.values().map(|s| session_info(s)).collect();
         drop(guard);
-        infos.extend(self.exited_sessions.lock().unwrap().values().cloned());
         infos.sort_by_key(|info| info.session_id.parse::<u64>().unwrap_or(u64::MAX));
         infos
     }
@@ -1379,7 +1380,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exited_sessions_are_kept_as_list_tombstones() {
+    async fn exited_sessions_are_hidden_from_list_but_kept_as_tombstones() {
         let state = test_state();
         let session = insert_session(&state, "1", "work").await;
 
@@ -1387,11 +1388,11 @@ mod tests {
 
         for _ in 0..50 {
             if state.get_session("1").is_none() {
-                let infos = state.list_sessions();
-                assert_eq!(infos.len(), 1);
-                assert_eq!(infos[0].session_id, "1");
-                assert!(infos[0].exited);
-                assert!(!infos[0].attached);
+                // 墓碑保留，供 attach 时给出 "session exited" 错误提示……
+                let tombstone = state.get_exited_session("1").expect("tombstone kept");
+                assert!(tombstone.exited);
+                // ……但不出现在 session 列表里。
+                assert!(state.list_sessions().is_empty());
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;

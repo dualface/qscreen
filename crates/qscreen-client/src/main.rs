@@ -372,7 +372,7 @@ fn print_help() {
 会话内热键:
   <prefix> d                  从当前会话 detach（会话继续在后台运行）
   <prefix> <prefix>           向 PTY 发送字面前缀字符
-  <prefix> s                  打开会话列表，选择会话后切换 attach
+  <prefix> s                  打开会话列表（Enter 切换，c 新建，r 改名，q 取消）
 
 ls 输出格式:
   <session_id>  <name>  <状态>  <创建时间>  <终端尺寸>
@@ -426,7 +426,7 @@ Prefix:
 Key bindings (inside a session):
   <prefix> d                  detach from session (session keeps running)
   <prefix> <prefix>           send a literal prefix key to the PTY
-  <prefix> s                  open the session list and switch to a session
+  <prefix> s                  open the session list (Enter switch, c create, r rename, q cancel)
 
 ls output format:
   <session_id>  <name>  <state>  <created-at>  <terminal-size>
@@ -621,6 +621,42 @@ async fn list_sessions() -> anyhow::Result<Vec<SessionInfo>> {
     let resp = recv_msg(&mut conn).await?;
     check_response(&resp, "1")?;
     Ok(resp.sessions)
+}
+
+/// 通过 daemon 新建一个使用默认名称/shell 的 session，返回其 session_id。
+async fn create_session() -> anyhow::Result<String> {
+    let mut conn = ensure_and_connect().await?;
+    let resp = send_recv_ok(
+        &mut conn,
+        Message {
+            kind: MessageKind::Request,
+            id: "1".to_string(),
+            command: Some(Command::New),
+            ..Default::default()
+        },
+    )
+    .await?;
+    validate_session_id(&resp.session_id)?;
+    Ok(resp.session_id)
+}
+
+/// 为指定 session 改名。名字先经过校验，再发送 Rename 请求。
+async fn rename_session(session_id: &str, name: &str) -> anyhow::Result<()> {
+    validate_session_name(name)?;
+    let mut conn = ensure_and_connect().await?;
+    send_recv_ok(
+        &mut conn,
+        Message {
+            kind: MessageKind::Request,
+            id: "1".to_string(),
+            command: Some(Command::Rename),
+            session_id: session_id.to_string(),
+            name: name.to_string(),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 fn print_sessions(sessions: &[SessionInfo]) {
@@ -1033,6 +1069,8 @@ enum SessionListAction {
     MoveUp,
     MoveDown,
     Select,
+    Create,
+    Rename,
     Cancel,
 }
 
@@ -1378,6 +1416,45 @@ async fn run_session_list_mode<W: Write>(
                 render_session_list(stdout, &rows, selected, &status, term_size)?;
             }
             SessionListAction::Cancel => return Ok(SessionListSelection::Close),
+            SessionListAction::Create => match create_session().await {
+                Ok(new_session_id) => return Ok(SessionListSelection::Switch(new_session_id)),
+                Err(e) => {
+                    status = format!("create failed: {e}");
+                    render_session_list(stdout, &rows, selected, &status, term_size)?;
+                }
+            },
+            SessionListAction::Rename => {
+                if rows.is_empty() {
+                    status = "no sessions".to_string();
+                    render_session_list(stdout, &rows, selected, &status, term_size)?;
+                    continue;
+                }
+                selected = selected.min(rows.len() - 1);
+                let row = rows[selected].clone();
+                if row.exited {
+                    status = "cannot rename an exited session".to_string();
+                    render_session_list(stdout, &rows, selected, &status, term_size)?;
+                    continue;
+                }
+                match prompt_session_rename(stdout, &rows, selected, term_size, &row.name).await? {
+                    Some(new_name) => match rename_session(&row.session_id, &new_name).await {
+                        Ok(()) => {
+                            rows = build_session_list_rows(
+                                &list_sessions().await?,
+                                current_session_id,
+                            );
+                            selected = rows
+                                .iter()
+                                .position(|r| r.session_id == row.session_id)
+                                .unwrap_or_else(|| selected.min(rows.len().saturating_sub(1)));
+                            status = format!("renamed to \"{new_name}\"");
+                        }
+                        Err(e) => status = format!("rename failed: {e}"),
+                    },
+                    None => status = String::new(),
+                }
+                render_session_list(stdout, &rows, selected, &status, term_size)?;
+            }
             SessionListAction::Select => {
                 if rows.is_empty() {
                     status = "no sessions".to_string();
@@ -1425,6 +1502,8 @@ async fn read_session_list_action() -> anyhow::Result<SessionListAction> {
                                 return Ok(SessionListAction::MoveDown);
                             }
                             KeyCode::Enter => return Ok(SessionListAction::Select),
+                            KeyCode::Char('c') => return Ok(SessionListAction::Create),
+                            KeyCode::Char('r') => return Ok(SessionListAction::Rename),
                             KeyCode::Esc | KeyCode::Char('q') => {
                                 return Ok(SessionListAction::Cancel);
                             }
@@ -1442,6 +1521,74 @@ async fn read_session_list_action() -> anyhow::Result<SessionListAction> {
     .await?
 }
 
+enum NameEditKey {
+    Char(char),
+    Backspace,
+    Submit,
+    Cancel,
+}
+
+async fn read_name_edit_key() -> anyhow::Result<NameEditKey> {
+    tokio::task::spawn_blocking(|| {
+        loop {
+            match crossterm::event::poll(Duration::from_millis(50)) {
+                Ok(true) => match crossterm::event::read() {
+                    Ok(Event::Key(key_event))
+                        if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                    {
+                        match key_event.code {
+                            KeyCode::Enter => return Ok(NameEditKey::Submit),
+                            KeyCode::Esc => return Ok(NameEditKey::Cancel),
+                            KeyCode::Backspace => return Ok(NameEditKey::Backspace),
+                            KeyCode::Char(c) => return Ok(NameEditKey::Char(c)),
+                            _ => {}
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => return Err(anyhow::Error::new(e)),
+                },
+                Ok(false) => {}
+                Err(e) => return Err(anyhow::Error::new(e)),
+            }
+        }
+    })
+    .await?
+}
+
+/// 在会话列表底部行内提示用户输入新名字。返回 Some(name) 表示提交，None 表示取消。
+async fn prompt_session_rename<W: Write>(
+    stdout: &mut W,
+    rows: &[SessionListRow],
+    selected: usize,
+    term_size: (u16, u16),
+    old_name: &str,
+) -> anyhow::Result<Option<String>> {
+    let mut input = String::new();
+    loop {
+        let status = format!("rename \"{old_name}\" -> {input}_  (Enter confirm, Esc cancel)");
+        render_session_list(stdout, rows, selected, &status, term_size)?;
+        match read_name_edit_key().await? {
+            NameEditKey::Submit => {
+                let trimmed = input.trim();
+                return Ok(if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                });
+            }
+            NameEditKey::Cancel => return Ok(None),
+            NameEditKey::Backspace => {
+                input.pop();
+            }
+            NameEditKey::Char(c) => {
+                if !c.is_control() {
+                    input.push(c);
+                }
+            }
+        }
+    }
+}
+
 fn render_session_list<W: Write>(
     out: &mut W,
     rows: &[SessionListRow],
@@ -1454,7 +1601,7 @@ fn render_session_list<W: Write>(
     write_session_list_line(out, "qscreen sessions", cols)?;
     write_session_list_line(
         out,
-        "Use Up/Down or k/j, Enter to switch, Esc/q to cancel",
+        "Up/Down or k/j, Enter switch, c create, r rename, Esc/q cancel",
         cols,
     )?;
     write_session_list_line(out, "", cols)?;
