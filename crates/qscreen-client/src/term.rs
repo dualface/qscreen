@@ -80,6 +80,59 @@ fn enable_virtual_terminal_output() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Enable or disable mouse reporting on the Windows console input handle,
+/// following the state of the attached application's mouse tracking.
+///
+/// Like GNU screen, qscn relays the inner application's mouse events: it
+/// mirrors the DEC private mouse modes to the host terminal and re-encodes the
+/// events back to the child. On Windows that relay only works if the client's
+/// own console input delivers mouse records — which requires
+/// `ENABLE_MOUSE_INPUT` (and `ENABLE_QUICK_EDIT_MODE` cleared, so the console
+/// does not swallow the mouse for its own selection). `ENABLE_EXTENDED_FLAGS`
+/// is required for the quick-edit change to take effect. When the application
+/// has no mouse mode we restore quick-edit so host-side selection keeps working.
+///
+/// No-op on non-Windows, where the host terminal drives mouse reporting purely
+/// through the VT private-mode sequences and delivers events on stdin.
+#[cfg(windows)]
+pub fn set_console_mouse_capture(enabled: bool) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        ENABLE_EXTENDED_FLAGS, ENABLE_MOUSE_INPUT, ENABLE_QUICK_EDIT_MODE, GetConsoleMode,
+        GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
+    };
+
+    // SAFETY: we only fetch the standard input handle and read/modify the console mode; the handle does not need to be released.
+    unsafe {
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut mode: u32 = 0;
+        if GetConsoleMode(handle, &mut mode) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let new_mode = if enabled {
+            (mode | ENABLE_EXTENDED_FLAGS | ENABLE_MOUSE_INPUT) & !ENABLE_QUICK_EDIT_MODE
+        } else {
+            (mode | ENABLE_EXTENDED_FLAGS | ENABLE_QUICK_EDIT_MODE) & !ENABLE_MOUSE_INPUT
+        };
+
+        if new_mode != mode && SetConsoleMode(handle, new_mode) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn set_console_mouse_capture(_enabled: bool) -> std::io::Result<()> {
+    Ok(())
+}
+
 pub fn prepare_attach_terminal<W: Write>(out: &mut W) -> std::io::Result<()> {
     out.write_all(PREPARE_ATTACH)?;
     out.flush()
@@ -158,6 +211,9 @@ fn render_input_mode_diff<W: Write>(
     if current.mouse_mode != frame.mouse_mode {
         write_mouse_mode(out, current.mouse_mode, false)?;
         write_mouse_mode(out, frame.mouse_mode, true)?;
+        // Windows: also toggle console mouse input so the attach loop receives
+        // mouse records to relay; best-effort no-op elsewhere.
+        let _ = set_console_mouse_capture(frame.mouse_mode != FrameMouseMode::None);
         current.mouse_mode = frame.mouse_mode;
     }
     if current.mouse_encoding != frame.mouse_encoding {
