@@ -2219,10 +2219,7 @@ mod tests {
     #[test]
     fn cwd_for_request_defaults_to_client_directory() {
         let expected = std::env::current_dir().unwrap();
-        let expected = CwdRequest {
-            cwd: expected.to_str().unwrap().to_string(),
-            cwd_bytes: Vec::new(),
-        };
+        let expected = cwd_request_from_path(&expected).unwrap();
 
         assert_eq!(cwd_for_request(None).unwrap(), expected);
         assert_eq!(cwd_for_request(Some("")).unwrap(), expected);
@@ -2231,20 +2228,25 @@ mod tests {
     #[test]
     fn cwd_for_request_resolves_relative_path_from_client_directory() {
         let expected = std::env::current_dir().unwrap().join("project");
+        let expected = cwd_request_from_path(&expected).unwrap();
 
-        assert_eq!(
-            cwd_for_request(Some("project")).unwrap().cwd,
-            expected.to_str().unwrap()
-        );
+        assert_eq!(cwd_for_request(Some("project")).unwrap(), expected);
     }
 
     #[test]
     fn cwd_for_request_preserves_absolute_path() {
-        let path = std::env::current_dir().unwrap().join("project");
+        let path = if cfg!(windows) {
+            r"C:\qscreen-project"
+        } else {
+            "/qscreen-project"
+        };
 
         assert_eq!(
-            cwd_for_request(path.to_str()).unwrap().cwd,
-            path.to_str().unwrap()
+            cwd_for_request(Some(path)).unwrap(),
+            CwdRequest {
+                cwd: path.to_string(),
+                cwd_bytes: Vec::new(),
+            }
         );
     }
 
