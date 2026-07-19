@@ -823,8 +823,11 @@ fn key_event_to_bytes(
     };
 
     match event.code {
-        // Backspace → BS (0x08)，Windows Terminal raw mode 发 DEL (0x7f) 会让 PSReadLine 误删整行
-        KeyCode::Backspace => vec![0x08],
+        // Backspace → DEL (0x7f)：ConPTY 把 0x7f 翻译成 Backspace 键，
+        // 而 0x08 会被翻译成 Ctrl+Backspace，PSReadLine 会按 BackwardKillWord 删除整个单词
+        KeyCode::Backspace if ctrl => vec![0x08],
+        KeyCode::Backspace if alt => vec![0x1b, 0x7f],
+        KeyCode::Backspace => vec![0x7f],
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Tab if shift => b"\x1b[Z".to_vec(),
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
@@ -836,8 +839,8 @@ fn key_event_to_bytes(
             }
         }
         KeyCode::Esc => vec![0x1b],
-        KeyCode::Delete if modifier > 1 => tilde_key(3, modifier),
-        KeyCode::Delete => vec![0x7f],
+        // Delete → CSI 3~：0x7f 会被 ConPTY 当成 Backspace 处理
+        KeyCode::Delete => tilde_key(3, modifier),
 
         KeyCode::Up => cursor_key(cursor_prefix, 'A', modifier),
         KeyCode::Down => cursor_key(cursor_prefix, 'B', modifier),
