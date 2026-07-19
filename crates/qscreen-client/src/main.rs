@@ -880,18 +880,49 @@ async fn attach_session_loop(initial_session_id: &str, config: ClientConfig) -> 
     loop {
         validate_session_id(&session_id)?;
         let outcome = attach_session_once(&session_id, config).await?;
-        match next_attach_target_after_outcome(outcome) {
-            Some(next_session_id) => session_id = next_session_id,
-            None => return Ok(()),
+        match outcome {
+            AttachOutcome::SwitchTo(next_session_id) => session_id = next_session_id,
+            // Detaching leaves the daemon and all sessions running.
+            AttachOutcome::Detached => return Ok(()),
+            // The attached session exited: auto-switch to the highest-ID
+            // remaining session, or shut the daemon down when none remain.
+            AttachOutcome::Ended => match next_session_after_exit(&session_id).await? {
+                Some(next_session_id) => session_id = next_session_id,
+                None => {
+                    cmd_shutdown().await?;
+                    return Ok(());
+                }
+            },
         }
     }
 }
 
-fn next_attach_target_after_outcome(outcome: AttachOutcome) -> Option<String> {
-    match outcome {
-        AttachOutcome::SwitchTo(next_session_id) => Some(next_session_id),
-        AttachOutcome::Detached | AttachOutcome::Ended => None,
-    }
+/// After the attached session exits, resolve the next session to attach to.
+/// Queries the daemon and returns the highest-ID remaining live session, or
+/// `None` when no other session remains (the caller then shuts the daemon down).
+async fn next_session_after_exit(ended_session_id: &str) -> anyhow::Result<Option<String>> {
+    let sessions = list_sessions().await?;
+    Ok(highest_remaining_session_id(&sessions, ended_session_id))
+}
+
+/// Pick the highest numeric session ID among live (non-exited) sessions,
+/// ignoring `ended_session_id`. Returns `None` when no other live session
+/// remains.
+fn highest_remaining_session_id(
+    sessions: &[SessionInfo],
+    ended_session_id: &str,
+) -> Option<String> {
+    sessions
+        .iter()
+        .filter(|s| !s.exited && s.session_id != ended_session_id)
+        .filter_map(|s| {
+            s.session_id
+                .parse::<u64>()
+                .ok()
+                .map(|id| (id, s.session_id.clone()))
+        })
+        .max_by_key(|(id, _)| *id)
+        .map(|(_, session_id)| session_id)
 }
 
 async fn attach_session_once(
@@ -2992,17 +3023,45 @@ mod tests {
         assert!(text.contains("\x1b[0m> * 1    main"));
     }
 
+    fn session_info_with_id(session_id: &str, exited: bool) -> SessionInfo {
+        SessionInfo {
+            session_id: session_id.to_string(),
+            exited,
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn attach_loop_target_helper_retries_only_on_switch() {
+    fn highest_remaining_session_id_picks_largest_live_id() {
+        let sessions = vec![
+            session_info_with_id("2", false),
+            session_info_with_id("10", false),
+            session_info_with_id("3", false),
+        ];
         assert_eq!(
-            next_attach_target_after_outcome(AttachOutcome::SwitchTo("next".to_string())),
-            Some("next".to_string())
+            highest_remaining_session_id(&sessions, "3"),
+            Some("10".to_string())
         );
+    }
+
+    #[test]
+    fn highest_remaining_session_id_skips_ended_and_exited() {
+        let sessions = vec![
+            session_info_with_id("5", true),
+            session_info_with_id("4", false),
+            session_info_with_id("7", false),
+        ];
+        // The just-ended session (7) and the exited session (5) are ignored.
         assert_eq!(
-            next_attach_target_after_outcome(AttachOutcome::Detached),
-            None
+            highest_remaining_session_id(&sessions, "7"),
+            Some("4".to_string())
         );
-        assert_eq!(next_attach_target_after_outcome(AttachOutcome::Ended), None);
+    }
+
+    #[test]
+    fn highest_remaining_session_id_none_when_empty() {
+        let sessions = vec![session_info_with_id("1", true)];
+        assert_eq!(highest_remaining_session_id(&sessions, "1"), None);
     }
 
     #[test]
