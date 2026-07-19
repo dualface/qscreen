@@ -562,7 +562,10 @@ async fn cmd_new_and_attach(
         validate_session_name(name)?;
     }
     let session_id = create_session_with_options(name, shell, cwd).await?;
-    attach_session_loop(&session_id, config).await
+    // Only the interactive `qscn new` path surfaces the Claude Code flicker hint,
+    // and only on this first attach (reattaches inside the loop pass None).
+    let notice = claude_no_flicker_notice();
+    attach_session_loop(&session_id, config, notice).await
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -665,7 +668,7 @@ fn cwd_request_from_path(path: &std::path::Path) -> anyhow::Result<CwdRequest> {
 async fn cmd_attach(session_id: &str, config: ClientConfig) -> anyhow::Result<()> {
     term::preflight_interactive()?;
     validate_session_id(session_id)?;
-    attach_session_loop(session_id, config).await
+    attach_session_loop(session_id, config, None).await
 }
 
 async fn cmd_kill(session_id: &str) -> anyhow::Result<()> {
@@ -1087,12 +1090,98 @@ async fn fetch_sessions_for_bar(
 
 // ── Attach implementation ────────────────────────────────────────────────────
 
-async fn attach_session_loop(initial_session_id: &str, config: ClientConfig) -> anyhow::Result<()> {
+// ── Claude Code flicker hint ─────────────────────────────────────────────────
+
+/// Path to the user-level Claude Code settings file (`~/.claude/settings.json`).
+/// Uses `USERPROFILE` on Windows and `HOME` elsewhere.
+fn claude_settings_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    Some(
+        std::path::PathBuf::from(home)
+            .join(".claude")
+            .join("settings.json"),
+    )
+}
+
+/// Returns a colored hint when the local Claude Code settings file exists but
+/// does not enable `env.CLAUDE_CODE_NO_FLICKER`. Returns `None` when the file is
+/// absent/unreadable, is malformed JSON, or the flag is already enabled — in
+/// those cases we stay silent rather than nag.
+fn claude_no_flicker_notice() -> Option<String> {
+    let content = std::fs::read_to_string(claude_settings_path()?).ok()?;
+    match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(value) if no_flicker_enabled_in(&value) => None,
+        Ok(_) => Some(build_no_flicker_notice()),
+        Err(_) => None,
+    }
+}
+
+/// Whether the settings JSON already enables `env.CLAUDE_CODE_NO_FLICKER`.
+/// The value is treated as enabled unless it is explicitly falsy
+/// (`"0"`, `"false"`, `"no"`, `"off"`, empty, `false`, or `0`).
+fn no_flicker_enabled_in(settings: &serde_json::Value) -> bool {
+    let Some(value) = settings
+        .get("env")
+        .and_then(|e| e.get("CLAUDE_CODE_NO_FLICKER"))
+    else {
+        return false;
+    };
+    match value {
+        serde_json::Value::String(s) => {
+            let v = s.trim().to_ascii_lowercase();
+            !(v.is_empty() || v == "0" || v == "false" || v == "no" || v == "off")
+        }
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::Number(n) => n.as_f64().is_some_and(|x| x != 0.0),
+        _ => false,
+    }
+}
+
+/// Build the colored multi-line hint. Uses `\r\n` line endings so it lays out
+/// correctly under raw mode, where a bare `\n` does not return the carriage.
+fn build_no_flicker_notice() -> String {
+    let title = color::paint(
+        "⚠  Claude Code 未启用 CLAUDE_CODE_NO_FLICKER",
+        color::sgr::ERROR,
+    );
+    let snippet = color::paint("\"CLAUDE_CODE_NO_FLICKER\": \"1\"", color::sgr::KEY);
+    let cont = color::paint("按任意键进入会话 . . .", color::sgr::HINT);
+    format!(
+        "{title}\r\n\r\n\
+         在 qscn 会话中,Claude Code 的 PageUp/PageDown 等按键需要该设置才能正常工作。\r\n\
+         强烈建议在 ~/.claude/settings.json 的 \"env\" 中加入:\r\n\r\n    \
+         {snippet}\r\n\r\n{cont}"
+    )
+}
+
+/// Print the hint to the alternate screen and block until any key is pressed.
+/// Raw mode is already active (via `TerminalCleanupGuard`), so this reads a
+/// single key event; focus/resize/mouse events are ignored.
+fn show_attach_notice(notice: &str) {
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(notice.as_bytes());
+    let _ = stdout.flush();
+    loop {
+        match crossterm::event::read() {
+            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => break,
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+async fn attach_session_loop(
+    initial_session_id: &str,
+    config: ClientConfig,
+    mut initial_notice: Option<String>,
+) -> anyhow::Result<()> {
     let mut session_id = initial_session_id.to_string();
 
     loop {
         validate_session_id(&session_id)?;
-        let outcome = attach_session_once(&session_id, config).await?;
+        // `take()` ensures the notice is shown at most once, on the first attach;
+        // switching/reattaching within the loop passes None.
+        let outcome = attach_session_once(&session_id, config, initial_notice.take()).await?;
         match outcome {
             AttachOutcome::SwitchTo(next_session_id) => session_id = next_session_id,
             // Detaching leaves the daemon and all sessions running.
@@ -1141,6 +1230,7 @@ fn highest_remaining_session_id(
 async fn attach_session_once(
     session_id: &str,
     config: ClientConfig,
+    notice: Option<String>,
 ) -> anyhow::Result<AttachOutcome> {
     let mut conn = ensure_and_connect().await?;
     let term_size = get_terminal_size().unwrap_or((80, 24));
@@ -1162,6 +1252,12 @@ async fn attach_session_once(
     check_response(&resp, attach_id)?;
 
     let _terminal = TerminalCleanupGuard::enter()?;
+
+    // Shown inside the alternate screen; the first rendered frame overwrites it,
+    // which is fine — the point is that the user reads it before entering the session.
+    if let Some(notice) = notice {
+        show_attach_notice(&notice);
+    }
 
     let session_id_owned = session_id.to_string();
     run_attach_loop(conn, session_id_owned, term_size, config).await
@@ -2452,6 +2548,42 @@ fn get_terminal_size() -> anyhow::Result<(u16, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn no_flicker_enabled(json: &str) -> bool {
+        no_flicker_enabled_in(&serde_json::from_str(json).unwrap())
+    }
+
+    #[test]
+    fn no_flicker_detects_enabled_string_one() {
+        assert!(no_flicker_enabled(
+            r#"{"env":{"CLAUDE_CODE_NO_FLICKER":"1"}}"#
+        ));
+        assert!(no_flicker_enabled(
+            r#"{"env":{"CLAUDE_CODE_NO_FLICKER":"true"}}"#
+        ));
+        assert!(no_flicker_enabled(
+            r#"{"env":{"CLAUDE_CODE_NO_FLICKER":true}}"#
+        ));
+    }
+
+    #[test]
+    fn no_flicker_missing_or_falsy_is_not_enabled() {
+        assert!(!no_flicker_enabled(r#"{}"#));
+        assert!(!no_flicker_enabled(r#"{"env":{}}"#));
+        assert!(!no_flicker_enabled(r#"{"env":{"OTHER":"1"}}"#));
+        assert!(!no_flicker_enabled(
+            r#"{"env":{"CLAUDE_CODE_NO_FLICKER":"0"}}"#
+        ));
+        assert!(!no_flicker_enabled(
+            r#"{"env":{"CLAUDE_CODE_NO_FLICKER":""}}"#
+        ));
+        assert!(!no_flicker_enabled(
+            r#"{"env":{"CLAUDE_CODE_NO_FLICKER":"off"}}"#
+        ));
+        assert!(!no_flicker_enabled(
+            r#"{"env":{"CLAUDE_CODE_NO_FLICKER":false}}"#
+        ));
+    }
 
     #[test]
     fn parse_prefix_accepts_supported_aliases() {
