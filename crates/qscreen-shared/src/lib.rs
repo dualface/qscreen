@@ -34,6 +34,23 @@ pub fn daemon_log_path() -> PathBuf {
     }
 }
 
+/// Client 日志路径：与 [`daemon_log_path`] 同目录，用于记录客户端侧的诊断信息
+/// （例如色彩支持检测结果）。Windows 用 %TEMP%，Unix 用 ${TMPDIR:-/tmp}。
+pub fn client_log_path() -> PathBuf {
+    let user = sanitize_pipe_user(&current_user());
+    #[cfg(windows)]
+    {
+        let temp = std::env::var("TEMP")
+            .or_else(|_| std::env::var("TMP"))
+            .unwrap_or_else(|_| "C:\\Temp".to_string());
+        PathBuf::from(temp).join(format!("qscreen-client-{}.log", user))
+    }
+    #[cfg(unix)]
+    {
+        unix_runtime_dir().join(format!("qscreen-client-{}.log", user))
+    }
+}
+
 /// Daemon single-instance lock path.
 #[cfg(unix)]
 pub fn daemon_lock_path() -> PathBuf {

@@ -16,6 +16,7 @@ use qscreen_protocol::{
 use qscreen_shared::{daemon_log_path, pipe_name};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+mod color;
 mod term;
 
 const DEFAULT_PREFIX: PrefixKey = PrefixKey {
@@ -139,7 +140,7 @@ fn main() {
 
     // CLI client 模式
     if let Err(e) = run_client(args) {
-        eprintln!("{}", e);
+        eprintln!("{}", color::paint_err(&e.to_string(), color::sgr::ERROR));
         std::process::exit(1);
     }
 }
@@ -176,6 +177,8 @@ fn run_daemon_mode() {
 // ── Client 模式 ───────────────────────────────────────────────────────────────
 
 fn run_client(args: Vec<String>) -> anyhow::Result<()> {
+    // 每次运行 qscn 时先检查运行环境是否支持色彩,并记录检查结果。
+    color::init_and_record();
     let (config, args) = parse_client_config(args)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -337,9 +340,35 @@ fn windows_locale_is_chinese() -> bool {
 // ── 帮助文本 ──────────────────────────────────────────────────────────────────
 
 fn print_help() {
-    if is_chinese() {
-        println!(
-            r#"qscreen — 轻量终端会话管理器
+    let raw = if is_chinese() {
+        help_text_zh()
+    } else {
+        help_text_en()
+    };
+    print!("{}", colorize_help(raw));
+}
+
+/// 给帮助文本着色:首行标题与形如 `Xxx:` 的分节标题用加粗青色,其余保持原样。
+/// stdout 不支持色彩时 [`color::paint`] 原样返回,输出与未着色版本一致。
+fn colorize_help(raw: &str) -> String {
+    let mut out = String::new();
+    for (idx, line) in raw.lines().enumerate() {
+        let is_title = idx == 0 && !line.trim().is_empty();
+        let is_section = !line.starts_with(char::is_whitespace)
+            && !line.trim().is_empty()
+            && line.trim_end().ends_with(':');
+        if is_title || is_section {
+            out.push_str(&color::paint(line, color::sgr::HEADER));
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn help_text_zh() -> &'static str {
+    r#"qscreen — 轻量终端会话管理器
 
 用法:
   qscn [--prefix C-a]          智能启动：无会话时新建并进入，单会话时直接 attach，
@@ -390,10 +419,10 @@ ls 输出格式:
   qscn ls                      # 查看所有会话状态
   qscn kill 1                  # 终止 session_id=1
 "#
-        );
-    } else {
-        println!(
-            r#"qscreen — lightweight terminal session manager
+}
+
+fn help_text_en() -> &'static str {
+    r#"qscreen — lightweight terminal session manager
 
 Usage:
   qscn [--prefix C-a]          smart launch: create and enter a session if no sessions,
@@ -444,8 +473,6 @@ Examples:
   qscn ls                      # show all session states
   qscn kill 1                  # terminate session_id=1
 "#
-        );
-    }
 }
 
 // ── 子命令实现 ────────────────────────────────────────────────────────────────
@@ -661,24 +688,47 @@ async fn rename_session(session_id: &str, name: &str) -> anyhow::Result<()> {
 
 fn print_sessions(sessions: &[SessionInfo]) {
     for s in sessions {
-        println!("{}", format_session_line(s));
+        if color::supported() {
+            println!("{}", colored_session_line(s));
+        } else {
+            println!("{}", format_session_line(s));
+        }
+    }
+}
+
+fn session_created_label(s: &SessionInfo) -> String {
+    if s.created_at.timestamp() == 0 {
+        "-".to_string()
+    } else {
+        s.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     }
 }
 
 fn format_session_line(s: &SessionInfo) -> String {
-    let created = if s.created_at.timestamp() == 0 {
-        "-".to_string()
-    } else {
-        s.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-    };
     format!(
         "{}\t{}\t{}\t{}\t{}\t{}",
         s.session_id,
         s.name,
         session_state_label(s),
-        created,
+        session_created_label(s),
         session_size_label(s),
         session_cwd_label(s)
+    )
+}
+
+/// 与 [`format_session_line`] 相同的列布局,但逐列着色(仅当 stdout 支持色彩时调用)。
+fn colored_session_line(s: &SessionInfo) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}",
+        color::paint(&s.session_id, color::sgr::ID),
+        color::paint(&s.name, color::sgr::NAME),
+        color::paint(
+            &session_state_label(s),
+            color::state_sgr(s.exited, s.attached)
+        ),
+        color::paint(&session_created_label(s), color::sgr::CREATED),
+        color::paint(&session_size_label(s), color::sgr::SIZE),
+        color::paint(&session_cwd_label(s), color::sgr::CWD)
     )
 }
 
@@ -1600,6 +1650,11 @@ async fn prompt_session_rename<W: Write>(
     }
 }
 
+/// 会话列表行里 cwd 之前所有固定列的可见宽度总和。
+/// 布局:`{sel:1} {cur:1} {id:<4} {name:<24} {state:<14} {size:>8}  {cwd}`
+/// = 1+1 +1+1 +4+1 +24+1 +14+1 +8+2 = 59。
+const ROW_PREFIX_WIDTH: usize = 59;
+
 fn render_session_list<W: Write>(
     out: &mut W,
     rows: &[SessionListRow],
@@ -1609,31 +1664,20 @@ fn render_session_list<W: Write>(
 ) -> std::io::Result<()> {
     let (cols, rows_count) = term_size;
     write!(out, "\x1b[?2026h\x1b[0m\x1b[2J\x1b[H")?;
-    write_session_list_line(out, "qscreen sessions", cols)?;
-    write_session_list_line(
+    write_text_line(out, "qscreen sessions", Some(color::sgr::HEADER), cols)?;
+    write_text_line(
         out,
         "Up/Down or k/j, Enter switch, c create, r rename, Esc/q cancel",
+        Some(color::sgr::HINT),
         cols,
     )?;
-    write_session_list_line(out, "", cols)?;
+    write_text_line(out, "", None, cols)?;
 
     if rows.is_empty() {
-        write_session_list_line(out, "  no sessions", cols)?;
+        write_text_line(out, "  no sessions", Some(color::sgr::HINT), cols)?;
     } else {
         for (idx, row) in rows.iter().enumerate() {
-            let selector = if idx == selected { ">" } else { " " };
-            let current = if row.is_current { "*" } else { " " };
-            let line = format!(
-                "{} {} {:<4} {:<24} {:<14} {:>8}  {}\r\n",
-                selector,
-                current,
-                truncate_for_terminal(&row.session_id, 4),
-                truncate_for_terminal(&row.name, 24),
-                truncate_for_terminal(&row.state, 14),
-                truncate_for_terminal(&row.size, 8),
-                row.cwd
-            );
-            write_session_list_line(out, line.trim_end_matches("\r\n"), cols)?;
+            write_session_row(out, row, idx == selected, cols)?;
         }
     }
 
@@ -1641,34 +1685,161 @@ fn render_session_list<W: Write>(
     if rows_count > used_lines + 1 {
         write!(out, "\x1b[{};1H", rows_count)?;
     } else {
-        write_session_list_line(out, "", cols)?;
+        write_text_line(out, "", None, cols)?;
     }
-    let mut status_line = if status.is_empty() {
-        "* marks current session".to_string()
+    let (status_text, status_sgr) = if status.is_empty() {
+        ("* marks current session".to_string(), color::sgr::HINT)
     } else {
-        status.to_string()
+        (status.to_string(), status_style(status))
     };
-    status_line = truncate_for_terminal(&status_line, cols as usize);
+    let status_text = truncate_for_terminal(&status_text, cols as usize);
+    let visible = status_text.chars().count();
+    // 状态行是最后一行,不带 CRLF(与原实现一致)。
     write!(out, "\x1b[0m")?;
-    write_padded_line(out, &status_line, cols)?;
+    let colored = color::supported();
+    if colored {
+        write!(out, "\x1b[{status_sgr}m")?;
+    }
+    write!(out, "{status_text}")?;
+    if colored {
+        write!(out, "\x1b[0m")?;
+    }
+    for _ in visible.min(cols as usize)..cols as usize {
+        out.write_all(b" ")?;
+    }
     write!(out, "\x1b[?2026l")?;
     out.flush()
 }
 
-fn write_session_list_line<W: Write>(out: &mut W, line: &str, cols: u16) -> std::io::Result<()> {
+/// 状态行按内容选择颜色:错误类=红,改名成功=绿,其余=暗淡提示。
+fn status_style(status: &str) -> &'static str {
+    let lower = status.to_ascii_lowercase();
+    if lower.contains("fail")
+        || lower.contains("cannot")
+        || lower.contains("error")
+        || lower.contains("no sessions")
+    {
+        color::sgr::ERROR
+    } else if lower.starts_with("renamed") {
+        color::sgr::SUCCESS
+    } else {
+        color::sgr::HINT
+    }
+}
+
+/// 写一整行文本:截断到 `cols`、按需整体着色、右侧补空格填满、以 CRLF 结束。
+fn write_text_line<W: Write>(
+    out: &mut W,
+    text: &str,
+    sgr: Option<&str>,
+    cols: u16,
+) -> std::io::Result<()> {
+    let truncated = truncate_for_terminal(text, cols as usize);
+    let visible = truncated.chars().count();
+    let content = match sgr {
+        Some(s) => color::paint(&truncated, s),
+        None => truncated,
+    };
+    write_list_line(out, &content, visible, None, cols)
+}
+
+/// 底层行写入:`content` 已按可见宽度截断(可含 ANSI 码),`visible` 是其可见宽度。
+/// `wrap_sgr` 用于跨整行(含填充空格)的样式,如选中行的反显;为 `None` 时字节布局
+/// 与原 `write_session_list_line` 完全一致,保证既有测试稳定。
+fn write_list_line<W: Write>(
+    out: &mut W,
+    content: &str,
+    visible: usize,
+    wrap_sgr: Option<&str>,
+    cols: u16,
+) -> std::io::Result<()> {
     write!(out, "\x1b[0m")?;
-    write_padded_line(out, line, cols)?;
+    let wrap = wrap_sgr.filter(|_| color::supported());
+    if let Some(s) = wrap {
+        write!(out, "\x1b[{s}m")?;
+    }
+    out.write_all(content.as_bytes())?;
+    for _ in visible.min(cols as usize)..cols as usize {
+        out.write_all(b" ")?;
+    }
+    if wrap.is_some() {
+        write!(out, "\x1b[0m")?;
+    }
     write!(out, "\r\n")
 }
 
-fn write_padded_line<W: Write>(out: &mut W, line: &str, cols: u16) -> std::io::Result<()> {
-    let line = truncate_for_terminal(line, cols as usize);
-    write!(out, "{line}")?;
-    let width = line.chars().count().min(cols as usize);
-    for _ in width..cols as usize {
-        out.write_all(b" ")?;
+fn write_session_row<W: Write>(
+    out: &mut W,
+    row: &SessionListRow,
+    selected: bool,
+    cols: u16,
+) -> std::io::Result<()> {
+    let selector = if selected { ">" } else { " " };
+
+    // 终端太窄放不下固定列时,退回到「整行截断」的朴素渲染(选中行仍反显)。
+    if (cols as usize) <= ROW_PREFIX_WIDTH {
+        let current = if row.is_current { "*" } else { " " };
+        let plain = format!(
+            "{} {} {:<4} {:<24} {:<14} {:>8}  {}",
+            selector,
+            current,
+            truncate_for_terminal(&row.session_id, 4),
+            truncate_for_terminal(&row.name, 24),
+            truncate_for_terminal(&row.state, 14),
+            truncate_for_terminal(&row.size, 8),
+            row.cwd
+        );
+        let truncated = truncate_for_terminal(&plain, cols as usize);
+        let visible = truncated.chars().count();
+        let wrap = if selected { Some("7") } else { None };
+        return write_list_line(out, &truncated, visible, wrap, cols);
     }
-    Ok(())
+
+    let cwd_budget = cols as usize - ROW_PREFIX_WIDTH;
+    let id = truncate_for_terminal(&row.session_id, 4);
+    let name = truncate_for_terminal(&row.name, 24);
+    let state = truncate_for_terminal(&row.state, 14);
+    let size = truncate_for_terminal(&row.size, 8);
+    let cwd = truncate_for_terminal(&row.cwd, cwd_budget);
+    let visible = ROW_PREFIX_WIDTH + cwd.chars().count();
+
+    if selected {
+        // 整行反显;不再叠加逐列前景色,避免与反显互相干扰。
+        let current = if row.is_current { "*" } else { " " };
+        let content = format!(
+            "{} {} {:<4} {:<24} {:<14} {:>8}  {}",
+            selector, current, id, name, state, size, cwd
+        );
+        write_list_line(out, &content, visible, Some("7"), cols)
+    } else if color::supported() {
+        // 逐列着色:id 青、name 加粗、state 按状态、size 青、cwd 蓝、当前标记绿。
+        let current = if row.is_current {
+            color::paint("*", color::sgr::CURRENT)
+        } else {
+            " ".to_string()
+        };
+        let content = format!(
+            "{} {} {} {} {} {}  {}",
+            selector,
+            current,
+            color::paint(&format!("{id:<4}"), color::sgr::ID),
+            color::paint(&format!("{name:<24}"), color::sgr::NAME),
+            color::paint(
+                &format!("{state:<14}"),
+                color::state_sgr(row.exited, row.attached)
+            ),
+            color::paint(&format!("{size:>8}"), color::sgr::SIZE),
+            color::paint(&cwd, color::sgr::CWD),
+        );
+        write_list_line(out, &content, visible, None, cols)
+    } else {
+        let current = if row.is_current { "*" } else { " " };
+        let content = format!(
+            "{} {} {:<4} {:<24} {:<14} {:>8}  {}",
+            selector, current, id, name, state, size, cwd
+        );
+        write_list_line(out, &content, visible, None, cols)
+    }
 }
 
 fn truncate_for_terminal(value: &str, width: usize) -> String {

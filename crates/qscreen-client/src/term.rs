@@ -33,6 +33,19 @@ pub fn preflight_interactive() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 尝试开启 Windows 控制台的 VT 输出处理,返回是否可用。非 attach 命令
+/// (如 `ls`、彩色帮助)也依赖它,因此色彩检测会在着色前调用一次。
+/// 非 Windows 平台默认支持 ANSI,恒为 `true`。
+#[cfg(windows)]
+pub fn enable_windows_vt_output() -> bool {
+    enable_virtual_terminal_output().is_ok()
+}
+
+#[cfg(not(windows))]
+pub fn enable_windows_vt_output() -> bool {
+    true
+}
+
 /// 打开 stdout 控制台的 `ENABLE_VIRTUAL_TERMINAL_PROCESSING`,让裸 ANSI/VT
 /// 转义序列在 Windows 控制台(含传统 conhost)里被正确解释。
 #[cfg(windows)]
