@@ -672,13 +672,22 @@ fn format_session_line(s: &SessionInfo) -> String {
         s.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     };
     format!(
-        "{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}",
         s.session_id,
         s.name,
         session_state_label(s),
         created,
-        session_size_label(s)
+        session_size_label(s),
+        session_cwd_label(s)
     )
+}
+
+fn session_cwd_label(session: &SessionInfo) -> String {
+    if session.cwd.is_empty() {
+        "-".to_string()
+    } else {
+        session.cwd.clone()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -687,6 +696,7 @@ struct SessionListRow {
     name: String,
     state: String,
     size: String,
+    cwd: String,
     is_current: bool,
     exited: bool,
     attached: bool,
@@ -710,6 +720,7 @@ fn build_session_list_rows(
             name: session.name.clone(),
             state: session_state_label(session),
             size: session_size_label(session),
+            cwd: session_cwd_label(session),
             is_current: session.session_id == current_session_id,
             exited: session.exited,
             attached: session.attached,
@@ -1613,13 +1624,14 @@ fn render_session_list<W: Write>(
             let selector = if idx == selected { ">" } else { " " };
             let current = if row.is_current { "*" } else { " " };
             let line = format!(
-                "{} {} {:<4} {:<24} {:<14} {:>8}\r\n",
+                "{} {} {:<4} {:<24} {:<14} {:>8}  {}\r\n",
                 selector,
                 current,
                 truncate_for_terminal(&row.session_id, 4),
                 truncate_for_terminal(&row.name, 24),
                 truncate_for_terminal(&row.state, 14),
-                truncate_for_terminal(&row.size, 8)
+                truncate_for_terminal(&row.size, 8),
+                row.cwd
             );
             write_session_list_line(out, line.trim_end_matches("\r\n"), cols)?;
         }
@@ -1951,6 +1963,7 @@ mod tests {
             width,
             height,
             size: String::new(),
+            cwd: String::new(),
         }
     }
 
@@ -2380,11 +2393,21 @@ mod tests {
     fn format_session_line_uses_attached_bool_for_live_sessions() {
         assert_eq!(
             format_session_line(&session("1", "work", true, false, 100, 30)),
-            "1\twork\tattached\t-\t100x30"
+            "1\twork\tattached\t-\t100x30\t-"
         );
         assert_eq!(
             format_session_line(&session("2", "idle", false, false, 80, 24)),
-            "2\tidle\tdetached\t-\t80x24"
+            "2\tidle\tdetached\t-\t80x24\t-"
+        );
+    }
+
+    #[test]
+    fn format_session_line_includes_cwd_when_present() {
+        let mut info = session("1", "work", false, false, 80, 24);
+        info.cwd = r"C:\work".to_string();
+        assert_eq!(
+            format_session_line(&info),
+            "1\twork\tdetached\t-\t80x24\tC:\\work"
         );
     }
 

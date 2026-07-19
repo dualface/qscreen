@@ -185,6 +185,7 @@ impl ScrollbackBuf {
 pub struct Session {
     pub session_id: String,
     name: Arc<Mutex<String>>,
+    pub cwd: String,
     pub created_at: DateTime<Utc>,
     width: Arc<Mutex<u16>>,
     height: Arc<Mutex<u16>>,
@@ -253,6 +254,7 @@ impl Session {
 
         let mut cmd = default_shell_command(shell).context("resolve shell command")?;
         apply_working_directory(&mut cmd, cwd)?;
+        let resolved_cwd = resolve_session_cwd(cwd);
         let child = pair.slave.spawn_command(cmd).context("spawn shell")?;
         let child_killer = Arc::new(Mutex::new(Some(child.clone_killer())));
         drop(pair.slave);
@@ -275,6 +277,7 @@ impl Session {
         let sess = Arc::new(Session {
             session_id,
             name: Arc::new(Mutex::new(name.clone())),
+            cwd: resolved_cwd,
             created_at: Utc::now(),
             width: Arc::new(Mutex::new(w)),
             height: Arc::new(Mutex::new(h)),
@@ -1034,6 +1037,17 @@ fn apply_working_directory(cmd: &mut CommandBuilder, cwd: Option<&str>) -> anyho
     }
     cmd.cwd(cwd);
     Ok(())
+}
+
+/// 返回会话实际使用的工作目录：显式指定则用它，否则回退到 daemon 当前目录。
+fn resolve_session_cwd(cwd: Option<&str>) -> String {
+    if let Some(cwd) = cwd.filter(|value| !value.is_empty()) {
+        return cwd.to_string();
+    }
+    std::env::current_dir()
+        .ok()
+        .and_then(|path| path.to_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

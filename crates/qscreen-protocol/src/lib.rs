@@ -147,6 +147,8 @@ pub struct SessionInfo {
     pub height: u32,
     #[serde(skip_serializing_if = "String::is_empty", default)]
     pub size: String,
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub cwd: String,
 }
 
 // ── Message (公开 API) ───────────────────────────────────────────────────────

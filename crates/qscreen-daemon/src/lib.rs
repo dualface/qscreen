@@ -139,6 +139,7 @@ fn session_info(s: &Session) -> SessionInfo {
         width: w,
         height: h,
         size: format!("{}x{}", w, h),
+        cwd: s.cwd.clone(),
     }
 }
 
