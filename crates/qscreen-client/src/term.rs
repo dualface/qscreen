@@ -11,10 +11,10 @@ const PREPARE_ATTACH: &[u8] = b"\x1b[?1049h\x1b[?1004h\x1b[2J\x1b[H";
 const RESTORE_AFTER_ATTACH: &[u8] =
     b"\x1b[?2026l\x1b[?1l\x1b[?2004l\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1004l\x1b[?25h\x1b[0m\x1b[0 q\x1b[r\x1b[?1049l";
 
-/// attach 前的运行环境预检:
-/// 1. 要求 stdin/stdout 都是交互式终端(否则渲染转义序列没有意义);
-/// 2. 在 Windows 上主动开启控制台 VT 输出处理,这样连传统 conhost 也能正确渲染,
-///    失败时只警告、不中断(交给用户换 Windows Terminal)。
+/// Environment preflight before attach:
+/// 1. Require both stdin/stdout to be interactive terminals (otherwise rendering escape sequences is meaningless);
+/// 2. On Windows, proactively enable console VT output processing so even legacy conhost renders correctly;
+///    on failure, only warn without aborting (leaving it to the user to switch to Windows Terminal).
 pub fn preflight_interactive() -> anyhow::Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         anyhow::bail!(
@@ -33,9 +33,10 @@ pub fn preflight_interactive() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 尝试开启 Windows 控制台的 VT 输出处理,返回是否可用。非 attach 命令
-/// (如 `ls`、彩色帮助)也依赖它,因此色彩检测会在着色前调用一次。
-/// 非 Windows 平台默认支持 ANSI,恒为 `true`。
+/// Try to enable VT output processing on the Windows console, returning whether
+/// it is available. Non-attach commands (such as `ls` and colored help) also
+/// depend on it, so color detection calls this once before coloring.
+/// On non-Windows platforms ANSI is supported by default, so this is always `true`.
 #[cfg(windows)]
 pub fn enable_windows_vt_output() -> bool {
     enable_virtual_terminal_output().is_ok()
@@ -46,8 +47,9 @@ pub fn enable_windows_vt_output() -> bool {
     true
 }
 
-/// 打开 stdout 控制台的 `ENABLE_VIRTUAL_TERMINAL_PROCESSING`,让裸 ANSI/VT
-/// 转义序列在 Windows 控制台(含传统 conhost)里被正确解释。
+/// Enable `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on the stdout console so raw
+/// ANSI/VT escape sequences are interpreted correctly by the Windows console
+/// (including legacy conhost).
 #[cfg(windows)]
 fn enable_virtual_terminal_output() -> std::io::Result<()> {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
@@ -56,7 +58,7 @@ fn enable_virtual_terminal_output() -> std::io::Result<()> {
         SetConsoleMode,
     };
 
-    // SAFETY: 只是获取标准输出句柄并读改控制台模式,句柄无需释放。
+    // SAFETY: we only fetch the standard output handle and read/modify the console mode; the handle does not need to be released.
     unsafe {
         let handle = GetStdHandle(STD_OUTPUT_HANDLE);
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {

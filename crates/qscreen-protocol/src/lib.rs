@@ -2,7 +2,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-// 与 Go wire.go 保持字节兼容的常量
+// Constants kept byte-compatible with Go wire.go
 pub const MAX_CONTROL_MESSAGE_SIZE: usize = 64 * 1024;
 pub const MAX_PAYLOAD_SIZE: usize = 64 * 1024;
 pub const MAX_WIRE_MESSAGE_SIZE: usize =
@@ -17,7 +17,7 @@ pub const MAX_TERMINAL_HEIGHT: u32 = 500;
 pub const DEFAULT_WIDTH: u32 = 80;
 pub const DEFAULT_HEIGHT: u32 = 24;
 
-// ── 枚举类型 ────────────────────────────────────────────────────────────────
+// ── Enum types ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -151,7 +151,7 @@ pub struct SessionInfo {
     pub cwd: String,
 }
 
-// ── Message (公开 API) ───────────────────────────────────────────────────────
+// ── Message (public API) ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]
 pub struct Message {
@@ -175,7 +175,7 @@ pub struct Message {
     pub attach_mode: AttachMode,
 }
 
-// ── Wire 格式 (JSON 序列化用) ────────────────────────────────────────────────
+// ── Wire format (for JSON serialization) ─────────────────────────────────────
 
 #[derive(Serialize, Deserialize)]
 struct WireMessage {
@@ -242,10 +242,10 @@ fn is_frame_mouse_encoding_default(v: &FrameMouseEncoding) -> bool {
     *v == FrameMouseEncoding::Default
 }
 
-// ── 编解码 ────────────────────────────────────────────────────────────────
+// ── Encoding/decoding ───────────────────────────────────────────────────────
 
 impl Message {
-    /// 序列化为 JSON line（末尾加 \n）
+    /// Serialize to a JSON line (appends a trailing \n)
     pub fn to_json_line(&self) -> anyhow::Result<Vec<u8>> {
         if self.payload.len() > MAX_PAYLOAD_SIZE {
             anyhow::bail!(
@@ -302,7 +302,7 @@ impl Message {
         Ok(bytes)
     }
 
-    /// 从 JSON 字符串（含可选尾部空白）解析
+    /// Parse from a JSON string (with optional trailing whitespace)
     pub fn from_json(s: &str) -> anyhow::Result<Self> {
         let s = s.trim();
         if s.len() > MAX_FRAME_MESSAGE_SIZE {
@@ -370,7 +370,7 @@ impl Message {
     }
 }
 
-// ── 校验工具 ─────────────────────────────────────────────────────────────────
+// ── Validation helpers ──────────────────────────────────────────────────────
 
 pub fn validate_session_name(name: &str) -> anyhow::Result<()> {
     if name.is_empty() {
@@ -436,7 +436,7 @@ pub fn validate_new_size(width: u32, height: u32) -> anyhow::Result<()> {
     validate_resize(width, height)
 }
 
-// ── 错误消息 helper（与 Go 版本字符串一致）───────────────────────────────────
+// ── Error message helpers (strings match the Go version) ─────────────────────
 
 pub fn missing_session_error(session_id: &str) -> String {
     format!("session_id {:?} not found", session_id)
@@ -450,7 +450,7 @@ pub fn attached_session_error(session_id: &str) -> String {
     format!("session_id {:?} is already attached", session_id)
 }
 
-// ── 单元测试 ──────────────────────────────────────────────────────────────────
+// ── Unit tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -577,7 +577,7 @@ mod tests {
             ..Default::default()
         };
         let line = msg.to_json_line().unwrap();
-        // 检查 payload_b64 字段名兼容 Go
+        // Check that the payload_b64 field name is compatible with Go
         let json_str = std::str::from_utf8(&line).unwrap();
         assert!(
             json_str.contains("payload_b64"),

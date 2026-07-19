@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 pub const PIPE_PREFIX: &str = r"\\.\pipe\qscreen-";
 
-/// IPC 名称：Windows 为 Named Pipe，Unix 为 Unix domain socket 路径。
+/// IPC name: a Named Pipe on Windows, a Unix domain socket path on Unix.
 pub fn pipe_name() -> String {
     let user = current_user();
     #[cfg(windows)]
@@ -18,7 +18,7 @@ pub fn pipe_name() -> String {
     }
 }
 
-/// Daemon 日志路径：Windows 用 %TEMP%，Unix 用 ${TMPDIR:-/tmp}。
+/// Daemon log path: uses %TEMP% on Windows, ${TMPDIR:-/tmp} on Unix.
 pub fn daemon_log_path() -> PathBuf {
     let user = sanitize_pipe_user(&current_user());
     #[cfg(windows)]
@@ -34,8 +34,9 @@ pub fn daemon_log_path() -> PathBuf {
     }
 }
 
-/// Client 日志路径：与 [`daemon_log_path`] 同目录，用于记录客户端侧的诊断信息
-/// （例如色彩支持检测结果）。Windows 用 %TEMP%，Unix 用 ${TMPDIR:-/tmp}。
+/// Client log path: same directory as [`daemon_log_path`], used to record
+/// client-side diagnostics (for example, color support detection results).
+/// Uses %TEMP% on Windows, ${TMPDIR:-/tmp} on Unix.
 pub fn client_log_path() -> PathBuf {
     let user = sanitize_pipe_user(&current_user());
     #[cfg(windows)]
@@ -66,7 +67,7 @@ pub fn current_user() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
-/// 仅保留 [A-Za-z0-9_-]，其余字符替换为 '_'
+/// Keep only [A-Za-z0-9_-]; replace all other characters with '_'
 pub fn sanitize_pipe_user(user: &str) -> String {
     user.chars()
         .map(|c| {

@@ -154,7 +154,7 @@ impl SessionEventQueue {
     }
 }
 
-/// 256KB 环形 scrollback buffer（字节级）
+/// 256KB ring scrollback buffer (byte-level)
 pub struct ScrollbackBuf {
     data: Vec<u8>,
 }
@@ -194,16 +194,16 @@ pub struct Session {
     pub exit_code: Arc<Mutex<Option<i32>>>,
     pub closed: Arc<AtomicBool>,
     exit_tx: watch::Sender<bool>,
-    /// PTY master：仅用于 resize（take_writer 后 write 走 pty_writer）
+    /// PTY master: used only for resize (after take_writer, writes go through pty_writer)
     pty_master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
-    /// PTY writer：写 input
+    /// PTY writer: writes input
     pty_writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     child_killer: Arc<Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>>,
     cursor_shape: Arc<Mutex<u8>>,
     pub scrollback: Arc<Mutex<ScrollbackBuf>>,
     screen: Arc<Mutex<vt100::Parser>>,
     event_lock: Arc<Mutex<()>>,
-    /// 已 attach 客户端；空 map = detached
+    /// Attached clients; empty map = detached
     pub attached_clients: Arc<Mutex<HashMap<ClientId, AttachedClient>>>,
     pub active_client_id: Arc<Mutex<Option<ClientId>>>,
     next_client_id: Arc<Mutex<ClientId>>,
@@ -249,7 +249,7 @@ impl Session {
             })
             .context("openpty failed")?;
 
-        // 先拿 reader 和 writer，再把 master 包进 Arc<Mutex>
+        // Grab the reader and writer first, then wrap master into Arc<Mutex>
         let pty_reader = pair.master.try_clone_reader().context("try_clone_reader")?;
         let pty_writer = pair.master.take_writer().context("take_writer")?;
 
@@ -298,7 +298,7 @@ impl Session {
             next_client_id,
         });
 
-        // PTY output 读取任务：先 coalesce，再原子更新 parser，避免 reattach 捕获半帧。
+        // PTY output reader task: coalesce first, then atomically update the parser to avoid reattach capturing a half frame.
         {
             spawn_coalesced_reader(
                 pty_reader,
@@ -315,7 +315,7 @@ impl Session {
             );
         }
 
-        // 子进程退出等待任务
+        // Child process exit wait task
         {
             let attached_e = attached_clients.clone();
             let active_client_e = active_client_id.clone();
@@ -405,7 +405,7 @@ impl Session {
         Ok((client.width, client.height))
     }
 
-    /// 写输入到 PTY（forwarded from client Input 命令）
+    /// Write input to the PTY (forwarded from client Input command)
     pub fn write_input(&self, data: &[u8]) -> anyhow::Result<()> {
         self.ensure_open()?;
         let mut guard = self.pty_writer.lock().unwrap();
@@ -427,8 +427,8 @@ impl Session {
         self.scrollback.lock().unwrap().snapshot()
     }
 
-    /// Attach 一个客户端：注册事件发送端并返回初始事件（frame 或 scrollback bytes）
-    /// 返回 Err 如果 session 已退出
+    /// Attach a client: register the event sender and return the initial event (frame or scrollback bytes)
+    /// Returns Err if the session has already exited
     pub fn attach(
         &self,
         queue: Arc<SessionEventQueue>,
@@ -531,7 +531,7 @@ impl Session {
         Ok(())
     }
 
-    /// Detach 指定客户端（幂等）
+    /// Detach the specified client (idempotent)
     pub fn detach(&self, client_id: ClientId) {
         let mut attached = self.attached_clients.lock().unwrap();
         if let Some(client) = attached.get_mut(&client_id) {
@@ -547,7 +547,7 @@ impl Session {
         }
     }
 
-    /// Disconnect 指定客户端连接（幂等）
+    /// Disconnect the specified client connection (idempotent)
     pub fn disconnect(&self, client_id: ClientId) {
         self.attached_clients.lock().unwrap().remove(&client_id);
         if *self.active_client_id.lock().unwrap() == Some(client_id) {
@@ -555,16 +555,16 @@ impl Session {
         }
     }
 
-    /// 关闭 session（kill PTY）
+    /// Close the session (kill PTY)
     pub fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
         if let Some(mut killer) = self.child_killer.lock().unwrap().take() {
             let _ = killer.kill();
         }
-        // 丢弃 writer 和 master → PTY 管道关闭 → reader task 结束
+        // Drop writer and master → PTY pipe closes → reader task ends
         self.pty_writer.lock().unwrap().take();
         self.pty_master.lock().unwrap().take();
-        // 通知已 attach 的客户端
+        // Notify the attached clients
         let mut attached = self.attached_clients.lock().unwrap();
         for (_, client) in attached.drain() {
             client.queue.push_exit_for_mode(-1, client.attach_mode);
@@ -1040,7 +1040,7 @@ fn apply_working_directory(cmd: &mut CommandBuilder, cwd: Option<&Path>) -> anyh
     Ok(())
 }
 
-/// 返回会话实际使用的工作目录：显式指定则用它，否则回退到 daemon 当前目录。
+/// Return the working directory the session actually uses: use the explicitly specified one if given, otherwise fall back to the daemon's current directory.
 fn resolve_session_cwd(cwd: Option<&Path>) -> String {
     if let Some(cwd) = cwd.filter(|value| !value.as_os_str().is_empty()) {
         return cwd.to_string_lossy().into_owned();

@@ -128,25 +128,25 @@ fn take_prefix_arg(args: Vec<String>) -> anyhow::Result<(Option<String>, Vec<Str
     Ok((prefix, remaining))
 }
 
-// ── 入口 ─────────────────────────────────────────────────────────────────────
+// ── Entry ────────────────────────────────────────────────────────────────────
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // --daemon 模式：启动 daemon 服务器
+    // --daemon mode: start the daemon server
     if args.first().map(|s| s.as_str()) == Some("--daemon") {
         run_daemon_mode();
         return;
     }
 
-    // CLI client 模式
+    // CLI client mode
     if let Err(e) = run_client(args) {
         eprintln!("{}", color::paint_err(&e.to_string(), color::sgr::ERROR));
         std::process::exit(1);
     }
 }
 
-// ── Daemon 模式 ───────────────────────────────────────────────────────────────
+// ── Daemon mode ──────────────────────────────────────────────────────────────
 
 fn run_daemon_mode() {
     let log_path = daemon_log_path();
@@ -175,10 +175,10 @@ fn run_daemon_mode() {
     }
 }
 
-// ── Client 模式 ───────────────────────────────────────────────────────────────
+// ── Client mode ──────────────────────────────────────────────────────────────
 
 fn run_client(args: Vec<String>) -> anyhow::Result<()> {
-    // 每次运行 qscn 时先检查运行环境是否支持色彩,并记录检查结果。
+    // On every qscn run, first check whether the environment supports color and record the result.
     color::init_and_record();
     let (config, args) = parse_client_config(args)?;
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -300,7 +300,7 @@ fn missing_option_value(option: &str) -> String {
     format!("missing value for {option}")
 }
 
-// ── 语言检测 ──────────────────────────────────────────────────────────────────
+// ── Language detection ───────────────────────────────────────────────────────
 
 static IS_CHINESE: OnceLock<bool> = OnceLock::new();
 
@@ -338,7 +338,7 @@ fn windows_locale_is_chinese() -> bool {
     false
 }
 
-// ── 帮助文本 ──────────────────────────────────────────────────────────────────
+// ── Help text ────────────────────────────────────────────────────────────────
 
 fn print_help() {
     let raw = if is_chinese() {
@@ -349,8 +349,10 @@ fn print_help() {
     print!("{}", colorize_help(raw));
 }
 
-/// 给帮助文本着色:首行标题与形如 `Xxx:` 的分节标题用加粗青色,其余保持原样。
-/// stdout 不支持色彩时 [`color::paint`] 原样返回,输出与未着色版本一致。
+/// Colorize the help text: the first-line title and section headings of the
+/// form `Xxx:` use bold cyan, everything else stays as-is. When stdout lacks
+/// color support, [`color::paint`] returns text unchanged, matching the
+/// uncolored version.
 fn colorize_help(raw: &str) -> String {
     let mut out = String::new();
     for (idx, line) in raw.lines().enumerate() {
@@ -476,7 +478,7 @@ Examples:
 "#
 }
 
-// ── 子命令实现 ────────────────────────────────────────────────────────────────
+// ── Subcommand implementations ───────────────────────────────────────────────
 
 async fn cmd_default(config: ClientConfig) -> anyhow::Result<()> {
     let sessions = list_sessions().await?;
@@ -511,7 +513,7 @@ async fn cmd_new_and_attach(
     cwd: Option<&str>,
     config: ClientConfig,
 ) -> anyhow::Result<()> {
-    // 预检放在创建 session 之前,避免预检失败时留下无法 attach 的孤儿 session。
+    // Run preflight before creating the session, so a failed preflight does not leave an un-attachable orphan session.
     term::preflight_interactive()?;
     if !name.is_empty() {
         validate_session_name(name)?;
@@ -587,8 +589,9 @@ fn cwd_for_request(cwd: Option<&str>) -> anyhow::Result<CwdRequest> {
                 .join(path)
         }
     } else {
-        // 未显式指定 --cwd 时, 继承客户端(父环境)的当前工作目录,
-        // 否则 session 会落到常驻 daemon 的启动目录而非用户执行 `qscn new` 的目录。
+        // When --cwd is not given explicitly, inherit the client's (parent's)
+        // current working directory; otherwise the session would land in the
+        // resident daemon's startup directory rather than where the user ran `qscn new`.
         std::env::current_dir().context("resolve current directory for session cwd")?
     };
     cwd_request_from_path(&path)
@@ -694,14 +697,14 @@ async fn list_sessions() -> anyhow::Result<Vec<SessionInfo>> {
     Ok(resp.sessions)
 }
 
-/// 通过 daemon 新建一个使用默认名称/shell 的 session，返回其 session_id。
-/// `cwd` 为 `Some(非空)` 时新 session 继承该目录,否则回退到客户端当前目录。
+/// Create a new session via the daemon using the default name/shell, returning its session_id.
+/// When `cwd` is `Some(non-empty)`, the new session inherits that directory; otherwise it falls back to the client's current directory.
 async fn create_session_in(cwd: Option<&str>) -> anyhow::Result<String> {
     let cwd = cwd.filter(|value| !value.is_empty());
     create_session_with_options("", None, cwd).await
 }
 
-/// 为指定 session 改名。名字先经过校验，再发送 Rename 请求。
+/// Rename the given session. The name is validated first, then a Rename request is sent.
 async fn rename_session(session_id: &str, name: &str) -> anyhow::Result<()> {
     validate_session_name(name)?;
     let mut conn = ensure_and_connect().await?;
@@ -750,7 +753,7 @@ fn format_session_line(s: &SessionInfo) -> String {
     )
 }
 
-/// 与 [`format_session_line`] 相同的列布局,但逐列着色(仅当 stdout 支持色彩时调用)。
+/// Same column layout as [`format_session_line`], but colored per column (called only when stdout supports color).
 fn colored_session_line(s: &SessionInfo) -> String {
     format!(
         "{}\t{}\t{}\t{}\t{}\t{}",
@@ -793,7 +796,7 @@ struct SessionListRow {
     state: String,
     size: String,
     cwd: String,
-    /// 未经转义的原始工作目录,供「在列表里创建 session」继承 cwd 使用。
+    /// Raw, unescaped working directory, used so "create a session from the list" can inherit its cwd.
     cwd_raw: String,
     is_current: bool,
     exited: bool,
@@ -869,7 +872,7 @@ fn move_session_list_selection(selected: usize, len: usize, delta: isize) -> usi
     }
 }
 
-// ── Attach 实现 ───────────────────────────────────────────────────────────────
+// ── Attach implementation ────────────────────────────────────────────────────
 
 async fn attach_session_loop(initial_session_id: &str, config: ClientConfig) -> anyhow::Result<()> {
     let mut session_id = initial_session_id.to_string();
@@ -958,7 +961,7 @@ impl Drop for TerminalCleanupGuard {
     }
 }
 
-// ── 键盘事件 → PTY 字节序列 ───────────────────────────────────────────────────
+// ── Keyboard event → PTY byte sequence ───────────────────────────────────────
 
 fn key_event_to_bytes(
     event: crossterm::event::KeyEvent,
@@ -975,8 +978,8 @@ fn key_event_to_bytes(
     };
 
     match event.code {
-        // Backspace → DEL (0x7f)：ConPTY 把 0x7f 翻译成 Backspace 键，
-        // 而 0x08 会被翻译成 Ctrl+Backspace，PSReadLine 会按 BackwardKillWord 删除整个单词
+        // Backspace → DEL (0x7f): ConPTY translates 0x7f into the Backspace key,
+        // while 0x08 is translated into Ctrl+Backspace, which PSReadLine treats as BackwardKillWord and deletes a whole word.
         KeyCode::Backspace if ctrl => vec![0x08],
         KeyCode::Backspace if alt => vec![0x1b, 0x7f],
         KeyCode::Backspace => vec![0x7f],
@@ -991,7 +994,7 @@ fn key_event_to_bytes(
             }
         }
         KeyCode::Esc => vec![0x1b],
-        // Delete → CSI 3~：0x7f 会被 ConPTY 当成 Backspace 处理
+        // Delete → CSI 3~: 0x7f would be treated as Backspace by ConPTY
         KeyCode::Delete => tilde_key(3, modifier),
 
         KeyCode::Up => cursor_key(cursor_prefix, 'A', modifier),
@@ -1163,7 +1166,7 @@ fn mouse_mode_reports(mode: FrameMouseMode, pressed: bool, motion: bool) -> bool
     }
 }
 
-// ── Attach 主循环 ─────────────────────────────────────────────────────────────
+// ── Attach main loop ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AttachAction {
@@ -1466,7 +1469,7 @@ fn spawn_attach_input_reader(
                 break;
             };
             match event {
-                // 只处理按键按下事件，避免 key-up 重复输入
+                // Only handle key-press events, to avoid duplicate input from key-up
                 Event::Key(key_event)
                     if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
@@ -1527,8 +1530,8 @@ async fn run_session_list_mode<W: Write>(
             }
             SessionListAction::Cancel => return Ok(SessionListSelection::Close),
             SessionListAction::Create => {
-                // 继承光标所在 session 的 cwd,让新 session 开在同一目录;
-                // 该 session 无已知 cwd 时回退到 create_session 的默认行为(客户端当前目录)。
+                // Inherit the cwd of the session under the cursor so the new session opens in the same directory;
+                // if that session has no known cwd, fall back to create_session's default behavior (the client's current directory).
                 let inherit_cwd = rows.get(selected).map(|row| row.cwd_raw.clone());
                 match create_session_in(inherit_cwd.as_deref()).await {
                     Ok(new_session_id) => return Ok(SessionListSelection::Switch(new_session_id)),
@@ -1670,7 +1673,7 @@ async fn read_name_edit_key() -> anyhow::Result<NameEditKey> {
     .await?
 }
 
-/// 在会话列表底部行内提示用户输入新名字。返回 Some(name) 表示提交，None 表示取消。
+/// Prompt the user for a new name inline in the session list's bottom row. Returns Some(name) on submit, None on cancel.
 async fn prompt_session_rename<W: Write>(
     stdout: &mut W,
     rows: &[SessionListRow],
@@ -1704,9 +1707,9 @@ async fn prompt_session_rename<W: Write>(
     }
 }
 
-/// 会话列表行里 cwd 之前所有固定列的可见宽度总和。
-/// 布局:`{sel:1} {cur:1} {id:<4} {name:<24} {state:<14} {size:>8}  {cwd}`
-/// = 1+1 +1+1 +4+1 +24+1 +14+1 +8+2 = 59。
+/// Total visible width of all fixed columns before cwd in a session list row.
+/// Layout: `{sel:1} {cur:1} {id:<4} {name:<24} {state:<14} {size:>8}  {cwd}`
+/// = 1+1 +1+1 +4+1 +24+1 +14+1 +8+2 = 59.
 const ROW_PREFIX_WIDTH: usize = 59;
 
 fn render_session_list<W: Write>(
@@ -1743,7 +1746,7 @@ fn render_session_list<W: Write>(
     };
     let status_text = truncate_for_terminal(&status_text, cols as usize);
     let visible = UnicodeWidthStr::width(status_text.as_str());
-    // 状态行是最后一行,不带 CRLF(与原实现一致)。
+    // The status line is the last line and carries no CRLF (matching the original implementation).
     write!(out, "\x1b[0m")?;
     let colored = color::supported();
     if colored {
@@ -1760,7 +1763,7 @@ fn render_session_list<W: Write>(
     out.flush()
 }
 
-/// 状态行按内容选择颜色:错误类=红,改名成功=绿,其余=暗淡提示。
+/// Pick the status line color by content: errors=red, successful rename=green, everything else=dim hint.
 fn status_style(status: &str) -> &'static str {
     let lower = status.to_ascii_lowercase();
     if lower.contains("fail")
@@ -1776,10 +1779,10 @@ fn status_style(status: &str) -> &'static str {
     }
 }
 
-/// 会话列表的操作提示行:把快捷键片段高亮(加粗黄),描述文字保持暗淡。
-/// 无色环境下退化为纯文本,可见宽度与上色前一致,布局不受影响。
+/// The session list's action hint line: highlight shortcut fragments (bold yellow) while keeping description text dim.
+/// In a colorless environment it degrades to plain text with the same visible width, so the layout is unaffected.
 fn write_session_list_hint<W: Write>(out: &mut W, cols: u16) -> std::io::Result<()> {
-    // (片段文本, 是否为快捷键)。拼接后即原提示串,便于按可见宽度截断。
+    // (fragment text, whether it is a shortcut key). Concatenated they form the original hint string, so it can be truncated by visible width.
     const SEGMENTS: &[(&str, bool)] = &[
         ("Up/Down", true),
         (" or ", false),
@@ -1811,13 +1814,13 @@ fn write_session_list_hint<W: Write>(out: &mut W, cols: u16) -> std::io::Result<
         } else {
             color::sgr::HINT
         };
-        // color::paint 在无色环境下原样返回,因此此分支同时覆盖有色/无色两种情况。
+        // color::paint returns text unchanged in a colorless environment, so this branch covers both the colored and colorless cases.
         content.push_str(&color::paint(&piece, sgr));
     }
     write_list_line(out, &content, visible, None, cols)
 }
 
-/// 写一整行文本:截断到 `cols`、按需整体着色、右侧补空格填满、以 CRLF 结束。
+/// Write a full line of text: truncate to `cols`, optionally color the whole line, pad the right with spaces, and end with CRLF.
 fn write_text_line<W: Write>(
     out: &mut W,
     text: &str,
@@ -1833,9 +1836,11 @@ fn write_text_line<W: Write>(
     write_list_line(out, &content, visible, None, cols)
 }
 
-/// 底层行写入:`content` 已按可见宽度截断(可含 ANSI 码),`visible` 是其可见宽度。
-/// `wrap_sgr` 用于跨整行(含填充空格)的样式,如选中行的反显;为 `None` 时字节布局
-/// 与原 `write_session_list_line` 完全一致,保证既有测试稳定。
+/// Low-level line write: `content` is already truncated by visible width (may
+/// contain ANSI codes), and `visible` is its visible width. `wrap_sgr` applies
+/// a style across the whole line (including padding spaces), such as the reverse
+/// video of the selected row; when `None`, the byte layout matches the original
+/// `write_session_list_line` exactly, keeping existing tests stable.
 fn write_list_line<W: Write>(
     out: &mut W,
     content: &str,
@@ -1866,7 +1871,7 @@ fn write_session_row<W: Write>(
 ) -> std::io::Result<()> {
     let selector = if selected { ">" } else { " " };
 
-    // 终端太窄放不下固定列时,退回到「整行截断」的朴素渲染(选中行仍反显)。
+    // When the terminal is too narrow for the fixed columns, fall back to naive whole-line truncation (the selected row is still reverse-video).
     if (cols as usize) <= ROW_PREFIX_WIDTH {
         let current = if row.is_current { "*" } else { " " };
         let plain = format!(
@@ -1894,7 +1899,7 @@ fn write_session_row<W: Write>(
     let visible = ROW_PREFIX_WIDTH + UnicodeWidthStr::width(cwd.as_str());
 
     if selected {
-        // 整行反显;不再叠加逐列前景色,避免与反显互相干扰。
+        // Reverse-video the whole line; do not also apply per-column foreground colors, to avoid interfering with the reverse video.
         let current = if row.is_current { "*" } else { " " };
         let content = format!(
             "{} {} {:<4} {:<24} {:<14} {:>8}  {}",
@@ -1902,7 +1907,7 @@ fn write_session_row<W: Write>(
         );
         write_list_line(out, &content, visible, Some("7"), cols)
     } else if color::supported() {
-        // 逐列着色:id 青、name 加粗、state 按状态、size 青、cwd 蓝、当前标记绿。
+        // Per-column coloring: id cyan, name bold, state by status, size cyan, cwd blue, current marker green.
         let current = if row.is_current {
             color::paint("*", color::sgr::CURRENT)
         } else {
@@ -1965,7 +1970,7 @@ fn session_list_action_enabled() -> bool {
     true
 }
 
-// ── 连接工具 ──────────────────────────────────────────────────────────────────
+// ── Connection helpers ───────────────────────────────────────────────────────
 
 struct TcpConn {
     #[cfg(windows)]
@@ -2042,7 +2047,7 @@ fn spawn_daemon() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── 协议辅助 ──────────────────────────────────────────────────────────────────
+// ── Protocol helpers ─────────────────────────────────────────────────────────
 
 async fn send_msg(conn: &mut TcpConn, msg: Message) -> anyhow::Result<()> {
     let bytes = msg.to_json_line()?;
@@ -2081,7 +2086,7 @@ fn check_response(resp: &Message, want_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── 终端尺寸 ──────────────────────────────────────────────────────────────────
+// ── Terminal size ────────────────────────────────────────────────────────────
 
 fn get_terminal_size() -> anyhow::Result<(u16, u16)> {
     let (w, h) = crossterm::terminal::size()?;
@@ -2207,7 +2212,7 @@ mod tests {
 
     #[test]
     fn session_list_hint_renders_full_text_and_pads_to_width() {
-        // 无色环境(测试默认)下提示行应为纯文本,且右侧补空格填满整行。
+        // In a colorless environment (the test default), the hint line should be plain text, right-padded with spaces to fill the whole line.
         let cols = 80u16;
         let mut out = Vec::new();
         write_session_list_hint(&mut out, cols).unwrap();
@@ -2218,14 +2223,14 @@ mod tests {
             line.contains("Up/Down or k/j, Enter switch, c create, r rename, Esc/q cancel"),
             "{line:?}"
         );
-        // 去掉可能存在的 SGR 重置前缀后,可见内容应恰好填满 cols 列。
+        // After stripping any leading SGR reset prefix, the visible content should exactly fill cols columns.
         let visible = line.trim_start_matches("\x1b[0m");
         assert_eq!(UnicodeWidthStr::width(visible), cols as usize);
     }
 
     #[test]
     fn session_list_hint_truncates_to_narrow_width() {
-        // 极窄终端下按可见宽度截断,不 panic 且不超宽。
+        // On a very narrow terminal, truncate by visible width without panicking or exceeding the width.
         let cols = 5u16;
         let mut out = Vec::new();
         write_session_list_hint(&mut out, cols).unwrap();

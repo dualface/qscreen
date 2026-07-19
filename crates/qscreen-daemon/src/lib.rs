@@ -17,7 +17,7 @@ use session::{Session, SessionEvent, SessionEventQueue};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{oneshot, watch};
 
-// ── Daemon 共享状态 ───────────────────────────────────────────────────────────
+// ── Daemon shared state ───────────────────────────────────────────────────────
 
 struct State {
     sessions: Arc<Mutex<HashMap<String, Arc<Session>>>>,
@@ -93,8 +93,8 @@ impl State {
         }
     }
 
-    /// 列出存活的 session。已退出的 session 仅作为墓碑保留（用于 attach 错误提示），
-    /// 不出现在列表里。
+    /// List live sessions. Exited sessions are kept only as tombstones (used for
+    /// attach error messages) and do not appear in the list.
     fn list_sessions(&self) -> Vec<SessionInfo> {
         let guard = self.sessions.lock().unwrap();
         let mut infos: Vec<SessionInfo> = guard.values().map(|s| session_info(s)).collect();
@@ -107,7 +107,7 @@ impl State {
         let _ = self.stop_tx.send(true);
     }
 
-    /// 关闭并移除所有 session
+    /// Close and remove all sessions
     fn kill_all(&self) {
         let sessions: Vec<Arc<Session>> = {
             let mut guard = self.sessions.lock().unwrap();
@@ -144,9 +144,9 @@ fn session_info(s: &Session) -> SessionInfo {
     }
 }
 
-// ── 入口：daemon 主循环 ───────────────────────────────────────────────────────
+// ── Entry point: daemon main loop ─────────────────────────────────────────────
 
-/// 在当前线程运行 daemon（需要在 tokio runtime 内调用）
+/// Run the daemon on the current thread (must be called within a tokio runtime)
 pub async fn run() -> anyhow::Result<()> {
     let pipe = pipe_name();
     tracing::info!(pipe = %pipe, "daemon starting");
@@ -171,7 +171,7 @@ pub async fn run() -> anyhow::Result<()> {
                         continue;
                     }
 
-                    // 立即准备下一个 pipe instance，再把当前连接交给 handler
+                    // Immediately prepare the next pipe instance, then hand the current connection to the handler
                     let next = match ServerOptions::new().create(&pipe) {
                         Ok(s) => s,
                         Err(e) => {
@@ -271,7 +271,7 @@ impl Drop for DaemonLockGuard {
     }
 }
 
-// ── 连接处理 ─────────────────────────────────────────────────────────────────
+// ── Connection handling ───────────────────────────────────────────────────────
 
 async fn handle_connection<S>(stream: S, state: Arc<State>)
 where
@@ -308,7 +308,7 @@ where
             break;
         }
 
-        // attach 命令把控制权转移到 handle_attach
+        // The attach command transfers control to handle_attach
         if msg.command == Some(Command::Attach) {
             handle_attach(msg, reader, writer, state).await;
             return;
@@ -326,7 +326,7 @@ where
             break;
         }
 
-        // stop 命令在回复后触发 daemon 停止
+        // The stop command triggers daemon shutdown after the reply is sent
         if msg.command == Some(Command::Stop) {
             break;
         }
@@ -335,7 +335,7 @@ where
 
 type SharedWriter<W> = Arc<tokio::sync::Mutex<W>>;
 
-/// 非 attach 命令的统一 dispatch
+/// Unified dispatch for non-attach commands
 async fn dispatch_command(msg: &Message, state: &State) -> Message {
     let id = msg.id.clone();
     let result = dispatch_inner(msg, state).await;
@@ -510,7 +510,7 @@ fn request_cwd(msg: &Message) -> anyhow::Result<Option<PathBuf>> {
     Ok((!msg.cwd.is_empty()).then(|| PathBuf::from(&msg.cwd)))
 }
 
-/// attach 命令处理：握手 → 发送当前 screen frame → 双向 IO 循环
+/// Attach command handler: handshake -> send current screen frame -> bidirectional IO loop
 async fn handle_attach<R, W>(
     msg: Message,
     mut reader: BufReader<R>,
@@ -523,7 +523,7 @@ async fn handle_attach<R, W>(
     let session_id = msg.session_id.clone();
     let attach_id = msg.id.clone();
 
-    // 校验 session_id
+    // Validate session_id
     if let Err(e) = validate_session_id(&session_id) {
         let resp = Message {
             kind: MessageKind::Response,
@@ -554,7 +554,7 @@ async fn handle_attach<R, W>(
         return;
     }
 
-    // 获取 session
+    // Get the session
     let sess = match state.get_session(&session_id) {
         Some(s) => s,
         None => {
@@ -578,7 +578,7 @@ async fn handle_attach<R, W>(
         }
     };
 
-    // 注册事件接收 queue
+    // Register the event receive queue
     let event_queue = SessionEventQueue::new();
     let attach_mode = msg.attach_mode;
     let (client_id, initial_event) =
@@ -603,7 +603,7 @@ async fn handle_attach<R, W>(
     let attached_name = sess.name();
     tracing::info!(session_id = %session_id, session = %attached_name, client_id, "client attached");
 
-    // 发送 attach 成功响应
+    // Send the attach success response
     let ok_resp = Message {
         kind: MessageKind::Response,
         id: attach_id,
@@ -660,7 +660,7 @@ async fn handle_attach<R, W>(
         }
     }
 
-    // 启动 writer 任务：PTY 输出 → client
+    // Start the writer task: PTY output -> client
     let (writer_done_tx, mut writer_done_rx) = oneshot::channel::<()>();
     let writer_task_handle = {
         let writer_c = writer.clone();
@@ -693,7 +693,7 @@ async fn handle_attach<R, W>(
         })
     };
 
-    // Reader 循环：client → PTY（Input / Resize / Detach）
+    // Reader loop: client -> PTY (Input / Resize / Detach)
     let mut line = String::new();
     loop {
         line.clear();
@@ -752,7 +752,7 @@ async fn handle_attach<R, W>(
                     let session_name = sess.name();
                     tracing::debug!(session_id = %session_id, session = %session_name, "write input error: {}", e);
                 }
-                // 兼容 Go 协议：input 也发 ok 响应
+                // Go protocol compatibility: input also sends an ok response
                 let resp = Message {
                     kind: MessageKind::Response,
                     id: cmd.id.clone(),
@@ -1441,10 +1441,10 @@ mod tests {
 
         for _ in 0..50 {
             if state.get_session("1").is_none() {
-                // 墓碑保留，供 attach 时给出 "session exited" 错误提示……
+                // The tombstone is kept so attach can report a "session exited" error...
                 let tombstone = state.get_exited_session("1").expect("tombstone kept");
                 assert!(tombstone.exited);
-                // ……但不出现在 session 列表里。
+                // ...but it does not appear in the session list.
                 assert!(state.list_sessions().is_empty());
                 return;
             }
