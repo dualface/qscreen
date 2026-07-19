@@ -3,7 +3,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use crossterm::event::{
@@ -1194,9 +1194,14 @@ enum AttachOutcome {
     Ended,
 }
 
+/// After the PREFIX key is pressed, wait this long for a command key. If no key
+/// arrives in time, the pending PREFIX byte is passed through to the terminal.
+const PREFIX_PENDING_TIMEOUT: Duration = Duration::from_millis(500);
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PrefixState {
-    pending: bool,
+    /// When the PREFIX key was pressed and is waiting for a command key.
+    pending_since: Option<Instant>,
 }
 
 impl PrefixState {
@@ -1205,26 +1210,27 @@ impl PrefixState {
         key_event: crossterm::event::KeyEvent,
         prefix: PrefixKey,
         input_modes: term::InputModeState,
+        now: Instant,
     ) -> Vec<AttachAction> {
-        if is_prefix_key_event(key_event, prefix) {
-            if self.pending {
-                self.pending = false;
-                return vec![AttachAction::Input(vec![prefix.byte])];
-            }
-            self.pending = true;
-            return Vec::new();
-        }
+        // If the pending PREFIX has already timed out, pass it through before
+        // interpreting this key so a late key is treated as normal input.
+        let mut actions = self.take_expired(now, prefix);
 
-        if self.pending {
-            self.pending = false;
+        if self.pending_since.is_some() {
+            // A key followed the PREFIX within the timeout window.
+            self.pending_since = None;
             if key_char_eq_ignore_ascii_case(key_event.code, 'd') {
-                return vec![AttachAction::Detach];
+                actions.push(AttachAction::Detach);
+                return actions;
             }
             if key_char_eq_ignore_ascii_case(key_event.code, 's') && session_list_action_enabled() {
-                return vec![AttachAction::OpenSessionList];
+                actions.push(AttachAction::OpenSessionList);
+                return actions;
             }
 
-            let mut actions = vec![AttachAction::Input(vec![prefix.byte])];
+            // Not a valid command key (a second PREFIX included): pass both the
+            // PREFIX byte and this key's bytes through to the terminal.
+            actions.push(AttachAction::Input(vec![prefix.byte]));
             let bytes = key_event_to_bytes(key_event, input_modes);
             if !bytes.is_empty() {
                 actions.push(AttachAction::Input(bytes));
@@ -1232,12 +1238,28 @@ impl PrefixState {
             return actions;
         }
 
-        let bytes = key_event_to_bytes(key_event, input_modes);
-        if bytes.is_empty() {
-            Vec::new()
-        } else {
-            vec![AttachAction::Input(bytes)]
+        if is_prefix_key_event(key_event, prefix) {
+            self.pending_since = Some(now);
+            return actions;
         }
+
+        let bytes = key_event_to_bytes(key_event, input_modes);
+        if !bytes.is_empty() {
+            actions.push(AttachAction::Input(bytes));
+        }
+        actions
+    }
+
+    /// If a PREFIX key is pending and the timeout has elapsed, clear it and
+    /// return the PREFIX byte so it is passed through to the terminal.
+    fn take_expired(&mut self, now: Instant, prefix: PrefixKey) -> Vec<AttachAction> {
+        if let Some(since) = self.pending_since
+            && now.duration_since(since) >= PREFIX_PENDING_TIMEOUT
+        {
+            self.pending_since = None;
+            return vec![AttachAction::Input(vec![prefix.byte])];
+        }
+        Vec::new()
     }
 }
 
@@ -1462,7 +1484,14 @@ fn spawn_attach_input_reader(
         while !stop_input.load(Ordering::Relaxed) {
             let event = match crossterm::event::poll(Duration::from_millis(50)) {
                 Ok(true) => crossterm::event::read(),
-                Ok(false) => continue,
+                Ok(false) => {
+                    // On idle ticks, pass through a PREFIX key that has been
+                    // pending longer than the timeout.
+                    for action in prefix_state.take_expired(Instant::now(), prefix) {
+                        let _ = action_tx.send(action);
+                    }
+                    continue;
+                }
                 Err(_) => break,
             };
             let Ok(event) = event else {
@@ -1474,7 +1503,8 @@ fn spawn_attach_input_reader(
                     if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
                     let modes = *input_modes.lock().unwrap();
-                    for action in prefix_state.handle_key(key_event, prefix, modes) {
+                    for action in prefix_state.handle_key(key_event, prefix, modes, Instant::now())
+                    {
                         let should_stop =
                             matches!(action, AttachAction::Detach | AttachAction::OpenSessionList);
                         let _ = action_tx.send(action);
@@ -2253,6 +2283,10 @@ mod tests {
         crossterm::event::KeyEvent::new(KeyCode::Char(byte as char), KeyModifiers::NONE)
     }
 
+    fn now() -> Instant {
+        Instant::now()
+    }
+
     fn session(
         session_id: &str,
         name: &str,
@@ -2521,12 +2555,18 @@ mod tests {
                 state.handle_key(
                     ctrl_key(prefix.ctrl_char),
                     prefix,
-                    term::InputModeState::default()
+                    term::InputModeState::default(),
+                    now()
                 ),
                 vec![]
             );
             assert_eq!(
-                state.handle_key(char_key('d'), prefix, term::InputModeState::default()),
+                state.handle_key(
+                    char_key('d'),
+                    prefix,
+                    term::InputModeState::default(),
+                    now()
+                ),
                 vec![AttachAction::Detach]
             );
         }
@@ -2539,7 +2579,8 @@ mod tests {
             state.handle_key(
                 ctrl_key('a'),
                 DEFAULT_PREFIX,
-                term::InputModeState::default()
+                term::InputModeState::default(),
+                now()
             ),
             vec![]
         );
@@ -2547,7 +2588,8 @@ mod tests {
             state.handle_key(
                 char_key('D'),
                 DEFAULT_PREFIX,
-                term::InputModeState::default()
+                term::InputModeState::default(),
+                now()
             ),
             vec![AttachAction::Detach]
         );
@@ -2557,7 +2599,8 @@ mod tests {
             state.handle_key(
                 ctrl_key('a'),
                 DEFAULT_PREFIX,
-                term::InputModeState::default()
+                term::InputModeState::default(),
+                now()
             ),
             vec![]
         );
@@ -2565,31 +2608,38 @@ mod tests {
             state.handle_key(
                 char_key('S'),
                 DEFAULT_PREFIX,
-                term::InputModeState::default()
+                term::InputModeState::default(),
+                now()
             ),
             vec![AttachAction::OpenSessionList]
         );
     }
 
     #[test]
-    fn prefix_state_sends_literal_prefix_for_double_prefix() {
+    fn prefix_state_passes_through_both_prefixes_for_double_prefix() {
         for prefix in [DEFAULT_PREFIX, PrefixKey::parse("C-b").unwrap()] {
             let mut state = PrefixState::default();
             assert_eq!(
                 state.handle_key(
                     ctrl_key(prefix.ctrl_char),
                     prefix,
-                    term::InputModeState::default()
+                    term::InputModeState::default(),
+                    now()
                 ),
                 vec![]
             );
+            // A second PREFIX is not a command key, so both bytes pass through.
             assert_eq!(
                 state.handle_key(
                     ctrl_key(prefix.ctrl_char),
                     prefix,
-                    term::InputModeState::default()
+                    term::InputModeState::default(),
+                    now()
                 ),
-                vec![AttachAction::Input(vec![prefix.byte])]
+                vec![
+                    AttachAction::Input(vec![prefix.byte]),
+                    AttachAction::Input(vec![prefix.byte])
+                ]
             );
         }
     }
@@ -2602,12 +2652,18 @@ mod tests {
                 state.handle_key(
                     ctrl_key(prefix.ctrl_char),
                     prefix,
-                    term::InputModeState::default()
+                    term::InputModeState::default(),
+                    now()
                 ),
                 vec![]
             );
             assert_eq!(
-                state.handle_key(char_key('x'), prefix, term::InputModeState::default()),
+                state.handle_key(
+                    char_key('x'),
+                    prefix,
+                    term::InputModeState::default(),
+                    now()
+                ),
                 vec![
                     AttachAction::Input(vec![prefix.byte]),
                     AttachAction::Input(vec![b'x'])
@@ -2623,7 +2679,8 @@ mod tests {
             state.handle_key(
                 char_key('d'),
                 DEFAULT_PREFIX,
-                term::InputModeState::default()
+                term::InputModeState::default(),
+                now()
             ),
             vec![AttachAction::Input(vec![b'd'])]
         );
@@ -2637,12 +2694,18 @@ mod tests {
                 state.handle_key(
                     ctrl_key(prefix.ctrl_char),
                     prefix,
-                    term::InputModeState::default()
+                    term::InputModeState::default(),
+                    now()
                 ),
                 vec![]
             );
             assert_eq!(
-                state.handle_key(char_key('s'), prefix, term::InputModeState::default()),
+                state.handle_key(
+                    char_key('s'),
+                    prefix,
+                    term::InputModeState::default(),
+                    now()
+                ),
                 vec![AttachAction::OpenSessionList]
             );
         }
@@ -2654,22 +2717,110 @@ mod tests {
 
         let mut state = PrefixState::default();
         assert_eq!(
-            state.handle_key(raw_char_key(0x02), prefix, term::InputModeState::default()),
+            state.handle_key(
+                raw_char_key(0x02),
+                prefix,
+                term::InputModeState::default(),
+                now()
+            ),
             vec![]
         );
         assert_eq!(
-            state.handle_key(char_key('d'), prefix, term::InputModeState::default()),
+            state.handle_key(
+                char_key('d'),
+                prefix,
+                term::InputModeState::default(),
+                now()
+            ),
             vec![AttachAction::Detach]
         );
 
         let mut state = PrefixState::default();
         assert_eq!(
-            state.handle_key(raw_char_key(0x02), prefix, term::InputModeState::default()),
+            state.handle_key(
+                raw_char_key(0x02),
+                prefix,
+                term::InputModeState::default(),
+                now()
+            ),
             vec![]
         );
         assert_eq!(
-            state.handle_key(char_key('s'), prefix, term::InputModeState::default()),
+            state.handle_key(
+                char_key('s'),
+                prefix,
+                term::InputModeState::default(),
+                now()
+            ),
             vec![AttachAction::OpenSessionList]
+        );
+    }
+
+    #[test]
+    fn prefix_state_passes_through_prefix_after_timeout() {
+        let prefix = DEFAULT_PREFIX;
+        let start = Instant::now();
+        let mut state = PrefixState::default();
+        assert_eq!(
+            state.handle_key(
+                ctrl_key(prefix.ctrl_char),
+                prefix,
+                term::InputModeState::default(),
+                start
+            ),
+            vec![]
+        );
+
+        // Just under the timeout: nothing is flushed yet.
+        assert_eq!(
+            state.take_expired(
+                start + PREFIX_PENDING_TIMEOUT - Duration::from_millis(1),
+                prefix
+            ),
+            vec![]
+        );
+
+        // At the timeout the pending PREFIX byte is passed through.
+        assert_eq!(
+            state.take_expired(start + PREFIX_PENDING_TIMEOUT, prefix),
+            vec![AttachAction::Input(vec![prefix.byte])]
+        );
+
+        // Once flushed, nothing remains pending.
+        assert_eq!(
+            state.take_expired(start + PREFIX_PENDING_TIMEOUT * 2, prefix),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn prefix_state_late_command_key_is_treated_as_normal_input() {
+        let prefix = DEFAULT_PREFIX;
+        let start = Instant::now();
+        let mut state = PrefixState::default();
+        assert_eq!(
+            state.handle_key(
+                ctrl_key(prefix.ctrl_char),
+                prefix,
+                term::InputModeState::default(),
+                start
+            ),
+            vec![]
+        );
+
+        // A 'd' arriving after the timeout should not detach; the pending PREFIX
+        // is flushed and 'd' is sent as ordinary input.
+        assert_eq!(
+            state.handle_key(
+                char_key('d'),
+                prefix,
+                term::InputModeState::default(),
+                start + PREFIX_PENDING_TIMEOUT
+            ),
+            vec![
+                AttachAction::Input(vec![prefix.byte]),
+                AttachAction::Input(vec![b'd'])
+            ]
         );
     }
 
