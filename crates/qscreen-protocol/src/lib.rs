@@ -163,6 +163,7 @@ pub struct Message {
     pub name: String,
     pub shell: String,
     pub cwd: String,
+    pub cwd_bytes: Vec<u8>,
     pub width: u32,
     pub height: u32,
     pub ok: bool,
@@ -193,6 +194,8 @@ struct WireMessage {
     shell: String,
     #[serde(skip_serializing_if = "String::is_empty", default)]
     cwd: String,
+    #[serde(rename = "cwd_b64", skip_serializing_if = "String::is_empty", default)]
+    cwd_b64: String,
     #[serde(skip_serializing_if = "is_zero_u32", default)]
     width: u32,
     #[serde(skip_serializing_if = "is_zero_u32", default)]
@@ -251,6 +254,13 @@ impl Message {
                 MAX_PAYLOAD_SIZE
             );
         }
+        if self.cwd_bytes.len() > MAX_CONTROL_MESSAGE_SIZE {
+            anyhow::bail!(
+                "cwd too large: {} > {}",
+                self.cwd_bytes.len(),
+                MAX_CONTROL_MESSAGE_SIZE
+            );
+        }
         let wire = WireMessage {
             kind: self.kind.clone(),
             id: self.id.clone(),
@@ -260,6 +270,11 @@ impl Message {
             name: self.name.clone(),
             shell: self.shell.clone(),
             cwd: self.cwd.clone(),
+            cwd_b64: if self.cwd_bytes.is_empty() {
+                String::new()
+            } else {
+                B64.encode(&self.cwd_bytes)
+            },
             width: self.width,
             height: self.height,
             ok: self.ok,
@@ -319,6 +334,19 @@ impl Message {
             }
             decoded
         };
+        let cwd_bytes = if wire.cwd_b64.is_empty() {
+            Vec::new()
+        } else {
+            let decoded = B64.decode(&wire.cwd_b64)?;
+            if decoded.len() > MAX_CONTROL_MESSAGE_SIZE {
+                anyhow::bail!(
+                    "cwd too large after decode: {} > {}",
+                    decoded.len(),
+                    MAX_CONTROL_MESSAGE_SIZE
+                );
+            }
+            decoded
+        };
         Ok(Message {
             kind: wire.kind,
             id: wire.id,
@@ -328,6 +356,7 @@ impl Message {
             name: wire.name,
             shell: wire.shell,
             cwd: wire.cwd,
+            cwd_bytes,
             width: wire.width,
             height: wire.height,
             ok: wire.ok,
@@ -450,8 +479,42 @@ mod tests {
         assert_eq!(decoded.name, "test");
         assert_eq!(decoded.shell, "cmd");
         assert_eq!(decoded.cwd, r"C:\work");
+        assert!(decoded.cwd_bytes.is_empty());
         assert_eq!(decoded.width, 80);
         assert_eq!(decoded.height, 24);
+        assert!(!std::str::from_utf8(&line).unwrap().contains("cwd_b64"));
+    }
+
+    #[test]
+    fn round_trip_raw_cwd_bytes() {
+        let msg = Message {
+            kind: MessageKind::Request,
+            command: Some(Command::New),
+            cwd_bytes: b"/tmp/work-\xff".to_vec(),
+            ..Default::default()
+        };
+
+        let line = msg.to_json_line().unwrap();
+        let json = std::str::from_utf8(&line).unwrap();
+        let decoded = Message::from_json(json).unwrap();
+
+        assert!(json.contains(r#""cwd_b64":"L3RtcC93b3JrLf8=""#));
+        assert_eq!(decoded.cwd_bytes, b"/tmp/work-\xff");
+        assert!(decoded.cwd.is_empty());
+    }
+
+    #[test]
+    fn raw_cwd_over_limit_is_rejected() {
+        let msg = Message {
+            cwd_bytes: vec![b'x'; MAX_CONTROL_MESSAGE_SIZE + 1],
+            ..Default::default()
+        };
+        assert!(msg.to_json_line().is_err());
+
+        let encoded = B64.encode(vec![b'x'; MAX_CONTROL_MESSAGE_SIZE + 1]);
+        let json = format!(r#"{{"kind":"request","cwd_b64":"{encoded}"}}"#);
+        let err = Message::from_json(&json).unwrap_err().to_string();
+        assert!(err.contains("cwd too large after decode"), "{err}");
     }
 
     #[test]

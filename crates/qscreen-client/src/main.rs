@@ -15,6 +15,7 @@ use qscreen_protocol::{
 };
 use qscreen_shared::{daemon_log_path, pipe_name};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 mod color;
 mod term;
@@ -515,8 +516,22 @@ async fn cmd_new_and_attach(
     if !name.is_empty() {
         validate_session_name(name)?;
     }
-    let cwd = cwd_for_request(cwd)?;
-    let requested_cwd = cwd.clone();
+    let session_id = create_session_with_options(name, shell, cwd).await?;
+    attach_session_loop(&session_id, config).await
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CwdRequest {
+    cwd: String,
+    cwd_bytes: Vec<u8>,
+}
+
+async fn create_session_with_options(
+    name: &str,
+    shell: Option<&str>,
+    cwd: Option<&str>,
+) -> anyhow::Result<String> {
+    let requested_cwd = cwd_for_request(cwd)?;
     let mut conn = ensure_and_connect().await?;
     let resp = send_recv_ok(
         &mut conn,
@@ -526,50 +541,79 @@ async fn cmd_new_and_attach(
             command: Some(Command::New),
             name: name.to_string(),
             shell: shell.unwrap_or_default().to_string(),
-            cwd,
+            cwd: requested_cwd.cwd.clone(),
+            cwd_bytes: requested_cwd.cwd_bytes.clone(),
             ..Default::default()
         },
     )
     .await?;
     validate_session_id(&resp.session_id)?;
-    if !cwd_acknowledged(&requested_cwd, &resp.cwd) {
+    if !cwd_acknowledged(&requested_cwd, &resp) {
+        let session_id = resp.session_id.clone();
         let _ = send_recv_ok(
             &mut conn,
             Message {
                 kind: MessageKind::Request,
                 id: "2".to_string(),
                 command: Some(Command::Kill),
-                session_id: resp.session_id,
+                session_id,
                 ..Default::default()
             },
         )
         .await;
         anyhow::bail!("daemon does not support --cwd; restart qscn daemon and retry");
     }
-    drop(conn);
-    attach_session_loop(&resp.session_id, config).await
+    Ok(resp.session_id)
 }
 
-fn cwd_acknowledged(requested: &str, acknowledged: &str) -> bool {
-    requested.is_empty() || requested == acknowledged
-}
-
-fn cwd_for_request(cwd: Option<&str>) -> anyhow::Result<String> {
-    let Some(cwd) = cwd.filter(|value| !value.is_empty()) else {
-        // 未显式指定 --cwd 时,继承客户端(父环境)的当前工作目录,
-        // 否则 session 会落到常驻 daemon 的启动目录而非用户执行 `qscn new` 的目录。
-        let path = std::env::current_dir().context("resolve current directory for session cwd")?;
-        return Ok(path.to_string_lossy().into_owned());
-    };
-    let path = std::path::Path::new(cwd);
-    let path = if path.is_absolute() {
-        path.to_path_buf()
+fn cwd_acknowledged(requested: &CwdRequest, acknowledged: &Message) -> bool {
+    if requested.cwd_bytes.is_empty() {
+        requested.cwd == acknowledged.cwd
     } else {
-        std::env::current_dir()
-            .context("resolve current directory for --cwd")?
-            .join(path)
+        requested.cwd.is_empty()
+            && acknowledged.cwd.is_empty()
+            && requested.cwd_bytes == acknowledged.cwd_bytes
+    }
+}
+
+fn cwd_for_request(cwd: Option<&str>) -> anyhow::Result<CwdRequest> {
+    let path = if let Some(cwd) = cwd.filter(|value| !value.is_empty()) {
+        let path = std::path::Path::new(cwd);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .context("resolve current directory for --cwd")?
+                .join(path)
+        }
+    } else {
+        // 未显式指定 --cwd 时, 继承客户端(父环境)的当前工作目录,
+        // 否则 session 会落到常驻 daemon 的启动目录而非用户执行 `qscn new` 的目录。
+        std::env::current_dir().context("resolve current directory for session cwd")?
     };
-    Ok(path.to_string_lossy().into_owned())
+    cwd_request_from_path(&path)
+}
+
+fn cwd_request_from_path(path: &std::path::Path) -> anyhow::Result<CwdRequest> {
+    if let Some(cwd) = path.to_str() {
+        return Ok(CwdRequest {
+            cwd: cwd.to_string(),
+            cwd_bytes: Vec::new(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        Ok(CwdRequest {
+            cwd: String::new(),
+            cwd_bytes: path.as_os_str().as_bytes().to_vec(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        anyhow::bail!("current directory is not valid UTF-8")
+    }
 }
 
 async fn cmd_attach(session_id: &str, config: ClientConfig) -> anyhow::Result<()> {
@@ -652,19 +696,7 @@ async fn list_sessions() -> anyhow::Result<Vec<SessionInfo>> {
 
 /// 通过 daemon 新建一个使用默认名称/shell 的 session，返回其 session_id。
 async fn create_session() -> anyhow::Result<String> {
-    let mut conn = ensure_and_connect().await?;
-    let resp = send_recv_ok(
-        &mut conn,
-        Message {
-            kind: MessageKind::Request,
-            id: "1".to_string(),
-            command: Some(Command::New),
-            ..Default::default()
-        },
-    )
-    .await?;
-    validate_session_id(&resp.session_id)?;
-    Ok(resp.session_id)
+    create_session_with_options("", None, None).await
 }
 
 /// 为指定 session 改名。名字先经过校验，再发送 Rename 请求。
@@ -736,8 +768,20 @@ fn session_cwd_label(session: &SessionInfo) -> String {
     if session.cwd.is_empty() {
         "-".to_string()
     } else {
-        session.cwd.clone()
+        escape_terminal_controls(&session.cwd)
     }
+}
+
+fn escape_terminal_controls(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_control() {
+            escaped.extend(ch.escape_default());
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1693,7 +1737,7 @@ fn render_session_list<W: Write>(
         (status.to_string(), status_style(status))
     };
     let status_text = truncate_for_terminal(&status_text, cols as usize);
-    let visible = status_text.chars().count();
+    let visible = UnicodeWidthStr::width(status_text.as_str());
     // 状态行是最后一行,不带 CRLF(与原实现一致)。
     write!(out, "\x1b[0m")?;
     let colored = color::supported();
@@ -1735,7 +1779,7 @@ fn write_text_line<W: Write>(
     cols: u16,
 ) -> std::io::Result<()> {
     let truncated = truncate_for_terminal(text, cols as usize);
-    let visible = truncated.chars().count();
+    let visible = UnicodeWidthStr::width(truncated.as_str());
     let content = match sgr {
         Some(s) => color::paint(&truncated, s),
         None => truncated,
@@ -1790,7 +1834,7 @@ fn write_session_row<W: Write>(
             row.cwd
         );
         let truncated = truncate_for_terminal(&plain, cols as usize);
-        let visible = truncated.chars().count();
+        let visible = UnicodeWidthStr::width(truncated.as_str());
         let wrap = if selected { Some("7") } else { None };
         return write_list_line(out, &truncated, visible, wrap, cols);
     }
@@ -1801,7 +1845,7 @@ fn write_session_row<W: Write>(
     let state = truncate_for_terminal(&row.state, 14);
     let size = truncate_for_terminal(&row.size, 8);
     let cwd = truncate_for_terminal(&row.cwd, cwd_budget);
-    let visible = ROW_PREFIX_WIDTH + cwd.chars().count();
+    let visible = ROW_PREFIX_WIDTH + UnicodeWidthStr::width(cwd.as_str());
 
     if selected {
         // 整行反显;不再叠加逐列前景色,避免与反显互相干扰。
@@ -1843,7 +1887,18 @@ fn write_session_row<W: Write>(
 }
 
 fn truncate_for_terminal(value: &str, width: usize) -> String {
-    value.chars().take(width).collect()
+    let mut visible = 0;
+    value
+        .chars()
+        .take_while(|ch| {
+            let next = visible + UnicodeWidthChar::width(*ch).unwrap_or(0);
+            if next > width {
+                return false;
+            }
+            visible = next;
+            true
+        })
+        .collect()
 }
 
 fn is_prefix_key_event(event: crossterm::event::KeyEvent, prefix: PrefixKey) -> bool {
@@ -2164,12 +2219,13 @@ mod tests {
     #[test]
     fn cwd_for_request_defaults_to_client_directory() {
         let expected = std::env::current_dir().unwrap();
+        let expected = CwdRequest {
+            cwd: expected.to_str().unwrap().to_string(),
+            cwd_bytes: Vec::new(),
+        };
 
-        assert_eq!(cwd_for_request(None).unwrap(), expected.to_string_lossy());
-        assert_eq!(
-            cwd_for_request(Some("")).unwrap(),
-            expected.to_string_lossy()
-        );
+        assert_eq!(cwd_for_request(None).unwrap(), expected);
+        assert_eq!(cwd_for_request(Some("")).unwrap(), expected);
     }
 
     #[test]
@@ -2177,8 +2233,8 @@ mod tests {
         let expected = std::env::current_dir().unwrap().join("project");
 
         assert_eq!(
-            cwd_for_request(Some("project")).unwrap(),
-            expected.to_string_lossy()
+            cwd_for_request(Some("project")).unwrap().cwd,
+            expected.to_str().unwrap()
         );
     }
 
@@ -2187,17 +2243,52 @@ mod tests {
         let path = std::env::current_dir().unwrap().join("project");
 
         assert_eq!(
-            cwd_for_request(path.to_str()).unwrap(),
-            path.to_string_lossy()
+            cwd_for_request(path.to_str()).unwrap().cwd,
+            path.to_str().unwrap()
         );
     }
 
     #[test]
     fn cwd_ack_requires_matching_non_empty_response() {
-        assert!(cwd_acknowledged("", ""));
-        assert!(cwd_acknowledged("/work", "/work"));
-        assert!(!cwd_acknowledged("/work", ""));
-        assert!(!cwd_acknowledged("/work", "/other"));
+        let requested = CwdRequest {
+            cwd: "/work".to_string(),
+            cwd_bytes: Vec::new(),
+        };
+        assert!(cwd_acknowledged(
+            &requested,
+            &Message {
+                cwd: "/work".to_string(),
+                ..Default::default()
+            }
+        ));
+        assert!(!cwd_acknowledged(&requested, &Message::default()));
+        assert!(!cwd_acknowledged(
+            &requested,
+            &Message {
+                cwd: "/other".to_string(),
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_cwd_uses_raw_wire_bytes_and_requires_raw_ack() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = std::path::PathBuf::from(OsString::from_vec(b"/tmp/work-\xff".to_vec()));
+        let requested = cwd_request_from_path(&path).unwrap();
+        assert!(requested.cwd.is_empty());
+        assert_eq!(requested.cwd_bytes, b"/tmp/work-\xff");
+        assert!(cwd_acknowledged(
+            &requested,
+            &Message {
+                cwd_bytes: requested.cwd_bytes.clone(),
+                ..Default::default()
+            }
+        ));
+        assert!(!cwd_acknowledged(&requested, &Message::default()));
     }
 
     #[test]
@@ -2580,6 +2671,33 @@ mod tests {
             format_session_line(&info),
             "1\twork\tdetached\t-\t80x24\tC:\\work"
         );
+    }
+
+    #[test]
+    fn session_cwd_label_escapes_terminal_control_characters() {
+        let mut info = session("1", "work", false, false, 80, 24);
+        info.cwd = "/work\n\t\u{1b}\u{85}\u{7f}".to_string();
+
+        let label = session_cwd_label(&info);
+
+        assert_eq!(label, r"/work\n\t\u{1b}\u{85}\u{7f}");
+        assert!(!label.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn terminal_truncation_uses_display_width() {
+        assert_eq!(truncate_for_terminal("ab界c", 3), "ab");
+        assert_eq!(truncate_for_terminal("ab界c", 4), "ab界");
+        assert_eq!(truncate_for_terminal("e\u{301}x", 1), "e\u{301}");
+    }
+
+    #[test]
+    fn text_line_padding_uses_display_width() {
+        let mut out = Vec::new();
+
+        write_text_line(&mut out, "界", None, 4).unwrap();
+
+        assert_eq!(String::from_utf8(out).unwrap(), "\x1b[0m界  \r\n");
     }
 
     #[test]

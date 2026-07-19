@@ -1,6 +1,7 @@
 pub mod session;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -366,13 +367,14 @@ async fn dispatch_inner(msg: &Message, state: &State) -> anyhow::Result<Message>
             } else {
                 msg.name.clone()
             };
+            let cwd = request_cwd(msg)?;
             let sess = Session::new_with_cwd(
                 session_id.clone(),
                 session_name.clone(),
                 msg.width,
                 msg.height,
                 Some(msg.shell.as_str()),
-                Some(msg.cwd.as_str()),
+                cwd.as_deref(),
             )?;
             tracing::info!(session_id = %session_id, session = %session_name, "session created");
             state.insert_session(session_id.clone(), sess);
@@ -381,6 +383,7 @@ async fn dispatch_inner(msg: &Message, state: &State) -> anyhow::Result<Message>
                 session_id,
                 name: session_name,
                 cwd: msg.cwd.clone(),
+                cwd_bytes: msg.cwd_bytes.clone(),
                 ok: true,
                 ..Default::default()
             })
@@ -485,6 +488,26 @@ async fn dispatch_inner(msg: &Message, state: &State) -> anyhow::Result<Message>
 
         _ => anyhow::bail!("unknown or missing command"),
     }
+}
+
+fn request_cwd(msg: &Message) -> anyhow::Result<Option<PathBuf>> {
+    if !msg.cwd.is_empty() && !msg.cwd_bytes.is_empty() {
+        anyhow::bail!("cwd and cwd_b64 cannot both be set");
+    }
+    if !msg.cwd_bytes.is_empty() {
+        #[cfg(unix)]
+        {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+
+            return Ok(Some(PathBuf::from(OsString::from_vec(
+                msg.cwd_bytes.clone(),
+            ))));
+        }
+        #[cfg(not(unix))]
+        anyhow::bail!("cwd_b64 is unsupported on this platform");
+    }
+    Ok((!msg.cwd.is_empty()).then(|| PathBuf::from(&msg.cwd)))
 }
 
 /// attach 命令处理：握手 → 发送当前 screen frame → 双向 IO 循环
@@ -1029,6 +1052,35 @@ mod tests {
         assert!(response.ok);
         assert_eq!(response.cwd, cwd.to_string_lossy());
         state.kill_all();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_cwd_decodes_raw_unix_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let raw = b"/tmp/work-\xff".to_vec();
+        let cwd = request_cwd(&Message {
+            cwd_bytes: raw.clone(),
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(cwd.as_os_str().as_bytes(), raw);
+    }
+
+    #[test]
+    fn request_cwd_rejects_ambiguous_fields() {
+        let err = request_cwd(&Message {
+            cwd: "/work".to_string(),
+            cwd_bytes: b"/other".to_vec(),
+            ..Default::default()
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("cannot both be set"), "{err}");
     }
 
     #[tokio::test]

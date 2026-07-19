@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -225,7 +226,7 @@ impl Session {
         width: u32,
         height: u32,
         shell: Option<&str>,
-        cwd: Option<&str>,
+        cwd: Option<&Path>,
     ) -> anyhow::Result<Arc<Self>> {
         let w = if width > 0 {
             width as u16
@@ -1026,27 +1027,27 @@ fn default_shell_command(shell: Option<&str>) -> anyhow::Result<CommandBuilder> 
     }
 }
 
-fn apply_working_directory(cmd: &mut CommandBuilder, cwd: Option<&str>) -> anyhow::Result<()> {
-    let Some(cwd) = cwd.filter(|value| !value.is_empty()) else {
+fn apply_working_directory(cmd: &mut CommandBuilder, cwd: Option<&Path>) -> anyhow::Result<()> {
+    let Some(cwd) = cwd.filter(|value| !value.as_os_str().is_empty()) else {
         return Ok(());
     };
     let metadata = std::fs::metadata(cwd)
-        .with_context(|| format!("working directory does not exist: {cwd}"))?;
+        .with_context(|| format!("working directory does not exist: {}", cwd.display()))?;
     if !metadata.is_dir() {
-        anyhow::bail!("working directory is not a directory: {cwd}");
+        anyhow::bail!("working directory is not a directory: {}", cwd.display());
     }
     cmd.cwd(cwd);
     Ok(())
 }
 
 /// 返回会话实际使用的工作目录：显式指定则用它，否则回退到 daemon 当前目录。
-fn resolve_session_cwd(cwd: Option<&str>) -> String {
-    if let Some(cwd) = cwd.filter(|value| !value.is_empty()) {
-        return cwd.to_string();
+fn resolve_session_cwd(cwd: Option<&Path>) -> String {
+    if let Some(cwd) = cwd.filter(|value| !value.as_os_str().is_empty()) {
+        return cwd.to_string_lossy().into_owned();
     }
     std::env::current_dir()
         .ok()
-        .and_then(|path| path.to_str().map(str::to_string))
+        .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
 
@@ -1059,7 +1060,7 @@ mod tests {
     fn working_directory_uses_non_empty_request_value() {
         let mut cmd = default_shell_command(None).unwrap();
         let cwd = std::env::current_dir().unwrap();
-        apply_working_directory(&mut cmd, cwd.to_str()).unwrap();
+        apply_working_directory(&mut cmd, Some(cwd.as_path())).unwrap();
 
         assert_eq!(
             cmd.get_cwd().map(|value| value.as_os_str()),
@@ -1067,10 +1068,31 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn working_directory_preserves_non_utf8_path() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut name = format!("qscreen-cwd-{}-", std::process::id()).into_bytes();
+        name.push(0xff);
+        let cwd = std::env::temp_dir().join(OsString::from_vec(name));
+        std::fs::create_dir(&cwd).unwrap();
+        let mut cmd = default_shell_command(None).unwrap();
+
+        apply_working_directory(&mut cmd, Some(&cwd)).unwrap();
+
+        assert_eq!(
+            cmd.get_cwd().map(OsString::as_os_str),
+            Some(cwd.as_os_str())
+        );
+        std::fs::remove_dir(cwd).unwrap();
+    }
+
     #[test]
     fn working_directory_ignores_empty_request_value() {
         let mut cmd = default_shell_command(None).unwrap();
-        apply_working_directory(&mut cmd, Some("")).unwrap();
+        apply_working_directory(&mut cmd, Some(Path::new(""))).unwrap();
 
         assert_eq!(cmd.get_cwd(), None);
     }
@@ -1081,7 +1103,7 @@ mod tests {
         let missing =
             std::env::temp_dir().join(format!("qscreen-missing-cwd-{}", std::process::id()));
 
-        let err = apply_working_directory(&mut cmd, missing.to_str()).unwrap_err();
+        let err = apply_working_directory(&mut cmd, Some(missing.as_path())).unwrap_err();
 
         assert!(err.to_string().contains("does not exist"), "{err:#}");
     }
@@ -1092,7 +1114,7 @@ mod tests {
         let file = std::env::temp_dir().join(format!("qscreen-file-cwd-{}", std::process::id()));
         std::fs::write(&file, b"not a directory").unwrap();
 
-        let err = apply_working_directory(&mut cmd, file.to_str()).unwrap_err();
+        let err = apply_working_directory(&mut cmd, Some(file.as_path())).unwrap_err();
         let _ = std::fs::remove_file(file);
 
         assert!(err.to_string().contains("not a directory"), "{err:#}");
