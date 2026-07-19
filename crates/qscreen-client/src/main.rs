@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -34,6 +34,7 @@ struct PrefixKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ClientConfig {
     prefix: PrefixKey,
+    status_bar: bool,
 }
 
 impl PrefixKey {
@@ -92,23 +93,38 @@ fn parse_prefix_letter(original: &str, rest: &str) -> anyhow::Result<char> {
 }
 
 fn parse_client_config(args: Vec<String>) -> anyhow::Result<(ClientConfig, Vec<String>)> {
-    parse_client_config_with_env(args, std::env::var("QSCREEN_PREFIX").ok())
+    parse_client_config_with_env(
+        args,
+        std::env::var("QSCREEN_PREFIX").ok(),
+        std::env::var("QSCREEN_STATUS_BAR").ok(),
+    )
 }
 
 fn parse_client_config_with_env(
     args: Vec<String>,
     env_prefix: Option<String>,
+    env_status_bar: Option<String>,
 ) -> anyhow::Result<(ClientConfig, Vec<String>)> {
-    let (prefix_arg, remaining_args) = take_prefix_arg(args)?;
-    let prefix = match prefix_arg.or(env_prefix) {
+    let (options, remaining_args) = take_client_options(args)?;
+    let prefix = match options.prefix.or(env_prefix) {
         Some(value) => PrefixKey::parse(&value)?,
         None => DEFAULT_PREFIX,
     };
-    Ok((ClientConfig { prefix }, remaining_args))
+    let status_bar = match options.status_bar.or(env_status_bar) {
+        Some(value) => parse_status_bar_value(&value)?,
+        None => true,
+    };
+    Ok((ClientConfig { prefix, status_bar }, remaining_args))
 }
 
-fn take_prefix_arg(args: Vec<String>) -> anyhow::Result<(Option<String>, Vec<String>)> {
-    let mut prefix = None;
+#[derive(Debug, Default)]
+struct ClientOptionArgs {
+    prefix: Option<String>,
+    status_bar: Option<String>,
+}
+
+fn take_client_options(args: Vec<String>) -> anyhow::Result<(ClientOptionArgs, Vec<String>)> {
+    let mut options = ClientOptionArgs::default();
     let mut remaining = Vec::with_capacity(args.len());
     let mut iter = args.into_iter();
 
@@ -117,15 +133,30 @@ fn take_prefix_arg(args: Vec<String>) -> anyhow::Result<(Option<String>, Vec<Str
             let Some(value) = iter.next() else {
                 anyhow::bail!("invalid prefix: --prefix requires a value");
             };
-            prefix = Some(value);
+            options.prefix = Some(value);
         } else if let Some(value) = arg.strip_prefix("--prefix=") {
-            prefix = Some(value.to_string());
+            options.prefix = Some(value.to_string());
+        } else if arg == "--status-bar" {
+            let Some(value) = iter.next() else {
+                anyhow::bail!("invalid status bar option: --status-bar requires on or off");
+            };
+            options.status_bar = Some(value);
+        } else if let Some(value) = arg.strip_prefix("--status-bar=") {
+            options.status_bar = Some(value.to_string());
         } else {
             remaining.push(arg);
         }
     }
 
-    Ok((prefix, remaining))
+    Ok((options, remaining))
+}
+
+fn parse_status_bar_value(value: &str) -> anyhow::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "1" | "true" | "yes" => Ok(true),
+        "off" | "0" | "false" | "no" => Ok(false),
+        _ => anyhow::bail!("invalid status bar option `{value}`: expected on or off"),
+    }
 }
 
 // ── Entry ────────────────────────────────────────────────────────────────────
@@ -401,6 +432,12 @@ fn help_text_zh() -> &'static str {
   QSCREEN_PREFIX=C-b           为所有命令设置备用前缀
   支持 C-a..C-z 或 Ctrl+A..Ctrl+Z；CLI 参数优先于环境变量
 
+状态栏:
+  attach 时底部一行列出所有会话（* 当前，! 已退出），每 2 秒刷新
+  --status-bar off             本次命令关闭状态栏
+  QSCREEN_STATUS_BAR=off       为所有命令关闭状态栏
+  取值 on|off；CLI 参数优先于环境变量；终端高度不足 3 行时自动停用
+
 会话内热键:
   <prefix> d                  从当前会话 detach（会话继续在后台运行）
   <prefix> <prefix>           向 PTY 发送字面前缀字符
@@ -454,6 +491,12 @@ Prefix:
   --prefix C-b                 use Ctrl+B as the session prefix for this command
   QSCREEN_PREFIX=C-b           set a fallback prefix for every command
   Values: C-a..C-z or Ctrl+A..Ctrl+Z; CLI takes precedence over env
+
+Status bar:
+  while attached, the bottom row lists all sessions (* current, ! exited), refreshed every 2s
+  --status-bar off             disable the status bar for this command
+  QSCREEN_STATUS_BAR=off       disable the status bar for every command
+  Values: on|off; CLI takes precedence over env; disabled when the terminal has fewer than 3 rows
 
 Key bindings (inside a session):
   <prefix> d                  detach from session (session keeps running)
@@ -872,6 +915,176 @@ fn move_session_list_selection(selected: usize, len: usize, delta: isize) -> usi
     }
 }
 
+// ── Status bar ───────────────────────────────────────────────────────────────
+
+/// Below this terminal height the status bar is disabled and attach uses the
+/// full height, so tiny terminals keep every row for the session.
+const STATUS_BAR_MIN_HEIGHT: u16 = 3;
+/// How often the attach loop polls the daemon for the session list shown in
+/// the status bar.
+const STATUS_BAR_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Give up on a status bar poll quickly so a stalled daemon cannot wedge the
+/// attach loop; the side connection is dropped and reopened on the next tick.
+const STATUS_BAR_FETCH_TIMEOUT: Duration = Duration::from_millis(800);
+/// Current session in the status bar: reverse video, standing out from the
+/// state-colored entries around it.
+const STATUS_BAR_CURRENT_SGR: &str = "7";
+
+fn status_bar_active(config: ClientConfig, term_height: u16) -> bool {
+    config.status_bar && term_height >= STATUS_BAR_MIN_HEIGHT
+}
+
+/// Height reported to the daemon: when the status bar is active, the bottom
+/// row is reserved for it and the session gets the rest.
+fn session_area_height(config: ClientConfig, term_height: u16) -> u16 {
+    if status_bar_active(config, term_height) {
+        term_height - 1
+    } else {
+        term_height
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusBarItem {
+    session_id: String,
+    name: String,
+    is_current: bool,
+    exited: bool,
+    attached: bool,
+}
+
+fn build_status_bar_items(
+    sessions: &[SessionInfo],
+    current_session_id: &str,
+) -> Vec<StatusBarItem> {
+    let mut items: Vec<StatusBarItem> = sessions
+        .iter()
+        .map(|session| StatusBarItem {
+            session_id: session.session_id.clone(),
+            name: session.name.clone(),
+            is_current: session.session_id == current_session_id,
+            exited: session.exited,
+            attached: session.attached,
+        })
+        .collect();
+    items.sort_by_key(|item| item.session_id.parse::<u64>().unwrap_or(u64::MAX));
+    items
+}
+
+/// Status bar content as (text, sgr) segments; concatenated they form the whole
+/// bar, so the renderer can truncate by visible width (same pattern as the
+/// session list hint line). Markers double as a colorless fallback:
+/// `*` = current session, `!` = exited.
+fn status_bar_segments(items: &[StatusBarItem]) -> Vec<(String, &'static str)> {
+    let mut segments = vec![("[qscn]".to_string(), color::sgr::HEADER)];
+    for item in items {
+        segments.push((" ".to_string(), ""));
+        let marker = if item.is_current {
+            "*"
+        } else if item.exited {
+            "!"
+        } else {
+            ""
+        };
+        let text = format!("{}:{}{}", item.session_id, item.name, marker);
+        let sgr = if item.is_current {
+            STATUS_BAR_CURRENT_SGR
+        } else {
+            color::state_sgr(item.exited, item.attached)
+        };
+        segments.push((text, sgr));
+    }
+    segments
+}
+
+/// Draw the status bar when active; a no-op while the item cache is still
+/// empty (before the first poll completes) so no stale row is painted over.
+fn draw_status_bar<W: Write>(
+    out: &mut W,
+    items: &[StatusBarItem],
+    config: ClientConfig,
+    term_size: (u16, u16),
+    cursor_visible: bool,
+) -> std::io::Result<()> {
+    if !status_bar_active(config, term_size.1) || items.is_empty() {
+        return Ok(());
+    }
+    render_status_bar(out, items, term_size, cursor_visible)
+}
+
+/// Render the bar on the terminal's bottom row. The cursor is saved/restored
+/// (DECSC/DECRC) around the write and hidden while drawing, so the session
+/// area and the frame-rendered cursor position are unaffected.
+fn render_status_bar<W: Write>(
+    out: &mut W,
+    items: &[StatusBarItem],
+    term_size: (u16, u16),
+    cursor_visible: bool,
+) -> std::io::Result<()> {
+    let (cols, rows) = term_size;
+    write!(out, "\x1b[?2026h\x1b7\x1b[?25l\x1b[0m\x1b[{};1H", rows)?;
+    let limit = cols as usize;
+    let mut visible = 0usize;
+    for (text, sgr) in status_bar_segments(items) {
+        if visible >= limit {
+            break;
+        }
+        let piece = truncate_for_terminal(&text, limit - visible);
+        if piece.is_empty() {
+            continue;
+        }
+        visible += UnicodeWidthStr::width(piece.as_str());
+        if sgr.is_empty() {
+            out.write_all(piece.as_bytes())?;
+        } else {
+            out.write_all(color::paint(&piece, sgr).as_bytes())?;
+        }
+    }
+    for _ in visible.min(limit)..limit {
+        out.write_all(b" ")?;
+    }
+    write!(out, "\x1b[0m\x1b8")?;
+    if cursor_visible {
+        out.write_all(b"\x1b[?25h")?;
+    }
+    out.write_all(b"\x1b[?2026l")?;
+    out.flush()
+}
+
+/// Fetch the session list over a persistent side connection, separate from the
+/// attach stream (whose responses are consumed by the event reader task). On
+/// any error the connection is dropped so the next poll reconnects. Uses
+/// `connect()` rather than `ensure_and_connect()`: being attached implies the
+/// daemon is running, and the poll loop must never spawn one.
+async fn fetch_sessions_for_bar(
+    conn_slot: &mut Option<TcpConn>,
+) -> anyhow::Result<Vec<SessionInfo>> {
+    if conn_slot.is_none() {
+        *conn_slot = Some(connect().await?);
+    }
+    let conn = conn_slot.as_mut().expect("connection ensured above");
+    let result: anyhow::Result<Vec<SessionInfo>> = async {
+        send_msg(
+            conn,
+            Message {
+                kind: MessageKind::Request,
+                id: "status-bar".to_string(),
+                command: Some(Command::List),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let resp = recv_msg(conn).await?;
+        check_response(&resp, "status-bar")?;
+        Ok(resp.sessions)
+    }
+    .await;
+    if result.is_err() {
+        *conn_slot = None;
+    }
+    result
+}
+
 // ── Attach implementation ────────────────────────────────────────────────────
 
 async fn attach_session_loop(initial_session_id: &str, config: ClientConfig) -> anyhow::Result<()> {
@@ -936,7 +1149,12 @@ async fn attach_session_once(
     let attach_id = "1";
     send_msg(
         &mut conn,
-        attach_request_message(attach_id, session_id, term_width, term_height),
+        attach_request_message(
+            attach_id,
+            session_id,
+            term_width,
+            session_area_height(config, term_height),
+        ),
     )
     .await?;
 
@@ -946,7 +1164,7 @@ async fn attach_session_once(
     let _terminal = TerminalCleanupGuard::enter()?;
 
     let session_id_owned = session_id.to_string();
-    run_attach_loop(conn, session_id_owned, term_size, config.prefix).await
+    run_attach_loop(conn, session_id_owned, term_size, config).await
 }
 
 fn attach_request_message(
@@ -1298,7 +1516,7 @@ async fn run_attach_loop(
     conn: TcpConn,
     session_id: String,
     term_size: (u16, u16),
-    prefix: PrefixKey,
+    config: ClientConfig,
 ) -> anyhow::Result<AttachOutcome> {
     let (read_half, write_half) = tokio::io::split(conn.stream);
     let writer = Arc::new(tokio::sync::Mutex::new(write_half));
@@ -1325,6 +1543,17 @@ async fn run_attach_loop(
     let mut screen = term::TermScreen::new(rows, cols);
     let mut frame_renderer = term::FrameRenderer::default();
 
+    // Status bar state: session cache, cursor visibility from the last frame,
+    // a persistent side connection for polling, and the row count available to
+    // the application (shared with the input reader so bar-row mouse events
+    // are not forwarded to the PTY).
+    let mut bar_items: Vec<StatusBarItem> = Vec::new();
+    let mut bar_cursor_visible = true;
+    let mut bar_conn: Option<TcpConn> = None;
+    let mut bar_poll = tokio::time::interval(STATUS_BAR_POLL_INTERVAL);
+    bar_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let app_rows = Arc::new(AtomicU16::new(session_area_height(config, rows)));
+
     let writer_c = writer.clone();
     let session_id_c = session_id.clone();
     let mut msg_id: u64 = 10;
@@ -1335,8 +1564,9 @@ async fn run_attach_loop(
     let mut input_handle = spawn_attach_input_reader(
         action_tx.clone(),
         stop_input.clone(),
-        prefix,
+        config.prefix,
         input_modes.clone(),
+        app_rows.clone(),
     );
 
     let mut stdout = std::io::stdout();
@@ -1375,6 +1605,17 @@ async fn run_attach_loop(
                             if let Some(frame) = latest_frame.as_ref() {
                                 let _ = frame_renderer.render(&mut stdout, frame);
                                 *input_modes.lock().unwrap() = frame_renderer.input_modes();
+                                // Repaint the bar: a force-full render (first
+                                // frame, resize, alt-screen switch) clears the
+                                // whole screen including the bar row.
+                                bar_cursor_visible = !frame.hide_cursor;
+                                let _ = draw_status_bar(
+                                    &mut stdout,
+                                    &bar_items,
+                                    config,
+                                    screen.size(),
+                                    bar_cursor_visible,
+                                );
                             }
                         }
                         Some(EventType::Exit) => break AttachOutcome::Ended,
@@ -1384,6 +1625,34 @@ async fn run_attach_loop(
                         break AttachOutcome::Ended;
                     }
                     _ => {}
+                }
+            }
+
+            _ = bar_poll.tick(), if config.status_bar => {
+                match tokio::time::timeout(
+                    STATUS_BAR_FETCH_TIMEOUT,
+                    fetch_sessions_for_bar(&mut bar_conn),
+                )
+                .await
+                {
+                    Ok(Ok(sessions)) => {
+                        let items = build_status_bar_items(&sessions, &session_id_c);
+                        if items != bar_items {
+                            bar_items = items;
+                            let _ = draw_status_bar(
+                                &mut stdout,
+                                &bar_items,
+                                config,
+                                screen.size(),
+                                bar_cursor_visible,
+                            );
+                        }
+                    }
+                    // Fetch errors already dropped the side connection; a
+                    // timeout leaves a half-finished exchange behind, so drop
+                    // the connection to resync on the next tick.
+                    Ok(Err(_)) => {}
+                    Err(_) => bar_conn = None,
                 }
             }
 
@@ -1408,6 +1677,8 @@ async fn run_attach_loop(
                     Some(AttachAction::Resize(w, h)) => {
                         screen.resize(h, w);
                         frame_renderer.reset();
+                        let area_h = session_area_height(config, h);
+                        app_rows.store(area_h, Ordering::Relaxed);
                         msg_id += 1;
                         let resize_msg = Message {
                             kind: MessageKind::Request,
@@ -1415,13 +1686,20 @@ async fn run_attach_loop(
                             command: Some(Command::Resize),
                             session_id: session_id_c.clone(),
                             width: w as u32,
-                            height: h as u32,
+                            height: area_h as u32,
                             ..Default::default()
                         };
                         let bytes = resize_msg.to_json_line()?;
                         if writer_c.lock().await.write_all(&bytes).await.is_err() {
                             break AttachOutcome::Ended;
                         }
+                        let _ = draw_status_bar(
+                            &mut stdout,
+                            &bar_items,
+                            config,
+                            (w, h),
+                            bar_cursor_visible,
+                        );
                     }
                     Some(AttachAction::Focus) => {
                         msg_id += 1;
@@ -1468,7 +1746,7 @@ async fn run_attach_loop(
                                     command: Some(Command::Resize),
                                     session_id: session_id_c.clone(),
                                     width: w as u32,
-                                    height: h as u32,
+                                    height: session_area_height(config, h) as u32,
                                     ..Default::default()
                                 };
                                 if let Ok(bytes) = resize_msg.to_json_line() {
@@ -1478,8 +1756,19 @@ async fn run_attach_loop(
                                 input_handle = spawn_attach_input_reader(
                                     action_tx.clone(),
                                     stop_input.clone(),
-                                    prefix,
+                                    config.prefix,
                                     input_modes.clone(),
+                                    app_rows.clone(),
+                                );
+                                // The list modal painted over the whole screen;
+                                // restore the bar right away instead of waiting
+                                // for the next frame.
+                                let _ = draw_status_bar(
+                                    &mut stdout,
+                                    &bar_items,
+                                    config,
+                                    (w, h),
+                                    bar_cursor_visible,
                                 );
                             }
                         }
@@ -1508,6 +1797,7 @@ fn spawn_attach_input_reader(
     stop_input: Arc<AtomicBool>,
     prefix: PrefixKey,
     input_modes: Arc<std::sync::Mutex<term::InputModeState>>,
+    app_rows: Arc<AtomicU16>,
 ) -> tokio::task::JoinHandle<()> {
     // Keyboard/resize reading uses a bounded poll so attach cleanup can finish without process exit.
     tokio::task::spawn_blocking(move || {
@@ -1552,6 +1842,11 @@ fn spawn_attach_input_reader(
                     let _ = action_tx.send(AttachAction::Focus);
                 }
                 Event::Mouse(mouse_event) => {
+                    // The status bar row is outside the session area; its
+                    // coordinates would be out of range for the PTY.
+                    if mouse_event.row >= app_rows.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     let modes = *input_modes.lock().unwrap();
                     if let Some(bytes) = mouse_event_to_bytes(mouse_event, modes) {
                         let _ = action_tx.send(AttachAction::Input(bytes));
@@ -2188,16 +2483,20 @@ mod tests {
 
     #[test]
     fn client_config_uses_default_prefix() {
-        let (config, args) = parse_client_config_with_env(vec![], None).unwrap();
+        let (config, args) = parse_client_config_with_env(vec![], None, None).unwrap();
         assert_eq!(config.prefix, DEFAULT_PREFIX);
+        assert!(config.status_bar);
         assert!(args.is_empty());
     }
 
     #[test]
     fn client_config_uses_environment_fallback() {
-        let (config, args) =
-            parse_client_config_with_env(vec!["attach".into(), "work".into()], Some("C-b".into()))
-                .unwrap();
+        let (config, args) = parse_client_config_with_env(
+            vec!["attach".into(), "work".into()],
+            Some("C-b".into()),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             config.prefix,
             PrefixKey {
@@ -2218,6 +2517,7 @@ mod tests {
                 "work".into(),
             ],
             Some("C-a".into()),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2237,9 +2537,12 @@ mod tests {
             vec!["--prefix", "C-b", "new", "work"],
             vec!["--prefix", "C-b"],
         ] {
-            let (config, remaining) =
-                parse_client_config_with_env(args.iter().map(|s| s.to_string()).collect(), None)
-                    .unwrap();
+            let (config, remaining) = parse_client_config_with_env(
+                args.iter().map(|s| s.to_string()).collect(),
+                None,
+                None,
+            )
+            .unwrap();
             assert_eq!(config.prefix.ctrl_char, 'B');
             assert!(
                 !remaining
@@ -2259,16 +2562,188 @@ mod tests {
                 "work".into(),
             ],
             None,
+            None,
         )
         .unwrap_err()
         .to_string();
         assert!(err.starts_with("invalid prefix"), "{err}");
 
-        let err =
-            parse_client_config_with_env(vec!["attach".into(), "work".into()], Some("C-1".into()))
-                .unwrap_err()
-                .to_string();
+        let err = parse_client_config_with_env(
+            vec!["attach".into(), "work".into()],
+            Some("C-1".into()),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.starts_with("invalid prefix"), "{err}");
+    }
+
+    #[test]
+    fn client_config_status_bar_env_and_cli() {
+        // Env alone turns the bar off.
+        let (config, _) = parse_client_config_with_env(vec![], None, Some("off".into())).unwrap();
+        assert!(!config.status_bar);
+
+        // CLI takes precedence over env, and the option is stripped from args.
+        let (config, args) = parse_client_config_with_env(
+            vec![
+                "--status-bar".into(),
+                "on".into(),
+                "attach".into(),
+                "1".into(),
+            ],
+            None,
+            Some("off".into()),
+        )
+        .unwrap();
+        assert!(config.status_bar);
+        assert_eq!(args, vec!["attach", "1"]);
+
+        // `--status-bar=off` form works too.
+        let (config, args) =
+            parse_client_config_with_env(vec!["--status-bar=off".into()], None, None).unwrap();
+        assert!(!config.status_bar);
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn client_config_rejects_invalid_status_bar_value() {
+        let err = parse_client_config_with_env(vec!["--status-bar=maybe".into()], None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("invalid status bar option"), "{err}");
+
+        let err = parse_client_config_with_env(vec!["--status-bar".into()], None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("invalid status bar option"), "{err}");
+    }
+
+    fn test_config(status_bar: bool) -> ClientConfig {
+        ClientConfig {
+            prefix: DEFAULT_PREFIX,
+            status_bar,
+        }
+    }
+
+    #[test]
+    fn session_area_height_reserves_bottom_row_when_active() {
+        assert_eq!(session_area_height(test_config(true), 24), 23);
+        assert_eq!(
+            session_area_height(test_config(true), STATUS_BAR_MIN_HEIGHT),
+            STATUS_BAR_MIN_HEIGHT - 1
+        );
+        // Too small for the bar: keep every row for the session.
+        assert_eq!(session_area_height(test_config(true), 2), 2);
+        assert_eq!(session_area_height(test_config(true), 1), 1);
+        // Disabled by config: full height regardless.
+        assert_eq!(session_area_height(test_config(false), 24), 24);
+    }
+
+    fn bar_session(session_id: &str, name: &str, exited: bool, attached: bool) -> SessionInfo {
+        SessionInfo {
+            session_id: session_id.to_string(),
+            name: name.to_string(),
+            exited,
+            attached,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn status_bar_items_sort_numerically_and_mark_current() {
+        let sessions = vec![
+            bar_session("10", "ten", false, false),
+            bar_session("2", "two", false, true),
+            bar_session("1", "one", true, false),
+        ];
+
+        let items = build_status_bar_items(&sessions, "2");
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "10"]
+        );
+        assert!(items[1].is_current);
+        assert!(!items[0].is_current);
+        assert!(items[0].exited);
+    }
+
+    #[test]
+    fn status_bar_segments_carry_plaintext_markers() {
+        let items = build_status_bar_items(
+            &[
+                bar_session("1", "work", false, true),
+                bar_session("2", "old", true, false),
+            ],
+            "1",
+        );
+
+        let text: String = status_bar_segments(&items)
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect();
+
+        assert_eq!(text, "[qscn] 1:work* 2:old!");
+    }
+
+    #[test]
+    fn render_status_bar_writes_bottom_row_and_restores_cursor() {
+        let items = build_status_bar_items(&[bar_session("1", "work", false, true)], "1");
+        let cols = 20u16;
+        let mut out = Vec::new();
+
+        render_status_bar(&mut out, &items, (cols, 5), true).unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        // Bottom row addressing, cursor save/restore, and synchronized update.
+        assert!(text.contains("\x1b[5;1H"), "{text:?}");
+        assert!(text.contains("\x1b7"), "{text:?}");
+        assert!(text.contains("\x1b8"), "{text:?}");
+        assert!(text.starts_with("\x1b[?2026h"), "{text:?}");
+        assert!(text.ends_with("\x1b[?2026l"), "{text:?}");
+        assert!(text.contains("\x1b[?25h"), "{text:?}");
+        // Colorless test environment: plain content padded to the full width.
+        let start = text.find("\x1b[5;1H").unwrap() + "\x1b[5;1H".len();
+        let end = text.find("\x1b[0m\x1b8").unwrap();
+        let content = &text[start..end];
+        assert_eq!(content.len(), cols as usize, "{content:?}");
+        assert!(content.starts_with("[qscn] 1:work*"), "{content:?}");
+    }
+
+    #[test]
+    fn render_status_bar_hidden_cursor_stays_hidden() {
+        let items = build_status_bar_items(&[bar_session("1", "work", false, true)], "1");
+        let mut out = Vec::new();
+
+        render_status_bar(&mut out, &items, (20, 5), false).unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("\x1b[?25h"), "{text:?}");
+    }
+
+    #[test]
+    fn render_status_bar_truncates_to_narrow_width() {
+        let items = build_status_bar_items(
+            &[
+                bar_session("1", "alpha", false, true),
+                bar_session("2", "beta", false, false),
+            ],
+            "1",
+        );
+        let cols = 10u16;
+        let mut out = Vec::new();
+
+        render_status_bar(&mut out, &items, (cols, 5), true).unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        let start = text.find("\x1b[5;1H").unwrap() + "\x1b[5;1H".len();
+        let end = text.find("\x1b[0m\x1b8").unwrap();
+        let content = &text[start..end];
+        assert_eq!(content, "[qscn] 1:a");
     }
 
     #[test]
