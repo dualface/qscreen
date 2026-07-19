@@ -70,7 +70,7 @@ Verify the release before handing off: `shasum -a 256 -c SHA256SUMS` must pass l
 
 ## Coding Style & Naming Conventions
 
-Use Rust 2024 edition idioms and `rustfmt` defaults. Keep module names, file names, and functions in `snake_case`; types and enum variants use `PascalCase`; constants use `SCREAMING_SNAKE_CASE`. Prefer workspace dependencies in the root `Cargo.toml` for shared crates. Keep protocol JSON field names and compatibility behavior stable, especially `payload_b64` and size limits.
+Use Rust 2024 edition idioms and `rustfmt` defaults. Keep module names, file names, and functions in `snake_case`; types and enum variants use `PascalCase`; constants use `SCREAMING_SNAKE_CASE`. Prefer workspace dependencies in the root `Cargo.toml` for shared crates. Keep protocol JSON field names and compatibility behavior stable, especially `payload_b64` and size limits. Write all code comments in English.
 
 ## Testing Guidelines
 
@@ -79,6 +79,8 @@ Add focused unit tests near the code they cover. Use descriptive test names such
 ## Commit & Pull Request Guidelines
 
 Git history currently has only `Init import`, so no strict convention is established. Use concise imperative commit subjects, for example `Add resize validation tests` or `Fix daemon shutdown handling`. Pull requests should include a short behavior summary, test commands run, linked issues if any, and screenshots or terminal output when CLI behavior changes. Note Windows-specific manual testing when touching daemon, pipe, or PTY code.
+
+Push to the remote immediately after committing.
 
 ## Security & Configuration Tips
 
