@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "qscreen-client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -431,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "qscreen-daemon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "qscreen-protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "qscreen-shared"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "quote"

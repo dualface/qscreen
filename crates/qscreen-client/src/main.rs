@@ -21,8 +21,8 @@ mod color;
 mod term;
 
 const DEFAULT_PREFIX: PrefixKey = PrefixKey {
-    ctrl_char: 'A',
-    byte: 0x01,
+    ctrl_char: 'B',
+    byte: 0x02,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,7 +220,11 @@ fn run_client(args: Vec<String>) -> anyhow::Result<()> {
         match args.as_slice() {
             [] => cmd_default(config).await,
             [cmd] if cmd == "-h" || cmd == "--help" => {
-                print_help();
+                print_help(config.prefix);
+                Ok(())
+            }
+            [cmd] if cmd == "-V" || cmd == "--version" => {
+                print_version();
                 Ok(())
             }
             [cmd] if cmd == "ls" || cmd == "list" => cmd_list().await,
@@ -374,13 +378,105 @@ fn windows_locale_is_chinese() -> bool {
 
 // ── Help text ────────────────────────────────────────────────────────────────
 
-fn print_help() {
-    let raw = if is_chinese() {
-        help_text_zh()
-    } else {
-        help_text_en()
-    };
-    print!("{}", colorize_help(raw));
+fn print_version() {
+    println!("qscn {}", env!("CARGO_PKG_VERSION"));
+}
+
+/// One in-session prefix key binding. `keys` is the key(s) pressed after the
+/// prefix; the literal `<prefix>` token is expanded to the active prefix label.
+struct PrefixBinding {
+    keys: &'static str,
+    desc_en: &'static str,
+    desc_zh: &'static str,
+}
+
+/// Single source of truth for the `<prefix>`-driven in-session commands, shared
+/// by the CLI `--help` output and the in-session `<prefix> ?` help screen.
+const PREFIX_BINDINGS: &[PrefixBinding] = &[
+    PrefixBinding {
+        keys: "?",
+        desc_en: "show this key-binding help (Esc or q to close)",
+        desc_zh: "显示此快捷键帮助(按 Esc 或 q 关闭)",
+    },
+    PrefixBinding {
+        keys: "d",
+        desc_en: "detach from the session (it keeps running in the background)",
+        desc_zh: "从当前会话 detach(会话继续在后台运行)",
+    },
+    PrefixBinding {
+        keys: "s",
+        desc_en: "open the session list (Enter switch, c create, r rename, q cancel)",
+        desc_zh: "打开会话列表(Enter 切换,c 新建,r 改名,q 取消)",
+    },
+    PrefixBinding {
+        keys: "n",
+        desc_en: "switch to the next session (by ID, wraps around)",
+        desc_zh: "切换到下一个会话(按 ID 顺序,末尾回到开头)",
+    },
+    PrefixBinding {
+        keys: "p",
+        desc_en: "switch to the previous session (by ID, wraps around)",
+        desc_zh: "切换到上一个会话(按 ID 顺序,开头回到末尾)",
+    },
+    PrefixBinding {
+        keys: "<prefix>",
+        desc_en: "send a literal prefix key to the terminal",
+        desc_zh: "向终端发送字面前缀字符",
+    },
+];
+
+/// Human-readable label for a prefix key, e.g. `Ctrl+B`.
+fn prefix_label(prefix: PrefixKey) -> String {
+    format!("Ctrl+{}", prefix.ctrl_char)
+}
+
+/// Width of the indented `Ctrl+X key` column before the description text, so the
+/// descriptions line up across bindings. Combos are ASCII, so character count
+/// equals display width here.
+const PREFIX_COMBO_WIDTH: usize = 28;
+
+/// Build the aligned `<prefix>`-binding rows for the given prefix, localized by
+/// `zh`. Each row is `(combo_field, description)`: `combo_field` is the indented,
+/// width-padded `Ctrl+X key` column meant to be rendered in the KEY color and the
+/// description in the HINT color. Shared by both `--help` and the in-session help
+/// screen so they never drift and highlight the keys identically.
+fn prefix_help_rows(prefix: PrefixKey, zh: bool) -> Vec<(String, String)> {
+    let label = prefix_label(prefix);
+    PREFIX_BINDINGS
+        .iter()
+        .map(|b| {
+            let keys = b.keys.replace("<prefix>", &label);
+            let combo = format!("{label} {keys}");
+            let desc = if zh { b.desc_zh } else { b.desc_en };
+            (
+                format!("  {combo:<width$}", width = PREFIX_COMBO_WIDTH),
+                desc.to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The `--help` key-binding block: combos highlighted in KEY (bold yellow),
+/// descriptions in HINT (dim). Degrades to plain aligned text without color.
+fn prefix_help_block(prefix: PrefixKey, zh: bool) -> String {
+    prefix_help_rows(prefix, zh)
+        .iter()
+        .map(|(combo, desc)| {
+            format!(
+                "{}{}",
+                color::paint(combo, color::sgr::KEY),
+                color::paint(desc, color::sgr::HINT)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn print_help(prefix: PrefixKey) {
+    let zh = is_chinese();
+    let raw = if zh { help_text_zh() } else { help_text_en() };
+    let raw = raw.replace("%PREFIX_BINDINGS%", &prefix_help_block(prefix, zh));
+    print!("{}", colorize_help(&raw));
 }
 
 /// Colorize the help text: the first-line title and section headings of the
@@ -408,19 +504,19 @@ fn help_text_zh() -> &'static str {
     r#"qscreen — 轻量终端会话管理器
 
 用法:
-  qscn [--prefix C-a]          智能启动：无会话时新建并进入，单会话时直接 attach，
+  qscn [--prefix C-b]          智能启动：无会话时新建并进入，单会话时直接 attach，
                             多会话时列出所有会话
-  qscn [--prefix C-a] new
+  qscn [--prefix C-b] new
                                新建自动命名会话并进入
-  qscn [--prefix C-a] new --name <name>
+  qscn [--prefix C-b] new --name <name>
                                用参数指定显示名
-  qscn [--prefix C-a] new --shell <shell>
+  qscn [--prefix C-b] new --shell <shell>
                                指定启动 shell（Windows: cmd、powershell 或可执行文件路径；Unix: shell 路径）
-  qscn [--prefix C-a] new --cwd <path>
+  qscn [--prefix C-b] new --cwd <path>
                                指定会话启动工作目录
-  qscn [--prefix C-a] attach [session_id]
+  qscn [--prefix C-b] attach [session_id]
                                进入已有会话；省略 session_id 时进入 ID 最大的可用会话（别名 att）
-  qscn [--prefix C-a] -r [session_id]
+  qscn [--prefix C-b] -r [session_id]
                                同 attach，兼容 tmux 风格
   qscn ls                      列出所有会话（同 list）
   qscn list                    列出所有会话
@@ -429,10 +525,12 @@ fn help_text_zh() -> &'static str {
                                修改会话显示名
   qscn shutdown                停止后台 daemon（所有会话将被关闭）
   qscn -h, --help              显示此帮助
+  qscn -V, --version           显示版本号
 
 前缀:
-  --prefix C-b                 使用 Ctrl+B 作为当前命令的会话前缀
-  QSCREEN_PREFIX=C-b           为所有命令设置备用前缀
+  默认前缀为 Ctrl+B（C-b）
+  --prefix C-a                 使用 Ctrl+A 作为当前命令的会话前缀
+  QSCREEN_PREFIX=C-a           为所有命令设置备用前缀
   支持 C-a..C-z 或 Ctrl+A..Ctrl+Z；CLI 参数优先于环境变量
 
 状态栏:
@@ -441,12 +539,8 @@ fn help_text_zh() -> &'static str {
   QSCREEN_STATUS_BAR=off       为所有命令关闭状态栏
   取值 on|off；CLI 参数优先于环境变量；终端高度不足 3 行时自动停用
 
-会话内热键:
-  <prefix> d                  从当前会话 detach（会话继续在后台运行）
-  <prefix> <prefix>           向 PTY 发送字面前缀字符
-  <prefix> s                  打开会话列表（Enter 切换，c 新建，r 改名，q 取消）
-  <prefix> n                  切换到下一个会话（按 ID 顺序，末尾回到开头）
-  <prefix> p                  切换到上一个会话（按 ID 顺序，开头回到末尾）
+会话内热键（默认前缀 Ctrl+B，按下前缀后再按对应键）:
+%PREFIX_BINDINGS%
 
 ls 输出格式:
   <session_id>  <name>  <状态>  <创建时间>  <终端尺寸>
@@ -458,7 +552,7 @@ ls 输出格式:
   qscn new --name work         # 新建显示名为 work 的会话
   qscn new --shell cmd --name work
   qscn new --cwd C:\work --name work
-  qscn --prefix C-b attach 1   # 使用 Ctrl+B 作为前缀进入 session_id=1
+  qscn --prefix C-a attach 1   # 使用 Ctrl+A 作为前缀进入 session_id=1
   qscn attach 1                # 重新进入 session_id=1
   qscn rename 1 work           # 修改 session_id=1 的显示名
   qscn ls                      # 查看所有会话状态
@@ -470,19 +564,19 @@ fn help_text_en() -> &'static str {
     r#"qscreen — lightweight terminal session manager
 
 Usage:
-  qscn [--prefix C-a]          smart launch: create and enter a session if no sessions,
+  qscn [--prefix C-b]          smart launch: create and enter a session if no sessions,
                             attach if one session, list all if multiple
-  qscn [--prefix C-a] new
+  qscn [--prefix C-b] new
                                create an auto-named session and attach
-  qscn [--prefix C-a] new --name <name>
+  qscn [--prefix C-b] new --name <name>
                                specify the display name as an option
-  qscn [--prefix C-a] new --shell <shell>
+  qscn [--prefix C-b] new --shell <shell>
                                specify the startup shell (Windows: cmd, powershell, or an executable path; Unix: shell path)
-  qscn [--prefix C-a] new --cwd <path>
+  qscn [--prefix C-b] new --cwd <path>
                                specify the session working directory
-  qscn [--prefix C-a] attach [session_id]
+  qscn [--prefix C-b] attach [session_id]
                                attach to an existing session; without session_id, attach to the highest-ID available session (alias: att)
-  qscn [--prefix C-a] -r [session_id]
+  qscn [--prefix C-b] -r [session_id]
                                same as attach (tmux-style shorthand)
   qscn ls                      list all sessions (alias: list)
   qscn list                    list all sessions
@@ -491,10 +585,12 @@ Usage:
                                change a session display name
   qscn shutdown                stop the background daemon (closes all sessions)
   qscn -h, --help              show this help
+  qscn -V, --version           show the version
 
 Prefix:
-  --prefix C-b                 use Ctrl+B as the session prefix for this command
-  QSCREEN_PREFIX=C-b           set a fallback prefix for every command
+  the default prefix is Ctrl+B (C-b)
+  --prefix C-a                 use Ctrl+A as the session prefix for this command
+  QSCREEN_PREFIX=C-a           set a fallback prefix for every command
   Values: C-a..C-z or Ctrl+A..Ctrl+Z; CLI takes precedence over env
 
 Status bar:
@@ -503,12 +599,8 @@ Status bar:
   QSCREEN_STATUS_BAR=off       disable the status bar for every command
   Values: on|off; CLI takes precedence over env; disabled when the terminal has fewer than 3 rows
 
-Key bindings (inside a session):
-  <prefix> d                  detach from session (session keeps running)
-  <prefix> <prefix>           send a literal prefix key to the PTY
-  <prefix> s                  open the session list (Enter switch, c create, r rename, q cancel)
-  <prefix> n                  switch to the next session (by ID, wraps around)
-  <prefix> p                  switch to the previous session (by ID, wraps around)
+Key bindings (default prefix Ctrl+B; press the prefix, then the key):
+%PREFIX_BINDINGS%
 
 ls output format:
   <session_id>  <name>  <state>  <created-at>  <terminal-size>
@@ -520,7 +612,7 @@ Examples:
   qscn new --name work         # create a session with display name 'work'
   qscn new --shell cmd --name work
   qscn new --cwd C:\work --name work
-  qscn --prefix C-b attach 1   # attach to session_id=1 using Ctrl+B as the prefix
+  qscn --prefix C-a attach 1   # attach to session_id=1 using Ctrl+A as the prefix
   qscn attach 1                # reattach to session_id=1
   qscn rename 1 work           # change the display name for session_id=1
   qscn ls                      # show all session states
@@ -1845,6 +1937,7 @@ enum AttachAction {
     Focus,
     Detach,
     OpenSessionList,
+    OpenHelp,
     SwitchSession(SwitchDirection),
 }
 
@@ -1896,6 +1989,10 @@ impl PrefixState {
             }
             if key_char_eq_ignore_ascii_case(key_event.code, 's') && session_list_action_enabled() {
                 actions.push(AttachAction::OpenSessionList);
+                return actions;
+            }
+            if key_char_eq_ignore_ascii_case(key_event.code, '?') {
+                actions.push(AttachAction::OpenHelp);
                 return actions;
             }
             if key_char_eq_ignore_ascii_case(key_event.code, 'n') {
@@ -2203,6 +2300,45 @@ async fn run_attach_loop(
                             }
                         }
                     }
+                    Some(AttachAction::OpenHelp) => {
+                        stop_input.store(true, Ordering::Relaxed);
+                        let _ = input_handle.await;
+
+                        run_help_mode(config.prefix, screen.size(), &mut stdout).await?;
+
+                        // The help modal painted over the whole screen; restore the
+                        // session view exactly like the session list's close path.
+                        let (w, h) = screen.size();
+                        frame_renderer.reset();
+                        msg_id += 1;
+                        let resize_msg = Message {
+                            kind: MessageKind::Request,
+                            id: msg_id.to_string(),
+                            command: Some(Command::Resize),
+                            session_id: session_id_c.clone(),
+                            width: w as u32,
+                            height: session_area_height(config, h) as u32,
+                            ..Default::default()
+                        };
+                        if let Ok(bytes) = resize_msg.to_json_line() {
+                            let _ = writer_c.lock().await.write_all(&bytes).await;
+                        }
+                        stop_input.store(false, Ordering::Relaxed);
+                        input_handle = spawn_attach_input_reader(
+                            action_tx.clone(),
+                            stop_input.clone(),
+                            config.prefix,
+                            input_modes.clone(),
+                            app_rows.clone(),
+                        );
+                        let _ = draw_status_bar(
+                            &mut stdout,
+                            &bar_items,
+                            config,
+                            (w, h),
+                            bar_cursor_visible,
+                        );
+                    }
                     Some(AttachAction::SwitchSession(direction)) => {
                         // Stop the input reader before the async lookup so it can
                         // never race the next attachment's reader over Crossterm
@@ -2297,6 +2433,7 @@ fn spawn_attach_input_reader(
                             action,
                             AttachAction::Detach
                                 | AttachAction::OpenSessionList
+                                | AttachAction::OpenHelp
                                 | AttachAction::SwitchSession(_)
                         );
                         let _ = action_tx.send(action);
@@ -2328,6 +2465,96 @@ fn spawn_attach_input_reader(
             }
         }
     })
+}
+
+/// Full-screen help overlay listing the in-session `<prefix>` bindings. Blocks
+/// until the user presses Esc or q, then returns so the caller can repaint the
+/// session view.
+async fn run_help_mode<W: Write>(
+    prefix: PrefixKey,
+    term_size: (u16, u16),
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    render_help_screen(stdout, prefix, term_size)?;
+    read_help_dismiss().await
+}
+
+/// Wait for the key that dismisses the help screen (Esc or q). Other keys are
+/// ignored so the screen stays put.
+async fn read_help_dismiss() -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(|| {
+        loop {
+            match crossterm::event::poll(Duration::from_millis(50)) {
+                Ok(true) => match crossterm::event::read() {
+                    Ok(Event::Key(key_event))
+                        if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                    {
+                        match key_event.code {
+                            KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
+                            _ => {}
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => return Err(anyhow::Error::new(e)),
+                },
+                Ok(false) => {}
+                Err(e) => return Err(anyhow::Error::new(e)),
+            }
+        }
+    })
+    .await?
+}
+
+fn render_help_screen<W: Write>(
+    out: &mut W,
+    prefix: PrefixKey,
+    term_size: (u16, u16),
+) -> std::io::Result<()> {
+    let (cols, rows_count) = term_size;
+    let zh = is_chinese();
+    write!(out, "\x1b[?2026h\x1b[0m\x1b[2J\x1b[H")?;
+
+    let title = if zh {
+        "qscreen 快捷键"
+    } else {
+        "qscreen key bindings"
+    };
+    write_text_line(out, title, Some(color::sgr::HEADER), cols)?;
+    write_text_line(out, "", None, cols)?;
+
+    // Each binding renders the combo in KEY (bold yellow) and the description in
+    // HINT (dim), truncated together to the terminal width.
+    let rows = prefix_help_rows(prefix, zh);
+    for (combo, desc) in &rows {
+        write!(out, "\x1b[0m")?;
+        write_status_segments(
+            out,
+            &[
+                (combo.as_str(), color::sgr::KEY),
+                (desc.as_str(), color::sgr::HINT),
+            ],
+            cols,
+        )?;
+        write!(out, "\r\n")?;
+    }
+
+    // Pin the dismiss hint to the last row when there is room; otherwise let it
+    // follow the bindings directly.
+    let used_lines = rows.len() as u16 + 2;
+    if rows_count > used_lines + 1 {
+        write!(out, "\x1b[{rows_count};1H")?;
+    } else {
+        write_text_line(out, "", None, cols)?;
+    }
+    let hint = if zh {
+        "按 Esc 或 q 关闭"
+    } else {
+        "press Esc or q to close"
+    };
+    write!(out, "\x1b[0m")?;
+    write_status_segments(out, &[(hint, color::sgr::HINT)], cols)?;
+    write!(out, "\x1b[?2026l")?;
+    out.flush()
 }
 
 async fn run_session_list_mode<W: Write>(
@@ -3018,9 +3245,14 @@ mod tests {
 
     #[test]
     fn parse_prefix_accepts_supported_aliases() {
-        assert_eq!(PrefixKey::parse("C-a").unwrap(), DEFAULT_PREFIX);
-        assert_eq!(PrefixKey::parse("c-a").unwrap(), DEFAULT_PREFIX);
-        assert_eq!(PrefixKey::parse("Ctrl+A").unwrap(), DEFAULT_PREFIX);
+        let ctrl_a = PrefixKey {
+            ctrl_char: 'A',
+            byte: 0x01,
+        };
+        assert_eq!(PrefixKey::parse("C-a").unwrap(), ctrl_a);
+        assert_eq!(PrefixKey::parse("c-a").unwrap(), ctrl_a);
+        assert_eq!(PrefixKey::parse("Ctrl+A").unwrap(), ctrl_a);
+        assert_eq!(PrefixKey::parse("C-b").unwrap(), DEFAULT_PREFIX);
         assert_eq!(
             PrefixKey::parse("ctrl+z").unwrap(),
             PrefixKey {
@@ -3565,18 +3797,18 @@ mod tests {
     }
 
     #[test]
-    fn prefix_key_event_matches_default_ctrl_a() {
-        assert!(is_prefix_key_event(ctrl_key('a'), DEFAULT_PREFIX));
-        assert!(is_prefix_key_event(ctrl_key('A'), DEFAULT_PREFIX));
-        assert!(!is_prefix_key_event(ctrl_key('b'), DEFAULT_PREFIX));
+    fn prefix_key_event_matches_default_ctrl_b() {
+        assert!(is_prefix_key_event(ctrl_key('b'), DEFAULT_PREFIX));
+        assert!(is_prefix_key_event(ctrl_key('B'), DEFAULT_PREFIX));
+        assert!(!is_prefix_key_event(ctrl_key('a'), DEFAULT_PREFIX));
     }
 
     #[test]
-    fn prefix_key_event_matches_custom_ctrl_b() {
-        let prefix = PrefixKey::parse("C-b").unwrap();
-        assert!(is_prefix_key_event(ctrl_key('b'), prefix));
-        assert!(is_prefix_key_event(ctrl_key('B'), prefix));
-        assert!(!is_prefix_key_event(ctrl_key('a'), prefix));
+    fn prefix_key_event_matches_custom_ctrl_a() {
+        let prefix = PrefixKey::parse("C-a").unwrap();
+        assert!(is_prefix_key_event(ctrl_key('a'), prefix));
+        assert!(is_prefix_key_event(ctrl_key('A'), prefix));
+        assert!(!is_prefix_key_event(ctrl_key('b'), prefix));
     }
 
     #[test]
@@ -3705,7 +3937,7 @@ mod tests {
         let mut state = PrefixState::default();
         assert_eq!(
             state.handle_key(
-                ctrl_key('a'),
+                ctrl_key('b'),
                 DEFAULT_PREFIX,
                 term::InputModeState::default(),
                 now()
@@ -3725,7 +3957,7 @@ mod tests {
         let mut state = PrefixState::default();
         assert_eq!(
             state.handle_key(
-                ctrl_key('a'),
+                ctrl_key('b'),
                 DEFAULT_PREFIX,
                 term::InputModeState::default(),
                 now()
@@ -3741,6 +3973,48 @@ mod tests {
             ),
             vec![AttachAction::OpenSessionList]
         );
+    }
+
+    #[test]
+    fn prefix_state_opens_help_for_question_mark() {
+        for prefix in [DEFAULT_PREFIX, PrefixKey::parse("C-a").unwrap()] {
+            let mut state = PrefixState::default();
+            assert_eq!(
+                state.handle_key(
+                    ctrl_key(prefix.ctrl_char),
+                    prefix,
+                    term::InputModeState::default(),
+                    now()
+                ),
+                vec![]
+            );
+            assert_eq!(
+                state.handle_key(
+                    char_key('?'),
+                    prefix,
+                    term::InputModeState::default(),
+                    now()
+                ),
+                vec![AttachAction::OpenHelp]
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_help_rows_use_active_prefix_label() {
+        let rows = prefix_help_rows(DEFAULT_PREFIX, false);
+        // Every binding combo carries the active prefix label.
+        assert!(rows.iter().all(|(combo, _)| combo.contains("Ctrl+B")));
+        // The literal-prefix binding expands `<prefix>` to the label on both sides.
+        assert!(
+            rows.iter()
+                .any(|(combo, _)| combo.contains("Ctrl+B Ctrl+B"))
+        );
+        // The help binding is present.
+        assert!(rows.iter().any(|(combo, _)| combo.contains("Ctrl+B ?")));
+        // A custom prefix relabels every combo.
+        let rows_a = prefix_help_rows(PrefixKey::parse("C-a").unwrap(), false);
+        assert!(rows_a.iter().all(|(combo, _)| combo.contains("Ctrl+A")));
     }
 
     #[test]
