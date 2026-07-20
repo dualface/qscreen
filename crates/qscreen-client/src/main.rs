@@ -2133,16 +2133,7 @@ async fn run_attach_loop(
                                     }
                                 }
                             }
-                            // Ignore frames whose geometry no longer matches the
-                            // session area (e.g. a frame captured before a resize
-                            // was applied); rendering them would corrupt the
-                            // display until a matching frame arrives.
-                            let (cur_cols, cur_rows) = screen.size();
-                            let cur_area_h = session_area_height(config, cur_rows);
-                            let frame_matches = latest_frame
-                                .as_ref()
-                                .is_some_and(|f| f.cols == cur_cols && f.rows == cur_area_h);
-                            if let Some(frame) = latest_frame.as_ref().filter(|_| frame_matches) {
+                            if let Some(frame) = latest_frame.as_ref() {
                                 let _ = frame_renderer.render(&mut stdout, frame);
                                 *input_modes.lock().unwrap() = frame_renderer.input_modes();
                                 // Repaint the bar: a force-full render (first
@@ -2156,8 +2147,9 @@ async fn run_attach_loop(
                                     screen.size(),
                                     bar_cursor_visible,
                                 );
-                                // Keep the newest matching frame for overlay
-                                // repaint-on-close.
+                            }
+                            // Keep the newest frame for overlay repaint-on-close.
+                            if latest_frame.is_some() {
                                 last_frame = latest_frame;
                             }
                         }
@@ -2552,16 +2544,15 @@ async fn restore_session_after_overlay<S, W>(
         let _ = writer.lock().await.write_all(&bytes).await;
     }
 
-    // Only repaint the retained frame when it still matches the session area; a
-    // frame captured before a resize would render at the wrong geometry, so in
-    // that case clear and wait for the resized frame instead.
-    let frame = last_frame
-        .as_ref()
-        .filter(|f| f.cols == w && f.rows == area_h);
+    // Repaint the last known frame to remove the overlay. Like an ordinary
+    // resize (and like a broadcast frame sized for a differently-sized active
+    // client), the frame renderer handles a geometry that differs from the
+    // current terminal; the next frame from the daemon corrects any transient
+    // mismatch.
     repaint_session_after_overlay(
         stdout,
         frame_renderer,
-        frame,
+        last_frame.as_ref(),
         bar_items,
         config,
         (w, h),
