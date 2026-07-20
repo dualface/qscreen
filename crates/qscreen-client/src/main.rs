@@ -445,6 +445,8 @@ fn help_text_zh() -> &'static str {
   <prefix> d                  从当前会话 detach（会话继续在后台运行）
   <prefix> <prefix>           向 PTY 发送字面前缀字符
   <prefix> s                  打开会话列表（Enter 切换，c 新建，r 改名，q 取消）
+  <prefix> n                  切换到下一个会话（按 ID 顺序，末尾回到开头）
+  <prefix> p                  切换到上一个会话（按 ID 顺序，开头回到末尾）
 
 ls 输出格式:
   <session_id>  <name>  <状态>  <创建时间>  <终端尺寸>
@@ -505,6 +507,8 @@ Key bindings (inside a session):
   <prefix> d                  detach from session (session keeps running)
   <prefix> <prefix>           send a literal prefix key to the PTY
   <prefix> s                  open the session list (Enter switch, c create, r rename, q cancel)
+  <prefix> n                  switch to the next session (by ID, wraps around)
+  <prefix> p                  switch to the previous session (by ID, wraps around)
 
 ls output format:
   <session_id>  <name>  <state>  <created-at>  <terminal-size>
@@ -1422,6 +1426,40 @@ fn highest_live_session_id_excluding(
         .map(|(_, session_id)| session_id)
 }
 
+/// Resolve the session to switch to when the user presses `<prefix> n` (next)
+/// or `<prefix> p` (previous). Live (non-exited) sessions are ordered by numeric
+/// session ID and navigation wraps around at the ends. Returns `None` when the
+/// current session is the only live one, so the caller stays put.
+fn adjacent_session_id(
+    sessions: &[SessionInfo],
+    current_session_id: &str,
+    direction: SwitchDirection,
+) -> Option<String> {
+    let mut live: Vec<(u64, &str)> = sessions
+        .iter()
+        .filter(|s| !s.exited)
+        .filter_map(|s| {
+            s.session_id
+                .parse::<u64>()
+                .ok()
+                .map(|id| (id, s.session_id.as_str()))
+        })
+        .collect();
+    live.sort_by_key(|(id, _)| *id);
+
+    if live.len() < 2 {
+        return None;
+    }
+
+    let current = live.iter().position(|(_, id)| *id == current_session_id)?;
+    let len = live.len();
+    let target = match direction {
+        SwitchDirection::Next => (current + 1) % len,
+        SwitchDirection::Prev => (current + len - 1) % len,
+    };
+    Some(live[target].1.to_string())
+}
+
 /// The attach handshake failed because the daemon reports the target session as
 /// missing or already exited. Carries the daemon's original message so explicit
 /// `attach <id>` still surfaces it verbatim, while default-attach can downcast
@@ -1738,6 +1776,12 @@ fn mouse_mode_reports(mode: FrameMouseMode, pressed: bool, motion: bool) -> bool
 
 // ── Attach main loop ─────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwitchDirection {
+    Next,
+    Prev,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AttachAction {
     Input(Vec<u8>),
@@ -1745,6 +1789,7 @@ enum AttachAction {
     Focus,
     Detach,
     OpenSessionList,
+    SwitchSession(SwitchDirection),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1795,6 +1840,14 @@ impl PrefixState {
             }
             if key_char_eq_ignore_ascii_case(key_event.code, 's') && session_list_action_enabled() {
                 actions.push(AttachAction::OpenSessionList);
+                return actions;
+            }
+            if key_char_eq_ignore_ascii_case(key_event.code, 'n') {
+                actions.push(AttachAction::SwitchSession(SwitchDirection::Next));
+                return actions;
+            }
+            if key_char_eq_ignore_ascii_case(key_event.code, 'p') {
+                actions.push(AttachAction::SwitchSession(SwitchDirection::Prev));
                 return actions;
             }
 
@@ -2092,6 +2145,17 @@ async fn run_attach_loop(
                                     bar_cursor_visible,
                                 );
                             }
+                        }
+                    }
+                    Some(AttachAction::SwitchSession(direction)) => {
+                        // Query the daemon for the live session set and switch to
+                        // the neighbor. On a fetch error or when this is the only
+                        // live session, stay attached and keep reading input.
+                        if let Ok(sessions) = list_sessions().await
+                            && let Some(next_session_id) =
+                                adjacent_session_id(&sessions, &session_id_c, direction)
+                        {
+                            break AttachOutcome::SwitchTo(next_session_id);
                         }
                     }
                 }
@@ -3992,6 +4056,128 @@ mod tests {
             highest_live_session_id_excluding(&sessions, &["1".to_string()]),
             None
         );
+    }
+
+    #[test]
+    fn adjacent_session_id_moves_next_in_id_order() {
+        let sessions = vec![
+            session_info_with_id("2", false),
+            session_info_with_id("10", false),
+            session_info_with_id("3", false),
+        ];
+        // Sorted live IDs: 2, 3, 10. Next after 3 is 10.
+        assert_eq!(
+            adjacent_session_id(&sessions, "3", SwitchDirection::Next),
+            Some("10".to_string())
+        );
+    }
+
+    #[test]
+    fn adjacent_session_id_moves_prev_in_id_order() {
+        let sessions = vec![
+            session_info_with_id("2", false),
+            session_info_with_id("10", false),
+            session_info_with_id("3", false),
+        ];
+        // Sorted live IDs: 2, 3, 10. Prev before 3 is 2.
+        assert_eq!(
+            adjacent_session_id(&sessions, "3", SwitchDirection::Prev),
+            Some("2".to_string())
+        );
+    }
+
+    #[test]
+    fn adjacent_session_id_wraps_around_both_ends() {
+        let sessions = vec![
+            session_info_with_id("2", false),
+            session_info_with_id("3", false),
+            session_info_with_id("10", false),
+        ];
+        // Next past the highest ID wraps to the lowest.
+        assert_eq!(
+            adjacent_session_id(&sessions, "10", SwitchDirection::Next),
+            Some("2".to_string())
+        );
+        // Prev before the lowest ID wraps to the highest.
+        assert_eq!(
+            adjacent_session_id(&sessions, "2", SwitchDirection::Prev),
+            Some("10".to_string())
+        );
+    }
+
+    #[test]
+    fn adjacent_session_id_skips_exited_sessions() {
+        let sessions = vec![
+            session_info_with_id("2", false),
+            session_info_with_id("3", true),
+            session_info_with_id("10", false),
+        ];
+        // 3 is exited, so next after 2 is 10, not 3.
+        assert_eq!(
+            adjacent_session_id(&sessions, "2", SwitchDirection::Next),
+            Some("10".to_string())
+        );
+    }
+
+    #[test]
+    fn adjacent_session_id_none_with_single_live_session() {
+        let sessions = vec![
+            session_info_with_id("2", false),
+            session_info_with_id("3", true),
+        ];
+        assert_eq!(
+            adjacent_session_id(&sessions, "2", SwitchDirection::Next),
+            None
+        );
+        assert_eq!(
+            adjacent_session_id(&sessions, "2", SwitchDirection::Prev),
+            None
+        );
+    }
+
+    #[test]
+    fn prefix_state_switches_sessions_for_next_and_prev() {
+        for prefix in [DEFAULT_PREFIX, PrefixKey::parse("C-b").unwrap()] {
+            let mut state = PrefixState::default();
+            assert_eq!(
+                state.handle_key(
+                    ctrl_key(prefix.ctrl_char),
+                    prefix,
+                    term::InputModeState::default(),
+                    now()
+                ),
+                vec![]
+            );
+            assert_eq!(
+                state.handle_key(
+                    char_key('n'),
+                    prefix,
+                    term::InputModeState::default(),
+                    now()
+                ),
+                vec![AttachAction::SwitchSession(SwitchDirection::Next)]
+            );
+
+            let mut state = PrefixState::default();
+            assert_eq!(
+                state.handle_key(
+                    ctrl_key(prefix.ctrl_char),
+                    prefix,
+                    term::InputModeState::default(),
+                    now()
+                ),
+                vec![]
+            );
+            assert_eq!(
+                state.handle_key(
+                    char_key('p'),
+                    prefix,
+                    term::InputModeState::default(),
+                    now()
+                ),
+                vec![AttachAction::SwitchSession(SwitchDirection::Prev)]
+            );
+        }
     }
 
     #[test]
