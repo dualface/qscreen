@@ -987,8 +987,6 @@ enum SessionListSelection {
     Close,
     Error(String),
     Switch(String),
-    /// The session exited while the list overlay was open.
-    Ended,
 }
 
 fn build_session_list_rows(
@@ -1952,10 +1950,6 @@ enum SessionListAction {
     Create,
     Rename,
     Cancel,
-    /// Terminal resized to the given `(cols, rows)` while the list was open.
-    Resize(u16, u16),
-    /// The session exited while the list was open.
-    SessionEnded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2273,28 +2267,12 @@ async fn run_attach_loop(
                         stop_input.store(true, Ordering::Relaxed);
                         let _ = input_handle.await;
 
-                        // Scope the overlay context so its borrows of msg_rx and
-                        // pending_messages end before we repaint.
-                        let mut focus_gained = false;
-                        let selection = {
-                            let mut ctx = OverlayCtx {
-                                msg_rx: &mut msg_rx,
-                                pending: &mut pending_messages,
-                                focus_gained: &mut focus_gained,
-                            };
-                            run_session_list_mode(
-                                &session_id_c,
-                                screen.size(),
-                                &mut stdout,
-                                &mut ctx,
-                            )
+                        match run_session_list_mode(&session_id_c, screen.size(), &mut stdout)
                             .await?
-                        };
-                        match selection {
+                        {
                             SessionListSelection::Switch(next_session_id) => {
                                 break AttachOutcome::SwitchTo(next_session_id);
                             }
-                            SessionListSelection::Ended => break AttachOutcome::Ended,
                             SessionListSelection::Close | SessionListSelection::Error(_) => {
                                 restore_session_after_overlay(
                                     &mut stdout,
@@ -2309,7 +2287,6 @@ async fn run_attach_loop(
                                     &session_id_c,
                                     &mut msg_id,
                                     &app_rows,
-                                    focus_gained,
                                 )
                                 .await;
                                 stop_input.store(false, Ordering::Relaxed);
@@ -2327,19 +2304,7 @@ async fn run_attach_loop(
                         stop_input.store(true, Ordering::Relaxed);
                         let _ = input_handle.await;
 
-                        let mut focus_gained = false;
-                        let outcome = {
-                            let mut ctx = OverlayCtx {
-                                msg_rx: &mut msg_rx,
-                                pending: &mut pending_messages,
-                                focus_gained: &mut focus_gained,
-                            };
-                            run_help_mode(config.prefix, screen.size(), &mut stdout, &mut ctx)
-                                .await?
-                        };
-                        if matches!(outcome, HelpOutcome::SessionEnded) {
-                            break AttachOutcome::Ended;
-                        }
+                        run_help_mode(config.prefix, screen.size(), &mut stdout).await?;
                         restore_session_after_overlay(
                             &mut stdout,
                             &mut screen,
@@ -2353,7 +2318,6 @@ async fn run_attach_loop(
                             &session_id_c,
                             &mut msg_id,
                             &app_rows,
-                            focus_gained,
                         )
                         .await;
                         stop_input.store(false, Ordering::Relaxed);
@@ -2531,9 +2495,10 @@ fn repaint_session_after_overlay<W: Write>(
 }
 
 /// Restore the attachment after a full-screen overlay closes: reassert the
-/// terminal size to the daemon, re-focus if focus was regained while open, and
-/// repaint the session view locally. Shared by the help and session-list close
-/// paths. The caller restarts the input reader afterwards.
+/// terminal size to the daemon and repaint the session view locally. Shared by
+/// the help and session-list close paths. The caller restarts the input reader
+/// afterwards, and the main loop then replays any daemon messages that arrived
+/// while the overlay was open.
 #[allow(clippy::too_many_arguments)]
 async fn restore_session_after_overlay<S, W>(
     stdout: &mut S,
@@ -2548,7 +2513,6 @@ async fn restore_session_after_overlay<S, W>(
     session_id: &str,
     msg_id: &mut u64,
     app_rows: &Arc<AtomicU16>,
-    focus_gained: bool,
 ) where
     S: Write,
     W: tokio::io::AsyncWrite + Unpin,
@@ -2577,23 +2541,6 @@ async fn restore_session_after_overlay<S, W>(
         let _ = writer.lock().await.write_all(&bytes).await;
     }
 
-    // If focus was regained while the overlay was open, re-focus this client so
-    // it becomes active and the size just sent is applied even when other
-    // clients are attached.
-    if focus_gained {
-        *msg_id += 1;
-        let focus_msg = Message {
-            kind: MessageKind::Request,
-            id: msg_id.to_string(),
-            command: Some(Command::Focus),
-            session_id: session_id.to_string(),
-            ..Default::default()
-        };
-        if let Ok(bytes) = focus_msg.to_json_line() {
-            let _ = writer.lock().await.write_all(&bytes).await;
-        }
-    }
-
     repaint_session_after_overlay(
         stdout,
         frame_renderer,
@@ -2606,117 +2553,59 @@ async fn restore_session_after_overlay<S, W>(
     *input_modes.lock().unwrap() = frame_renderer.input_modes();
 }
 
-/// Borrowed daemon-stream state shared with an open overlay so it can keep the
-/// connection drained while blocking on terminal input.
-struct OverlayCtx<'a> {
-    msg_rx: &'a mut tokio::sync::mpsc::UnboundedReceiver<Message>,
-    pending: &'a mut VecDeque<Message>,
-    /// Set when the terminal regained focus while the overlay was open, so the
-    /// caller can re-`Focus` this client (and thus reassert its PTY size) on
-    /// resume — the input reader that normally forwards focus is stopped.
-    focus_gained: &'a mut bool,
-}
-
-/// A terminal event surfaced to an overlay, plus the out-of-band "session ended"
-/// signal discovered while draining daemon messages.
-enum OverlayEvent {
-    Key(crossterm::event::KeyEvent),
+/// A key/resize event read while a full-screen overlay is open. Like the
+/// session-list overlay, an open overlay blocks on terminal input and does not
+/// consume the daemon stream; buffered daemon messages are processed by the main
+/// loop after the overlay closes.
+enum HelpKey {
+    Dismiss,
     Resize(u16, u16),
-    SessionEnded,
 }
 
-/// Block until the next key-press or resize arrives, draining daemon messages in
-/// the meantime so the channel can't grow unbounded while the overlay is open.
-/// Messages are buffered onto `ctx.pending` in order so the main loop replays
-/// them (scrollback output, then frames) after the overlay closes; consecutive
-/// frames are collapsed to the newest to bound memory without reordering output
-/// against frames. An `Exit`/disconnect becomes [`OverlayEvent::SessionEnded`].
-async fn overlay_next_event(ctx: &mut OverlayCtx<'_>) -> anyhow::Result<OverlayEvent> {
-    loop {
-        // Drain everything currently queued before blocking on input again.
+/// Wait for a key that dismisses the help screen (Esc or q) or a resize. Other
+/// keys are ignored so the screen stays put.
+async fn read_help_key() -> anyhow::Result<HelpKey> {
+    tokio::task::spawn_blocking(|| {
         loop {
-            match ctx.msg_rx.try_recv() {
-                Ok(msg) => match msg.event {
-                    Some(EventType::Exit) => return Ok(OverlayEvent::SessionEnded),
-                    Some(EventType::Frame) => {
-                        // Collapse runs of frames (replace a trailing buffered
-                        // frame) to bound memory, but keep ordering relative to
-                        // Output so scrollback replay is preserved.
-                        if matches!(
-                            ctx.pending.back().and_then(|m| m.event.as_ref()),
-                            Some(EventType::Frame)
-                        ) {
-                            if let Some(back) = ctx.pending.back_mut() {
-                                *back = msg;
-                            }
-                        } else {
-                            ctx.pending.push_back(msg);
+            match crossterm::event::poll(Duration::from_millis(50)) {
+                Ok(true) => match crossterm::event::read() {
+                    Ok(Event::Key(key_event))
+                        if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                    {
+                        match key_event.code {
+                            KeyCode::Esc | KeyCode::Char('q') => return Ok(HelpKey::Dismiss),
+                            _ => {}
                         }
                     }
-                    _ => ctx.pending.push_back(msg),
+                    Ok(Event::Resize(cols, rows)) => return Ok(HelpKey::Resize(cols, rows)),
+                    Ok(_) => {}
+                    Err(e) => return Err(anyhow::Error::new(e)),
                 },
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    return Ok(OverlayEvent::SessionEnded);
-                }
+                Ok(false) => {}
+                Err(e) => return Err(anyhow::Error::new(e)),
             }
         }
-
-        // Poll for a terminal event with a short timeout so control returns here
-        // to drain again if nothing was pressed.
-        let event = tokio::task::spawn_blocking(|| {
-            match crossterm::event::poll(Duration::from_millis(20)) {
-                Ok(true) => crossterm::event::read().map(Some),
-                Ok(false) => Ok(None),
-                Err(e) => Err(e),
-            }
-        })
-        .await?
-        .map_err(anyhow::Error::new)?;
-
-        match event {
-            Some(Event::Key(key_event))
-                if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
-            {
-                return Ok(OverlayEvent::Key(key_event));
-            }
-            Some(Event::Resize(cols, rows)) => return Ok(OverlayEvent::Resize(cols, rows)),
-            Some(Event::FocusGained) => *ctx.focus_gained = true,
-            _ => {}
-        }
-    }
-}
-
-/// Outcome of the in-session help overlay.
-enum HelpOutcome {
-    /// Dismissed with Esc or q.
-    Closed,
-    /// The session exited while the overlay was open.
-    SessionEnded,
+    })
+    .await?
 }
 
 /// Full-screen help overlay listing the in-session `<prefix>` bindings. Blocks
 /// until the user presses Esc or q, re-rendering on resize so the screen tracks
-/// the terminal, while draining daemon messages so the stream stays healthy.
+/// the terminal.
 async fn run_help_mode<W: Write>(
     prefix: PrefixKey,
     term_size: (u16, u16),
     stdout: &mut W,
-    ctx: &mut OverlayCtx<'_>,
-) -> anyhow::Result<HelpOutcome> {
+) -> anyhow::Result<()> {
     let mut size = term_size;
     render_help_screen(stdout, prefix, size)?;
     loop {
-        match overlay_next_event(ctx).await? {
-            OverlayEvent::SessionEnded => return Ok(HelpOutcome::SessionEnded),
-            OverlayEvent::Resize(cols, rows) => {
+        match read_help_key().await? {
+            HelpKey::Dismiss => return Ok(()),
+            HelpKey::Resize(cols, rows) => {
                 size = (cols, rows);
                 render_help_screen(stdout, prefix, size)?;
             }
-            OverlayEvent::Key(key_event) => match key_event.code {
-                KeyCode::Esc | KeyCode::Char('q') => return Ok(HelpOutcome::Closed),
-                _ => {}
-            },
         }
     }
 }
@@ -2799,9 +2688,7 @@ async fn run_session_list_mode<W: Write>(
     current_session_id: &str,
     term_size: (u16, u16),
     stdout: &mut W,
-    ctx: &mut OverlayCtx<'_>,
 ) -> anyhow::Result<SessionListSelection> {
-    let mut term_size = term_size;
     let mut rows = build_session_list_rows(&list_sessions().await?, current_session_id);
     let mut selected = rows
         .iter()
@@ -2812,13 +2699,8 @@ async fn run_session_list_mode<W: Write>(
     render_session_list(stdout, &rows, selected, &status, term_size)?;
 
     loop {
-        let action = read_session_list_action(ctx).await?;
+        let action = read_session_list_action().await?;
         match action {
-            SessionListAction::SessionEnded => return Ok(SessionListSelection::Ended),
-            SessionListAction::Resize(cols, rows_count) => {
-                term_size = (cols, rows_count);
-                render_session_list(stdout, &rows, selected, &status, term_size)?;
-            }
             SessionListAction::MoveUp => {
                 selected = move_session_list_selection(selected, rows.len(), -1);
                 render_session_list(stdout, &rows, selected, &status, term_size)?;
@@ -2853,27 +2735,22 @@ async fn run_session_list_mode<W: Write>(
                     render_session_list(stdout, &rows, selected, &status, term_size)?;
                     continue;
                 }
-                match prompt_session_rename(stdout, &rows, selected, &mut term_size, &row.name, ctx)
-                    .await?
-                {
-                    RenameOutcome::SessionEnded => return Ok(SessionListSelection::Ended),
-                    RenameOutcome::Submitted(new_name) => {
-                        match rename_session(&row.session_id, &new_name).await {
-                            Ok(()) => {
-                                rows = build_session_list_rows(
-                                    &list_sessions().await?,
-                                    current_session_id,
-                                );
-                                selected = rows
-                                    .iter()
-                                    .position(|r| r.session_id == row.session_id)
-                                    .unwrap_or_else(|| selected.min(rows.len().saturating_sub(1)));
-                                status = format!("renamed to \"{new_name}\"");
-                            }
-                            Err(e) => status = format!("rename failed: {e}"),
+                match prompt_session_rename(stdout, &rows, selected, term_size, &row.name).await? {
+                    Some(new_name) => match rename_session(&row.session_id, &new_name).await {
+                        Ok(()) => {
+                            rows = build_session_list_rows(
+                                &list_sessions().await?,
+                                current_session_id,
+                            );
+                            selected = rows
+                                .iter()
+                                .position(|r| r.session_id == row.session_id)
+                                .unwrap_or_else(|| selected.min(rows.len().saturating_sub(1)));
+                            status = format!("renamed to \"{new_name}\"");
                         }
-                    }
-                    RenameOutcome::Cancelled => status = String::new(),
+                        Err(e) => status = format!("rename failed: {e}"),
+                    },
+                    None => status = String::new(),
                 }
                 render_session_list(stdout, &rows, selected, &status, term_size)?;
             }
@@ -2898,7 +2775,6 @@ async fn run_session_list_mode<W: Write>(
                     SessionListSelection::Switch(name) => {
                         return Ok(SessionListSelection::Switch(name));
                     }
-                    SessionListSelection::Ended => return Ok(SessionListSelection::Ended),
                     SessionListSelection::Error(error) => {
                         status = error.clone();
                         render_session_list(stdout, &rows, selected, &status, term_size)?;
@@ -2923,18 +2799,27 @@ fn map_session_list_key(code: KeyCode) -> Option<SessionListAction> {
     }
 }
 
-async fn read_session_list_action(ctx: &mut OverlayCtx<'_>) -> anyhow::Result<SessionListAction> {
-    loop {
-        match overlay_next_event(ctx).await? {
-            OverlayEvent::SessionEnded => return Ok(SessionListAction::SessionEnded),
-            OverlayEvent::Resize(cols, rows) => return Ok(SessionListAction::Resize(cols, rows)),
-            OverlayEvent::Key(key_event) => {
-                if let Some(action) = map_session_list_key(key_event.code) {
-                    return Ok(action);
-                }
+async fn read_session_list_action() -> anyhow::Result<SessionListAction> {
+    tokio::task::spawn_blocking(|| {
+        loop {
+            match crossterm::event::poll(Duration::from_millis(50)) {
+                Ok(true) => match crossterm::event::read() {
+                    Ok(Event::Key(key_event))
+                        if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                    {
+                        if let Some(action) = map_session_list_key(key_event.code) {
+                            return Ok(action);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => return Err(anyhow::Error::new(e)),
+                },
+                Ok(false) => {}
+                Err(e) => return Err(anyhow::Error::new(e)),
             }
         }
-    }
+    })
+    .await?
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2943,10 +2828,6 @@ enum NameEditKey {
     Backspace,
     Submit,
     Cancel,
-    /// Terminal resized to the given `(cols, rows)` while editing.
-    Resize(u16, u16),
-    /// The session exited while editing.
-    SessionEnded,
 }
 
 /// Map a key press to a rename-prompt edit action, or `None` if the key is not
@@ -2961,39 +2842,38 @@ fn map_name_edit_key(code: KeyCode) -> Option<NameEditKey> {
     }
 }
 
-async fn read_name_edit_key(ctx: &mut OverlayCtx<'_>) -> anyhow::Result<NameEditKey> {
-    loop {
-        match overlay_next_event(ctx).await? {
-            OverlayEvent::SessionEnded => return Ok(NameEditKey::SessionEnded),
-            OverlayEvent::Resize(cols, rows) => return Ok(NameEditKey::Resize(cols, rows)),
-            OverlayEvent::Key(key_event) => {
-                if let Some(action) = map_name_edit_key(key_event.code) {
-                    return Ok(action);
-                }
+async fn read_name_edit_key() -> anyhow::Result<NameEditKey> {
+    tokio::task::spawn_blocking(|| {
+        loop {
+            match crossterm::event::poll(Duration::from_millis(50)) {
+                Ok(true) => match crossterm::event::read() {
+                    Ok(Event::Key(key_event))
+                        if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                    {
+                        if let Some(action) = map_name_edit_key(key_event.code) {
+                            return Ok(action);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => return Err(anyhow::Error::new(e)),
+                },
+                Ok(false) => {}
+                Err(e) => return Err(anyhow::Error::new(e)),
             }
         }
-    }
-}
-
-/// Outcome of the inline rename prompt.
-enum RenameOutcome {
-    Submitted(String),
-    Cancelled,
-    /// The session exited while the prompt was open.
-    SessionEnded,
+    })
+    .await?
 }
 
 /// Prompt the user for a new name inline in the session list's bottom row.
-/// `term_size` is updated in place on resize so the caller re-renders at the new
-/// size after the prompt returns.
+/// Returns Some(name) on submit, None on cancel.
 async fn prompt_session_rename<W: Write>(
     stdout: &mut W,
     rows: &[SessionListRow],
     selected: usize,
-    term_size: &mut (u16, u16),
+    term_size: (u16, u16),
     old_name: &str,
-    ctx: &mut OverlayCtx<'_>,
-) -> anyhow::Result<RenameOutcome> {
+) -> anyhow::Result<Option<String>> {
     let mut input = String::new();
     loop {
         // Split the prompt into three color segments so the instruction, the
@@ -3008,21 +2888,17 @@ async fn prompt_session_rename<W: Write>(
             (input_field.as_str(), color::sgr::INPUT),
             ("  (Enter confirm, Esc cancel)", color::sgr::HINT),
         ];
-        render_session_list_with_status(stdout, rows, selected, &segments, *term_size)?;
-        match read_name_edit_key(ctx).await? {
+        render_session_list_with_status(stdout, rows, selected, &segments, term_size)?;
+        match read_name_edit_key().await? {
             NameEditKey::Submit => {
                 let trimmed = input.trim();
                 return Ok(if trimmed.is_empty() {
-                    RenameOutcome::Cancelled
+                    None
                 } else {
-                    RenameOutcome::Submitted(trimmed.to_string())
+                    Some(trimmed.to_string())
                 });
             }
-            NameEditKey::Cancel => return Ok(RenameOutcome::Cancelled),
-            NameEditKey::SessionEnded => return Ok(RenameOutcome::SessionEnded),
-            NameEditKey::Resize(cols, rows_count) => {
-                *term_size = (cols, rows_count);
-            }
+            NameEditKey::Cancel => return Ok(None),
             NameEditKey::Backspace => {
                 input.pop();
             }
