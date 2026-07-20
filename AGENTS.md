@@ -76,11 +76,20 @@ Use Rust 2024 edition idioms and `rustfmt` defaults. Keep module names, file nam
 
 Add focused unit tests near the code they cover. Use descriptive test names such as `round_trip_payload` or `validate_session_name_err`. Protocol and shared helper changes should include serialization, validation, and edge-case tests. For daemon/client changes, keep platform-specific behavior behind `#[cfg(windows)]` and make non-Windows tests avoid requiring a live ConPTY daemon.
 
+## Change Workflow
+
+All code changes must follow this mandatory review loop:
+
+- Do every code change in a dedicated git worktree; never edit files directly on the main working tree.
+- Create worktrees under `<main-tree>/worktrees/` (the `worktrees/` directory at the repository root).
+- When the work in the worktree is complete, dispatch `codex gpt-5.6-high` to review the change.
+- Every valid blocker/high/medium issue in the review must be fixed. Lower-severity or invalid findings may be noted but do not block the loop.
+- After fixing, run `codex gpt-5.6-high` again and repeat this review-fix cycle until no blocker/high/medium issues remain.
+- Once the review loop passes cleanly, merge the worktree branch into `main`, push `main` to the remote, and remove the worktree.
+
 ## Commit & Pull Request Guidelines
 
-Git history currently has only `Init import`, so no strict convention is established. Use concise imperative commit subjects, for example `Add resize validation tests` or `Fix daemon shutdown handling`. Pull requests should include a short behavior summary, test commands run, linked issues if any, and screenshots or terminal output when CLI behavior changes. Note Windows-specific manual testing when touching daemon, pipe, or PTY code.
-
-Push to the remote immediately after committing.
+Use Conventional Commit subjects in the imperative mood, for example `feat(attach): pick highest-ID session by default` or `fix(daemon): handle shutdown race`. Pull requests should summarize the behavior change, list the test commands run, link any related issues, and include terminal output when CLI behavior changes. Note Windows-specific manual testing when touching daemon, pipe, or PTY code.
 
 ## Security & Configuration Tips
 
