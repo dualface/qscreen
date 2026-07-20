@@ -11,7 +11,7 @@ use crossterm::event::{
 };
 use qscreen_protocol::{
     Command, EventType, FrameMouseEncoding, FrameMouseMode, Message, MessageKind, SessionInfo,
-    exited_session_error, validate_session_id, validate_session_name,
+    exited_session_error, missing_session_error, validate_session_id, validate_session_name,
 };
 use qscreen_shared::{daemon_log_path, pipe_name};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -235,7 +235,10 @@ fn run_client(args: Vec<String>) -> anyhow::Result<()> {
                 )
                 .await
             }
-            [cmd, session_id] if cmd == "attach" || cmd == "-r" => {
+            [cmd] if cmd == "attach" || cmd == "att" || cmd == "-r" => {
+                cmd_attach_default(config).await
+            }
+            [cmd, session_id] if cmd == "attach" || cmd == "att" || cmd == "-r" => {
                 cmd_attach(session_id, config).await
             }
             [cmd, session_id] if cmd == "kill" => cmd_kill(session_id).await,
@@ -415,9 +418,9 @@ fn help_text_zh() -> &'static str {
                                指定启动 shell（Windows: cmd、powershell 或可执行文件路径；Unix: shell 路径）
   qscn [--prefix C-a] new --cwd <path>
                                指定会话启动工作目录
-  qscn [--prefix C-a] attach <session_id>
-                               进入已有会话
-  qscn [--prefix C-a] -r <session_id>
+  qscn [--prefix C-a] attach [session_id]
+                               进入已有会话；省略 session_id 时进入 ID 最大的可用会话（别名 att）
+  qscn [--prefix C-a] -r [session_id]
                                同 attach，兼容 tmux 风格
   qscn ls                      列出所有会话（同 list）
   qscn list                    列出所有会话
@@ -475,9 +478,9 @@ Usage:
                                specify the startup shell (Windows: cmd, powershell, or an executable path; Unix: shell path)
   qscn [--prefix C-a] new --cwd <path>
                                specify the session working directory
-  qscn [--prefix C-a] attach <session_id>
-                               attach to an existing session
-  qscn [--prefix C-a] -r <session_id>
+  qscn [--prefix C-a] attach [session_id]
+                               attach to an existing session; without session_id, attach to the highest-ID available session (alias: att)
+  qscn [--prefix C-a] -r [session_id]
                                same as attach (tmux-style shorthand)
   qscn ls                      list all sessions (alias: list)
   qscn list                    list all sessions
@@ -669,6 +672,39 @@ async fn cmd_attach(session_id: &str, config: ClientConfig) -> anyhow::Result<()
     term::preflight_interactive()?;
     validate_session_id(session_id)?;
     attach_session_loop(session_id, config, None).await
+}
+
+/// `qscn attach` without an id: attach to the highest-ID live session, or
+/// error when no attachable session exists. If the chosen session exits in the
+/// window between listing and the attach handshake, fall back to the next live
+/// session instead of failing outright.
+async fn cmd_attach_default(config: ClientConfig) -> anyhow::Result<()> {
+    term::preflight_interactive()?;
+    // Sessions that raced out (exited between selection and attach) and must be
+    // skipped on the next selection so we do not retry a dead candidate.
+    let mut skip: Vec<String> = Vec::new();
+    loop {
+        let sessions = list_sessions().await?;
+        let Some(session_id) = highest_live_session_id_excluding(&sessions, &skip) else {
+            if is_chinese() {
+                anyhow::bail!("没有可用的 session")
+            } else {
+                anyhow::bail!("no attachable session")
+            }
+        };
+        match attach_session_loop(&session_id, config, None).await {
+            Ok(()) => return Ok(()),
+            // The chosen session exited between listing and the attach handshake:
+            // skip it and pick the next live session. Any other error (connection
+            // loss, daemon crash, a failure after a successful attach) is surfaced
+            // unchanged rather than being misread as a race.
+            Err(err) if err.downcast_ref::<SessionUnavailable>().is_some() => {
+                skip.push(session_id);
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 async fn cmd_kill(session_id: &str) -> anyhow::Result<()> {
@@ -1227,6 +1263,43 @@ fn highest_remaining_session_id(
         .map(|(_, session_id)| session_id)
 }
 
+/// Pick the highest numeric session ID among live (non-exited) sessions,
+/// skipping any listed in `exclude`. Returns `None` when no live session
+/// outside `exclude` remains.
+fn highest_live_session_id_excluding(
+    sessions: &[SessionInfo],
+    exclude: &[String],
+) -> Option<String> {
+    sessions
+        .iter()
+        .filter(|s| !s.exited && !exclude.iter().any(|e| e == &s.session_id))
+        .filter_map(|s| {
+            s.session_id
+                .parse::<u64>()
+                .ok()
+                .map(|id| (id, s.session_id.clone()))
+        })
+        .max_by_key(|(id, _)| *id)
+        .map(|(_, session_id)| session_id)
+}
+
+/// The attach handshake failed because the daemon reports the target session as
+/// missing or already exited. Carries the daemon's original message so explicit
+/// `attach <id>` still surfaces it verbatim, while default-attach can downcast
+/// this type to fall back to another live session.
+#[derive(Debug)]
+struct SessionUnavailable {
+    message: String,
+}
+
+impl std::fmt::Display for SessionUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SessionUnavailable {}
+
 async fn attach_session_once(
     session_id: &str,
     config: ClientConfig,
@@ -1249,6 +1322,19 @@ async fn attach_session_once(
     .await?;
 
     let resp = recv_msg(&mut conn).await?;
+    // Distinguish "the session is gone" from other handshake failures: the daemon
+    // reports a missing or already-exited session with these exact error strings.
+    // Callers use this typed error to fall back to another session, while any other
+    // error (connection loss, daemon crash) is surfaced unchanged.
+    if resp.kind == MessageKind::Response
+        && (resp.error == missing_session_error(session_id)
+            || resp.error == exited_session_error(session_id))
+    {
+        return Err(SessionUnavailable {
+            message: resp.error.clone(),
+        }
+        .into());
+    }
     check_response(&resp, attach_id)?;
 
     let _terminal = TerminalCleanupGuard::enter()?;
@@ -3669,6 +3755,45 @@ mod tests {
     fn highest_remaining_session_id_none_when_empty() {
         let sessions = vec![session_info_with_id("1", true)];
         assert_eq!(highest_remaining_session_id(&sessions, "1"), None);
+    }
+
+    #[test]
+    fn highest_live_session_id_excluding_picks_largest_live_id() {
+        let sessions = vec![
+            session_info_with_id("2", false),
+            session_info_with_id("10", false),
+            session_info_with_id("3", false),
+        ];
+        assert_eq!(
+            highest_live_session_id_excluding(&sessions, &[]),
+            Some("10".to_string())
+        );
+    }
+
+    #[test]
+    fn highest_live_session_id_excluding_skips_excluded_and_exited() {
+        let sessions = vec![
+            session_info_with_id("9", true),
+            session_info_with_id("8", false),
+            session_info_with_id("6", false),
+        ];
+        // 9 is exited and 8 is excluded, so the next live candidate is 6.
+        assert_eq!(
+            highest_live_session_id_excluding(&sessions, &["8".to_string()]),
+            Some("6".to_string())
+        );
+    }
+
+    #[test]
+    fn highest_live_session_id_excluding_none_when_all_skipped() {
+        let sessions = vec![
+            session_info_with_id("1", false),
+            session_info_with_id("2", true),
+        ];
+        assert_eq!(
+            highest_live_session_id_excluding(&sessions, &["1".to_string()]),
+            None
+        );
     }
 
     #[test]
