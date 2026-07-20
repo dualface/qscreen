@@ -82,9 +82,9 @@ All code changes must follow this mandatory review loop:
 
 - Do every code change in a dedicated git worktree; never edit files directly on the main working tree.
 - Create worktrees under `<main-tree>/worktrees/` (the `worktrees/` directory at the repository root).
-- When the work in the worktree is complete, dispatch `codex gpt-5.6-high` to review the change.
+- When the work in the worktree is complete, dispatch `codex --model gpt-5.6-sol -c model_reasoning_effort=high` (the `gpt-5.6-sol` model at high reasoning effort) to review the change.
 - Every valid blocker/high/medium issue in the review must be fixed. Lower-severity or invalid findings may be noted but do not block the loop.
-- After fixing, run `codex gpt-5.6-high` again and repeat this review-fix cycle until no blocker/high/medium issues remain.
+- After fixing, run `codex --model gpt-5.6-sol -c model_reasoning_effort=high` again and repeat this review-fix cycle until no blocker/high/medium issues remain.
 - Once the review loop passes cleanly, merge the worktree branch into `main`, push `main` to the remote, and remove the worktree.
 
 ## Commit & Pull Request Guidelines
