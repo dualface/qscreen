@@ -925,7 +925,9 @@ fn format_session_line(s: &SessionInfo) -> String {
         "{}\t{}\t{}\t{}\t{}\t{}",
         s.session_id,
         s.name,
-        session_state_label(s),
+        // The `qscn list` textual output stays English so it remains a stable,
+        // script-parseable format regardless of locale.
+        session_state_label(s, false),
         session_created_label(s),
         session_size_label(s),
         session_cwd_label(s)
@@ -939,7 +941,7 @@ fn colored_session_line(s: &SessionInfo) -> String {
         color::paint(&s.session_id, color::sgr::ID),
         color::paint(&s.name, color::sgr::NAME),
         color::paint(
-            &session_state_label(s),
+            &session_state_label(s, false),
             color::state_sgr(s.exited, s.attached)
         ),
         color::paint(&session_created_label(s), color::sgr::CREATED),
@@ -998,13 +1000,14 @@ enum SessionListSelection {
 fn build_session_list_rows(
     sessions: &[SessionInfo],
     current_session_id: &str,
+    zh: bool,
 ) -> Vec<SessionListRow> {
     let mut rows: Vec<SessionListRow> = sessions
         .iter()
         .map(|session| SessionListRow {
             session_id: session.session_id.clone(),
             name: session.name.clone(),
-            state: session_state_label(session),
+            state: session_state_label(session, zh),
             size: session_size_label(session),
             cwd: session_cwd_label(session),
             cwd_raw: session.cwd.clone(),
@@ -1017,11 +1020,17 @@ fn build_session_list_rows(
     rows
 }
 
-fn session_state_label(session: &SessionInfo) -> String {
+fn session_state_label(session: &SessionInfo, zh: bool) -> String {
     if session.exited {
-        format!("exited({})", session.exit_code)
+        if zh {
+            format!("已退出({})", session.exit_code)
+        } else {
+            format!("exited({})", session.exit_code)
+        }
     } else if session.attached {
-        "attached".to_string()
+        if zh { "已连接" } else { "attached" }.to_string()
+    } else if zh {
+        "未连接".to_string()
     } else {
         "detached".to_string()
     }
@@ -2740,36 +2749,37 @@ async fn run_session_list_mode<W: Write>(
     stdout: &mut W,
 ) -> anyhow::Result<SessionListSelection> {
     let mut term_size = term_size;
-    let mut rows = build_session_list_rows(&list_sessions().await?, current_session_id);
+    let zh = is_chinese();
+    let mut rows = build_session_list_rows(&list_sessions().await?, current_session_id, zh);
     let mut selected = rows
         .iter()
         .position(|row| row.is_current)
         .unwrap_or_default();
     let mut status = String::new();
 
-    render_session_list(stdout, &rows, selected, &status, term_size)?;
+    render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
 
     loop {
         let action = read_session_list_action().await?;
         match action {
             SessionListAction::MoveUp => {
                 selected = move_session_list_selection(selected, rows.len(), -1);
-                render_session_list(stdout, &rows, selected, &status, term_size)?;
+                render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
             }
             SessionListAction::MoveDown => {
                 selected = move_session_list_selection(selected, rows.len(), 1);
-                render_session_list(stdout, &rows, selected, &status, term_size)?;
+                render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
             }
             SessionListAction::Cancel => return Ok(SessionListSelection::Close),
             SessionListAction::Help => {
                 // The help overlay owns the screen until dismissed, then the
                 // list repaints so the user comes back where they left off.
                 term_size = run_help_mode(prefix, term_size, stdout).await?;
-                render_session_list(stdout, &rows, selected, &status, term_size)?;
+                render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
             }
             SessionListAction::Resize(cols, rows_count) => {
                 term_size = (cols, rows_count);
-                render_session_list(stdout, &rows, selected, &status, term_size)?;
+                render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
             }
             SessionListAction::Create => {
                 // Inherit the cwd of the session under the cursor so the new session opens in the same directory;
@@ -2778,25 +2788,34 @@ async fn run_session_list_mode<W: Write>(
                 match create_session_in(inherit_cwd.as_deref()).await {
                     Ok(new_session_id) => return Ok(SessionListSelection::Switch(new_session_id)),
                     Err(e) => {
-                        status = format!("create failed: {e}");
-                        render_session_list(stdout, &rows, selected, &status, term_size)?;
+                        status = if zh {
+                            format!("新建失败: {e}")
+                        } else {
+                            format!("create failed: {e}")
+                        };
+                        render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
                     }
                 }
             }
             SessionListAction::Rename => {
                 if rows.is_empty() {
-                    status = "no sessions".to_string();
-                    render_session_list(stdout, &rows, selected, &status, term_size)?;
+                    status = if zh { "无会话" } else { "no sessions" }.to_string();
+                    render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
                     continue;
                 }
                 selected = selected.min(rows.len() - 1);
                 let row = rows[selected].clone();
                 if row.exited {
-                    status = "cannot rename an exited session".to_string();
-                    render_session_list(stdout, &rows, selected, &status, term_size)?;
+                    status = if zh {
+                        "无法重命名已退出的会话"
+                    } else {
+                        "cannot rename an exited session"
+                    }
+                    .to_string();
+                    render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
                     continue;
                 }
-                match prompt_session_rename(stdout, &rows, selected, &mut term_size, &row.name)
+                match prompt_session_rename(stdout, &rows, selected, &mut term_size, &row.name, zh)
                     .await?
                 {
                     Some(new_name) => match rename_session(&row.session_id, &new_name).await {
@@ -2804,38 +2823,49 @@ async fn run_session_list_mode<W: Write>(
                             rows = build_session_list_rows(
                                 &list_sessions().await?,
                                 current_session_id,
+                                zh,
                             );
                             selected = rows
                                 .iter()
                                 .position(|r| r.session_id == row.session_id)
                                 .unwrap_or_else(|| selected.min(rows.len().saturating_sub(1)));
-                            status = format!("renamed to \"{new_name}\"");
+                            status = if zh {
+                                format!("已重命名为 \"{new_name}\"")
+                            } else {
+                                format!("renamed to \"{new_name}\"")
+                            };
                         }
-                        Err(e) => status = format!("rename failed: {e}"),
+                        Err(e) => {
+                            status = if zh {
+                                format!("重命名失败: {e}")
+                            } else {
+                                format!("rename failed: {e}")
+                            }
+                        }
                     },
                     None => status = String::new(),
                 }
-                render_session_list(stdout, &rows, selected, &status, term_size)?;
+                render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
             }
             SessionListAction::Kill => {
                 if rows.is_empty() {
-                    status = "no sessions".to_string();
-                    render_session_list(stdout, &rows, selected, &status, term_size)?;
+                    status = if zh { "无会话" } else { "no sessions" }.to_string();
+                    render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
                     continue;
                 }
                 selected = selected.min(rows.len() - 1);
                 let row = rows[selected].clone();
-                if !prompt_session_kill_confirm(stdout, &rows, selected, &mut term_size, &row)
+                if !prompt_session_kill_confirm(stdout, &rows, selected, &mut term_size, &row, zh)
                     .await?
                 {
                     status = String::new();
-                    render_session_list(stdout, &rows, selected, &status, term_size)?;
+                    render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
                     continue;
                 }
                 match cmd_kill(&row.session_id).await {
                     Ok(()) => {
                         let sessions = list_sessions().await?;
-                        rows = build_session_list_rows(&sessions, current_session_id);
+                        rows = build_session_list_rows(&sessions, current_session_id, zh);
                         if rows.is_empty() {
                             // The last session is gone: exit qscn and let the
                             // daemon shut down like the normal no-sessions path.
@@ -2854,24 +2884,34 @@ async fn run_session_list_mode<W: Write>(
                             }
                         }
                         selected = selected.min(rows.len() - 1);
-                        status = format!("killed \"{}\"", row.name);
+                        status = if zh {
+                            format!("已终止 \"{}\"", row.name)
+                        } else {
+                            format!("killed \"{}\"", row.name)
+                        };
                     }
-                    Err(e) => status = format!("kill failed: {e}"),
+                    Err(e) => {
+                        status = if zh {
+                            format!("终止失败: {e}")
+                        } else {
+                            format!("kill failed: {e}")
+                        }
+                    }
                 }
-                render_session_list(stdout, &rows, selected, &status, term_size)?;
+                render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
             }
             SessionListAction::Select => {
                 if rows.is_empty() {
-                    status = "no sessions".to_string();
-                    render_session_list(stdout, &rows, selected, &status, term_size)?;
+                    status = if zh { "无会话" } else { "no sessions" }.to_string();
+                    render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
                     continue;
                 }
 
-                rows = build_session_list_rows(&list_sessions().await?, current_session_id);
+                rows = build_session_list_rows(&list_sessions().await?, current_session_id, zh);
                 if rows.is_empty() {
                     selected = 0;
-                    status = "no sessions".to_string();
-                    render_session_list(stdout, &rows, selected, &status, term_size)?;
+                    status = if zh { "无会话" } else { "no sessions" }.to_string();
+                    render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
                     continue;
                 }
                 selected = selected.min(rows.len().saturating_sub(1));
@@ -2889,7 +2929,7 @@ async fn run_session_list_mode<W: Write>(
                     SessionListSelection::Quit => return Ok(SessionListSelection::Quit),
                     SessionListSelection::Error(error) => {
                         status = error.clone();
-                        render_session_list(stdout, &rows, selected, &status, term_size)?;
+                        render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
                     }
                 }
             }
@@ -2995,6 +3035,7 @@ async fn prompt_session_rename<W: Write>(
     selected: usize,
     term_size: &mut (u16, u16),
     old_name: &str,
+    zh: bool,
 ) -> anyhow::Result<Option<String>> {
     let mut input = String::new();
     loop {
@@ -3003,14 +3044,23 @@ async fn prompt_session_rename<W: Write>(
         // distinct: the label is prominent (yellow), the typed input uses a
         // separate prominent color (cyan) with a `_` caret, and the key hint
         // stays dim. Concatenated their text matches the original single line.
-        let label = format!("rename \"{old_name}\" -> ");
+        let label = if zh {
+            format!("重命名 \"{old_name}\" -> ")
+        } else {
+            format!("rename \"{old_name}\" -> ")
+        };
+        let hint = if zh {
+            "  (Enter 确认, Esc 取消)"
+        } else {
+            "  (Enter confirm, Esc cancel)"
+        };
         let input_field = format!("{input}_");
         let segments = [
             (label.as_str(), color::sgr::PROMPT),
             (input_field.as_str(), color::sgr::INPUT),
-            ("  (Enter confirm, Esc cancel)", color::sgr::HINT),
+            (hint, color::sgr::HINT),
         ];
-        render_session_list_with_status(stdout, rows, selected, &segments, *term_size)?;
+        render_session_list_with_status(stdout, rows, selected, &segments, *term_size, zh)?;
         match read_name_edit_key().await? {
             NameEditKey::Submit => {
                 let trimmed = input.trim();
@@ -3047,16 +3097,26 @@ async fn prompt_session_kill_confirm<W: Write>(
     selected: usize,
     term_size: &mut (u16, u16),
     row: &SessionListRow,
+    zh: bool,
 ) -> anyhow::Result<bool> {
     loop {
         // The label uses the error color to flag the destructive action; the
         // key hint stays dim like the rename prompt.
-        let label = format!("kill \"{}\" (session {})? ", row.name, row.session_id);
+        let label = if zh {
+            format!("终止 \"{}\" (会话 {})? ", row.name, row.session_id)
+        } else {
+            format!("kill \"{}\" (session {})? ", row.name, row.session_id)
+        };
+        let hint = if zh {
+            "(y 确认, Esc 取消)"
+        } else {
+            "(y confirm, Esc cancel)"
+        };
         let segments = [
             (label.as_str(), color::sgr::ERROR),
-            ("(y confirm, Esc cancel)", color::sgr::HINT),
+            (hint, color::sgr::HINT),
         ];
-        render_session_list_with_status(stdout, rows, selected, &segments, *term_size)?;
+        render_session_list_with_status(stdout, rows, selected, &segments, *term_size, zh)?;
         match read_kill_confirm_key().await? {
             ConfirmKey::Confirm => return Ok(true),
             ConfirmKey::Cancel => return Ok(false),
@@ -3121,15 +3181,21 @@ fn render_session_list<W: Write>(
     selected: usize,
     status: &str,
     term_size: (u16, u16),
+    zh: bool,
 ) -> std::io::Result<()> {
     // The whole status line shares one content-derived color; the empty status
     // falls back to the dim "* marks current session" hint.
     let (text, sgr) = if status.is_empty() {
-        ("* marks current session", color::sgr::HINT)
+        let marker = if zh {
+            "* 表示当前会话"
+        } else {
+            "* marks current session"
+        };
+        (marker, color::sgr::HINT)
     } else {
         (status, status_style(status))
     };
-    render_session_list_with_status(out, rows, selected, &[(text, sgr)], term_size)
+    render_session_list_with_status(out, rows, selected, &[(text, sgr)], term_size, zh)
 }
 
 /// Same as [`render_session_list`], but the bottom status line is a sequence of
@@ -3142,6 +3208,7 @@ fn render_session_list_with_status<W: Write>(
     selected: usize,
     status_segments: &[(&str, &str)],
     term_size: (u16, u16),
+    zh: bool,
 ) -> std::io::Result<()> {
     let (cols, rows_count) = term_size;
     write!(out, "\x1b[?2026h\x1b[0m\x1b[2J\x1b[H")?;
@@ -3156,10 +3223,15 @@ fn render_session_list_with_status<W: Write>(
         session_list_viewport(budget.saturating_sub(header_len), body_len, selected);
 
     if header_len >= 1 {
-        write_text_line(out, "qscreen sessions", Some(color::sgr::HEADER), cols)?;
+        let title = if zh {
+            "qscreen 会话列表"
+        } else {
+            "qscreen sessions"
+        };
+        write_text_line(out, title, Some(color::sgr::HEADER), cols)?;
     }
     if header_len >= 2 {
-        write_session_list_hint(out, cols)?;
+        write_session_list_hint(out, cols, zh)?;
     }
     if header_len >= 3 {
         write_text_line(out, "", None, cols)?;
@@ -3167,7 +3239,8 @@ fn render_session_list_with_status<W: Write>(
 
     if rows.is_empty() {
         if visible > 0 {
-            write_text_line(out, "  no sessions", Some(color::sgr::HINT), cols)?;
+            let empty = if zh { "  无会话" } else { "  no sessions" };
+            write_text_line(out, empty, Some(color::sgr::HINT), cols)?;
         }
     } else {
         for (idx, row) in rows.iter().enumerate().skip(start).take(visible) {
@@ -3251,16 +3324,22 @@ fn write_status_segments<W: Write>(
     Ok(())
 }
 
-/// Pick the status line color by content: errors=red, successful rename=green, everything else=dim hint.
+/// Pick the status line color by content: errors=red, successful rename=green,
+/// everything else=dim hint. Matches both the English and Chinese status
+/// messages produced by the session list.
 fn status_style(status: &str) -> &'static str {
     let lower = status.to_ascii_lowercase();
-    if lower.contains("fail")
+    let is_error = lower.contains("fail")
         || lower.contains("cannot")
         || lower.contains("error")
         || lower.contains("no sessions")
-    {
+        || status.contains("失败")
+        || status.contains("无法")
+        || status.contains("无会话");
+    let is_success = lower.starts_with("renamed") || status.starts_with("已重命名");
+    if is_error {
         color::sgr::ERROR
-    } else if lower.starts_with("renamed") {
+    } else if is_success {
         color::sgr::SUCCESS
     } else {
         color::sgr::HINT
@@ -3269,9 +3348,11 @@ fn status_style(status: &str) -> &'static str {
 
 /// The session list's action hint line: highlight shortcut fragments (bold yellow) while keeping description text dim.
 /// In a colorless environment it degrades to plain text with the same visible width, so the layout is unaffected.
-fn write_session_list_hint<W: Write>(out: &mut W, cols: u16) -> std::io::Result<()> {
-    // (fragment text, whether it is a shortcut key). Concatenated they form the original hint string, so it can be truncated by visible width.
-    const SEGMENTS: &[(&str, bool)] = &[
+fn write_session_list_hint<W: Write>(out: &mut W, cols: u16, zh: bool) -> std::io::Result<()> {
+    // (fragment text, whether it is a shortcut key). Concatenated they form the
+    // hint string, so it can be truncated by visible width. The shortcut keys
+    // stay identical across languages; only the descriptions are translated.
+    const SEGMENTS_EN: &[(&str, bool)] = &[
         ("Up/Down", true),
         (" or ", false),
         ("k/j", true),
@@ -3289,10 +3370,29 @@ fn write_session_list_hint<W: Write>(out: &mut W, cols: u16) -> std::io::Result<
         ("Esc/q", true),
         (" cancel", false),
     ];
+    const SEGMENTS_ZH: &[(&str, bool)] = &[
+        ("Up/Down", true),
+        (" 或 ", false),
+        ("k/j", true),
+        (", ", false),
+        ("Enter", true),
+        (" 切换, ", false),
+        ("c", true),
+        (" 新建, ", false),
+        ("r", true),
+        (" 改名, ", false),
+        ("x", true),
+        (" 终止, ", false),
+        ("?", true),
+        (" 帮助, ", false),
+        ("Esc/q", true),
+        (" 取消", false),
+    ];
+    let segments = if zh { SEGMENTS_ZH } else { SEGMENTS_EN };
     let limit = cols as usize;
     let mut content = String::new();
     let mut visible = 0usize;
-    for (text, is_key) in SEGMENTS {
+    for (text, is_key) in segments {
         if visible >= limit {
             break;
         }
@@ -3367,12 +3467,12 @@ fn write_session_row<W: Write>(
     if (cols as usize) <= ROW_PREFIX_WIDTH {
         let current = if row.is_current { "*" } else { " " };
         let plain = format!(
-            "{} {} {:<4} {:<24} {:<14} {:>8}  {}",
+            "{} {} {:<4} {:<24} {} {:>8}  {}",
             selector,
             current,
             truncate_for_terminal(&row.session_id, 4),
             truncate_for_terminal(&row.name, 24),
-            truncate_for_terminal(&row.state, 14),
+            pad_end_to_width(&truncate_for_terminal(&row.state, 14), 14),
             truncate_for_terminal(&row.size, 8),
             row.cwd
         );
@@ -3385,7 +3485,9 @@ fn write_session_row<W: Write>(
     let cwd_budget = cols as usize - ROW_PREFIX_WIDTH;
     let id = truncate_for_terminal(&row.session_id, 4);
     let name = truncate_for_terminal(&row.name, 24);
-    let state = truncate_for_terminal(&row.state, 14);
+    // The state label may contain wide CJK glyphs when translated, so pad it by
+    // display width to keep the fixed 14-column layout (ROW_PREFIX_WIDTH) intact.
+    let state = pad_end_to_width(&truncate_for_terminal(&row.state, 14), 14);
     let size = truncate_for_terminal(&row.size, 8);
     let cwd = truncate_for_terminal(&row.cwd, cwd_budget);
     let visible = ROW_PREFIX_WIDTH + UnicodeWidthStr::width(cwd.as_str());
@@ -3394,7 +3496,7 @@ fn write_session_row<W: Write>(
         // Reverse-video the whole line; do not also apply per-column foreground colors, to avoid interfering with the reverse video.
         let current = if row.is_current { "*" } else { " " };
         let content = format!(
-            "{} {} {:<4} {:<24} {:<14} {:>8}  {}",
+            "{} {} {:<4} {:<24} {} {:>8}  {}",
             selector, current, id, name, state, size, cwd
         );
         write_list_line(out, &content, visible, Some("7"), cols)
@@ -3411,10 +3513,7 @@ fn write_session_row<W: Write>(
             current,
             color::paint(&format!("{id:<4}"), color::sgr::ID),
             color::paint(&format!("{name:<24}"), color::sgr::NAME),
-            color::paint(
-                &format!("{state:<14}"),
-                color::state_sgr(row.exited, row.attached)
-            ),
+            color::paint(&state, color::state_sgr(row.exited, row.attached)),
             color::paint(&format!("{size:>8}"), color::sgr::SIZE),
             color::paint(&cwd, color::sgr::CWD),
         );
@@ -3422,11 +3521,29 @@ fn write_session_row<W: Write>(
     } else {
         let current = if row.is_current { "*" } else { " " };
         let content = format!(
-            "{} {} {:<4} {:<24} {:<14} {:>8}  {}",
+            "{} {} {:<4} {:<24} {} {:>8}  {}",
             selector, current, id, name, state, size, cwd
         );
         write_list_line(out, &content, visible, None, cols)
     }
+}
+
+/// Right-pad `value` with spaces to at least `width` display columns. Unlike
+/// `format!("{value:<width$}")`, which counts `char`s, this counts display width
+/// so columns stay aligned when the text contains wide (CJK) glyphs, such as the
+/// translated session state labels. For pure-ASCII text it is byte-identical to
+/// the `{:<width}` formatting it replaces.
+fn pad_end_to_width(value: &str, width: usize) -> String {
+    let visible = UnicodeWidthStr::width(value);
+    if visible >= width {
+        return value.to_string();
+    }
+    let mut padded = String::with_capacity(value.len() + (width - visible));
+    padded.push_str(value);
+    for _ in visible..width {
+        padded.push(' ');
+    }
+    padded
 }
 
 fn truncate_for_terminal(value: &str, width: usize) -> String {
@@ -3987,7 +4104,7 @@ mod tests {
         // In a colorless environment (the test default), the hint line should be plain text, right-padded with spaces to fill the whole line.
         let cols = 80u16;
         let mut out = Vec::new();
-        write_session_list_hint(&mut out, cols).unwrap();
+        write_session_list_hint(&mut out, cols, false).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(rendered.ends_with("\r\n"));
         let line = rendered.strip_suffix("\r\n").unwrap();
@@ -4000,6 +4117,69 @@ mod tests {
         // After stripping any leading SGR reset prefix, the visible content should exactly fill cols columns.
         let visible = line.trim_start_matches("\x1b[0m");
         assert_eq!(UnicodeWidthStr::width(visible), cols as usize);
+    }
+
+    #[test]
+    fn session_list_hint_renders_chinese_and_pads_to_width() {
+        // The Chinese hint keeps the shortcut keys but translates the descriptions,
+        // and still pads to the full terminal width.
+        let cols = 80u16;
+        let mut out = Vec::new();
+        write_session_list_hint(&mut out, cols, true).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        let line = rendered.strip_suffix("\r\n").unwrap();
+        assert!(
+            line.contains("Up/Down 或 k/j, Enter 切换, c 新建, r 改名, x 终止, ? 帮助, Esc/q 取消"),
+            "{line:?}"
+        );
+        let visible = line.trim_start_matches("\x1b[0m");
+        assert_eq!(UnicodeWidthStr::width(visible), cols as usize);
+    }
+
+    #[test]
+    fn session_state_label_translates_when_chinese() {
+        let attached = session("1", "a", true, false, 80, 24);
+        let detached = session("2", "b", false, false, 80, 24);
+        let exited = session("3", "c", false, true, 80, 24);
+        assert_eq!(session_state_label(&attached, false), "attached");
+        assert_eq!(session_state_label(&attached, true), "已连接");
+        assert_eq!(session_state_label(&detached, true), "未连接");
+        // The exit code is preserved inside the translated label.
+        assert!(session_state_label(&exited, true).starts_with("已退出("));
+    }
+
+    #[test]
+    fn pad_end_to_width_counts_display_columns() {
+        assert_eq!(pad_end_to_width("ab", 4), "ab  ");
+        // "已连接" is 6 display columns, so padding to 8 adds two spaces.
+        assert_eq!(pad_end_to_width("已连接", 8), "已连接  ");
+        // Never truncates when already at or beyond the target width.
+        assert_eq!(pad_end_to_width("toolong", 3), "toolong");
+    }
+
+    #[test]
+    fn session_row_aligns_wide_state_label_by_display_width() {
+        // A row whose state contains wide CJK glyphs must pad the state column to
+        // 14 display columns so later columns and the total line width stay aligned.
+        let row = SessionListRow {
+            session_id: "1".to_string(),
+            name: "main".to_string(),
+            state: "已连接".to_string(),
+            size: "80x24".to_string(),
+            cwd: "~".to_string(),
+            cwd_raw: "~".to_string(),
+            is_current: true,
+            exited: false,
+            attached: true,
+        };
+        let cols = 80u16;
+        let mut out = Vec::new();
+        write_session_row(&mut out, &row, false, cols).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        let line = rendered.strip_suffix("\r\n").unwrap();
+        let visible = line.trim_start_matches("\x1b[0m");
+        assert_eq!(UnicodeWidthStr::width(visible), cols as usize);
+        assert!(visible.contains("80x24"), "{visible:?}");
     }
 
     #[test]
@@ -4047,7 +4227,7 @@ mod tests {
             })
             .collect();
         let mut out = Vec::new();
-        render_session_list(&mut out, &rows, 7, "", (80, 6)).unwrap();
+        render_session_list(&mut out, &rows, 7, "", (80, 6), false).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         // 6 terminal rows = 5 budget lines at most, so at most 5 CRLFs are
         // written (the status line carries none) and nothing scrolls.
@@ -4063,7 +4243,7 @@ mod tests {
         // On a very narrow terminal, truncate by visible width without panicking or exceeding the width.
         let cols = 5u16;
         let mut out = Vec::new();
-        write_session_list_hint(&mut out, cols).unwrap();
+        write_session_list_hint(&mut out, cols, false).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         let line = rendered.strip_suffix("\r\n").unwrap();
         let visible = line.trim_start_matches("\x1b[0m");
@@ -4733,7 +4913,7 @@ mod tests {
             session("1", "alpha", true, false, 80, 24),
             session("2", "mid", false, true, 120, 30),
         ];
-        let rows = build_session_list_rows(&sessions, "1");
+        let rows = build_session_list_rows(&sessions, "1", false);
 
         assert_eq!(
             rows.iter()
@@ -4753,7 +4933,7 @@ mod tests {
     fn session_list_rows_prefer_protocol_size_label() {
         let mut info = session("1", "work", false, false, 80, 24);
         info.size = "132x43".to_string();
-        let rows = build_session_list_rows(&[info], "2");
+        let rows = build_session_list_rows(&[info], "2", false);
 
         assert_eq!(rows[0].size, "132x43");
     }
@@ -4768,6 +4948,7 @@ mod tests {
                 session("4", "next", false, false, 80, 24),
             ],
             "1",
+            false,
         );
 
         assert_eq!(
@@ -4854,10 +5035,11 @@ mod tests {
                 session("2", "work", false, false, 100, 30),
             ],
             "1",
+            false,
         );
         let mut out = Vec::new();
 
-        render_session_list(&mut out, &rows, 1, "ready", (80, 24)).unwrap();
+        render_session_list(&mut out, &rows, 1, "ready", (80, 24), false).unwrap();
 
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("qscreen sessions"));
@@ -4868,10 +5050,11 @@ mod tests {
 
     #[test]
     fn render_session_list_uses_crlf_in_raw_mode() {
-        let rows = build_session_list_rows(&[session("1", "main", true, false, 80, 24)], "1");
+        let rows =
+            build_session_list_rows(&[session("1", "main", true, false, 80, 24)], "1", false);
         let mut out = Vec::new();
 
-        render_session_list(&mut out, &rows, 0, "", (80, 24)).unwrap();
+        render_session_list(&mut out, &rows, 0, "", (80, 24), false).unwrap();
 
         for (idx, byte) in out.iter().enumerate() {
             if *byte == b'\n' {
@@ -4883,10 +5066,11 @@ mod tests {
 
     #[test]
     fn render_session_list_resets_style_and_pads_lines() {
-        let rows = build_session_list_rows(&[session("1", "main", true, false, 80, 24)], "1");
+        let rows =
+            build_session_list_rows(&[session("1", "main", true, false, 80, 24)], "1", false);
         let mut out = Vec::new();
 
-        render_session_list(&mut out, &rows, 0, "", (20, 8)).unwrap();
+        render_session_list(&mut out, &rows, 0, "", (20, 8), false).unwrap();
 
         let text = String::from_utf8(out).unwrap();
         assert!(text.starts_with("\x1b[?2026h\x1b[0m\x1b[2J"));
@@ -4898,7 +5082,8 @@ mod tests {
     fn render_session_list_with_status_concatenates_segments() {
         // A three-segment status (rename label / input / hint) should render as
         // its concatenated text, matching the original single-line prompt.
-        let rows = build_session_list_rows(&[session("1", "main", true, false, 80, 24)], "1");
+        let rows =
+            build_session_list_rows(&[session("1", "main", true, false, 80, 24)], "1", false);
         let mut out = Vec::new();
 
         let segments = [
@@ -4906,7 +5091,7 @@ mod tests {
             ("work_", color::sgr::INPUT),
             ("  (Enter confirm, Esc cancel)", color::sgr::HINT),
         ];
-        render_session_list_with_status(&mut out, &rows, 0, &segments, (80, 24)).unwrap();
+        render_session_list_with_status(&mut out, &rows, 0, &segments, (80, 24), false).unwrap();
 
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("rename \"main\" -> work_  (Enter confirm, Esc cancel)"));
