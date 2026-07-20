@@ -2296,7 +2296,8 @@ async fn run_attach_loop(
                             SessionListSelection::Ended => break AttachOutcome::Ended,
                             SessionListSelection::Close | SessionListSelection::Error(_) => {
                                 let (w, h) = terminal_size_or(screen.size());
-                                if (w, h) != screen.size() {
+                                let resized = (w, h) != screen.size();
+                                if resized {
                                     screen.resize(h, w);
                                 }
                                 let area_h = session_area_height(config, h);
@@ -2314,10 +2315,13 @@ async fn run_attach_loop(
                                 if let Ok(bytes) = resize_msg.to_json_line() {
                                     let _ = writer_c.lock().await.write_all(&bytes).await;
                                 }
+                                // A stale-sized frame is unsafe to repaint after a
+                                // resize; clear and let the resize drive the redraw.
+                                let frame = if resized { None } else { last_frame.as_ref() };
                                 repaint_session_after_overlay(
                                     &mut stdout,
                                     &mut frame_renderer,
-                                    &last_frame,
+                                    frame,
                                     &bar_items,
                                     config,
                                     (w, h),
@@ -2355,7 +2359,8 @@ async fn run_attach_loop(
                         // cleared the screen, so a resize while help was open does
                         // not leave the session at stale dimensions.
                         let (w, h) = terminal_size_or(screen.size());
-                        if (w, h) != screen.size() {
+                        let resized = (w, h) != screen.size();
+                        if resized {
                             screen.resize(h, w);
                         }
                         let area_h = session_area_height(config, h);
@@ -2373,10 +2378,13 @@ async fn run_attach_loop(
                         if let Ok(bytes) = resize_msg.to_json_line() {
                             let _ = writer_c.lock().await.write_all(&bytes).await;
                         }
+                        // A stale-sized frame is unsafe to repaint after a resize;
+                        // clear and let the resize drive the redraw.
+                        let frame = if resized { None } else { last_frame.as_ref() };
                         repaint_session_after_overlay(
                             &mut stdout,
                             &mut frame_renderer,
-                            &last_frame,
+                            frame,
                             &bar_items,
                             config,
                             (w, h),
@@ -2531,22 +2539,27 @@ fn terminal_size_or(fallback: (u16, u16)) -> (u16, u16) {
 /// cleared the screen, and a no-op resize does not make an idle app redraw, so
 /// restore the last known frame locally (and the status bar) instead of relying
 /// on the daemon to re-emit one.
+///
+/// `frame` is `None` when there is nothing safe to repaint — either no frame has
+/// arrived yet, or the terminal was resized while the overlay was open (the
+/// retained frame has stale dimensions, so we clear and let the resize elicit the
+/// app's redraw, mirroring the normal resize path).
 fn repaint_session_after_overlay<W: Write>(
     stdout: &mut W,
     frame_renderer: &mut term::FrameRenderer,
-    last_frame: &Option<ScreenFrame>,
+    frame: Option<&ScreenFrame>,
     bar_items: &[StatusBarItem],
     config: ClientConfig,
     size: (u16, u16),
     bar_cursor_visible: &mut bool,
 ) {
     frame_renderer.reset();
-    match last_frame {
+    match frame {
         Some(frame) => {
             let _ = frame_renderer.render(stdout, frame);
             *bar_cursor_visible = !frame.hide_cursor;
         }
-        // No frame arrived yet: clear so the overlay text does not linger.
+        // Clear so the overlay text does not linger while we wait for a frame.
         None => {
             let _ = write!(stdout, "\x1b[2J\x1b[H");
         }
