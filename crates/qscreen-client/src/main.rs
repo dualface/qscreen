@@ -2577,8 +2577,10 @@ enum OverlayEvent {
 /// the meantime. Frames are coalesced into `ctx.last_frame` (only the newest is
 /// kept, so the channel can't grow unbounded while the overlay is open and the
 /// caller can repaint the session on close); other messages are buffered onto
-/// `ctx.pending` so no output is lost. An `Exit`/disconnect becomes
-/// [`OverlayEvent::SessionEnded`].
+/// `ctx.pending` so the main loop processes them after the overlay closes. A
+/// frame is a full-screen snapshot, so any replay `Output` buffered before it is
+/// obsolete and is dropped — otherwise it would be replayed over the repainted
+/// frame after close. An `Exit`/disconnect becomes [`OverlayEvent::SessionEnded`].
 async fn overlay_next_event(ctx: &mut OverlayCtx<'_>) -> anyhow::Result<OverlayEvent> {
     loop {
         // Drain everything currently queued before blocking on input again.
@@ -2588,6 +2590,9 @@ async fn overlay_next_event(ctx: &mut OverlayCtx<'_>) -> anyhow::Result<OverlayE
                     Some(EventType::Frame) => {
                         if msg.frame.is_some() {
                             *ctx.last_frame = msg.frame;
+                            // Prior buffered output is superseded by this frame;
+                            // dropping it keeps the post-close repaint correct.
+                            ctx.pending.retain(|m| m.event != Some(EventType::Output));
                         }
                     }
                     Some(EventType::Exit) => return Ok(OverlayEvent::SessionEnded),
