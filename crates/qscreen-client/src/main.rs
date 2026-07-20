@@ -3085,11 +3085,14 @@ async fn read_kill_confirm_key() -> anyhow::Result<ConfirmKey> {
                     Ok(Event::Key(key_event))
                         if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                     {
-                        let modified = key_event
+                        // Shift is allowed (it produces `Y`); any other modifier
+                        // (Ctrl/Alt/Super/Hyper/Meta) cancels.
+                        let has_extra_modifier = !key_event
                             .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+                            .difference(KeyModifiers::SHIFT)
+                            .is_empty();
                         match key_event.code {
-                            KeyCode::Char('y') | KeyCode::Char('Y') if !modified => {
+                            KeyCode::Char('y') | KeyCode::Char('Y') if !has_extra_modifier => {
                                 return Ok(ConfirmKey::Confirm);
                             }
                             _ => return Ok(ConfirmKey::Cancel),
