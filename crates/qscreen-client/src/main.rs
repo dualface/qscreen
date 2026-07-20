@@ -2296,8 +2296,7 @@ async fn run_attach_loop(
                             SessionListSelection::Ended => break AttachOutcome::Ended,
                             SessionListSelection::Close | SessionListSelection::Error(_) => {
                                 let (w, h) = terminal_size_or(screen.size());
-                                let resized = (w, h) != screen.size();
-                                if resized {
+                                if (w, h) != screen.size() {
                                     screen.resize(h, w);
                                 }
                                 let area_h = session_area_height(config, h);
@@ -2315,13 +2314,10 @@ async fn run_attach_loop(
                                 if let Ok(bytes) = resize_msg.to_json_line() {
                                     let _ = writer_c.lock().await.write_all(&bytes).await;
                                 }
-                                // A stale-sized frame is unsafe to repaint after a
-                                // resize; clear and let the resize drive the redraw.
-                                let frame = if resized { None } else { last_frame.as_ref() };
                                 repaint_session_after_overlay(
                                     &mut stdout,
                                     &mut frame_renderer,
-                                    frame,
+                                    last_frame.as_ref(),
                                     &bar_items,
                                     config,
                                     (w, h),
@@ -2359,8 +2355,7 @@ async fn run_attach_loop(
                         // cleared the screen, so a resize while help was open does
                         // not leave the session at stale dimensions.
                         let (w, h) = terminal_size_or(screen.size());
-                        let resized = (w, h) != screen.size();
-                        if resized {
+                        if (w, h) != screen.size() {
                             screen.resize(h, w);
                         }
                         let area_h = session_area_height(config, h);
@@ -2378,13 +2373,10 @@ async fn run_attach_loop(
                         if let Ok(bytes) = resize_msg.to_json_line() {
                             let _ = writer_c.lock().await.write_all(&bytes).await;
                         }
-                        // A stale-sized frame is unsafe to repaint after a resize;
-                        // clear and let the resize drive the redraw.
-                        let frame = if resized { None } else { last_frame.as_ref() };
                         repaint_session_after_overlay(
                             &mut stdout,
                             &mut frame_renderer,
-                            frame,
+                            last_frame.as_ref(),
                             &bar_items,
                             config,
                             (w, h),
@@ -2538,12 +2530,10 @@ fn terminal_size_or(fallback: (u16, u16)) -> (u16, u16) {
 /// Repaint the session view after a full-screen overlay closes. The overlay
 /// cleared the screen, and a no-op resize does not make an idle app redraw, so
 /// restore the last known frame locally (and the status bar) instead of relying
-/// on the daemon to re-emit one.
-///
-/// `frame` is `None` when there is nothing safe to repaint — either no frame has
-/// arrived yet, or the terminal was resized while the overlay was open (the
-/// retained frame has stale dimensions, so we clear and let the resize elicit the
-/// app's redraw, mirroring the normal resize path).
+/// on the daemon to re-emit one. If the terminal was resized while the overlay
+/// was open, the retained frame still shows the last content until the app
+/// redraws — the same behavior as an ordinary resize. `frame` is `None` only when
+/// no frame has arrived yet, in which case the screen is cleared.
 fn repaint_session_after_overlay<W: Write>(
     stdout: &mut W,
     frame_renderer: &mut term::FrameRenderer,
@@ -2668,6 +2658,13 @@ async fn run_help_mode<W: Write>(
     }
 }
 
+/// One rendered line of the help overlay body.
+enum HelpBodyLine<'a> {
+    Title(&'a str),
+    Blank,
+    Binding(&'a str, &'a str),
+}
+
 fn render_help_screen<W: Write>(
     out: &mut W,
     prefix: PrefixKey,
@@ -2682,37 +2679,53 @@ fn render_help_screen<W: Write>(
     } else {
         "qscreen key bindings"
     };
-    write_text_line(out, title, Some(color::sgr::HEADER), cols)?;
-    write_text_line(out, "", None, cols)?;
-
-    // Each binding renders the combo in KEY (bold yellow) and the description in
-    // HINT (dim), truncated together to the terminal width.
-    let rows = prefix_help_rows(prefix, zh);
-    for (combo, desc) in &rows {
-        write!(out, "\x1b[0m")?;
-        write_status_segments(
-            out,
-            &[
-                (combo.as_str(), color::sgr::KEY),
-                (desc.as_str(), color::sgr::HINT),
-            ],
-            cols,
-        )?;
-        write!(out, "\r\n")?;
-    }
-
-    // Pin the dismiss hint to the last row when there is a spare row for a gap;
-    // otherwise write it directly after the bindings. Emitting a blank line when
-    // there is no room would scroll the bindings off the top of a short screen.
-    let used_lines = rows.len() as u16 + 2;
-    if rows_count > used_lines + 1 {
-        write!(out, "\x1b[{rows_count};1H")?;
-    }
     let hint = if zh {
         "按 Esc 或 q 关闭"
     } else {
         "press Esc or q to close"
     };
+    let rows = prefix_help_rows(prefix, zh);
+
+    // Assemble the body (title, blank separator, bindings), then trim it to fit
+    // above the pinned hint row so nothing scrolls off a short terminal.
+    let mut body: Vec<HelpBodyLine> = Vec::with_capacity(rows.len() + 2);
+    body.push(HelpBodyLine::Title(title));
+    body.push(HelpBodyLine::Blank);
+    for (combo, desc) in &rows {
+        body.push(HelpBodyLine::Binding(combo.as_str(), desc.as_str()));
+    }
+    // Reserve the last terminal row for the hint.
+    let budget = rows_count.saturating_sub(1) as usize;
+    if body.len() > budget
+        && let Some(pos) = body.iter().position(|l| matches!(l, HelpBodyLine::Blank))
+    {
+        // Drop the cosmetic blank separator before sacrificing any bindings.
+        body.remove(pos);
+    }
+    body.truncate(budget);
+
+    for line in &body {
+        match line {
+            HelpBodyLine::Title(t) => write_text_line(out, t, Some(color::sgr::HEADER), cols)?,
+            HelpBodyLine::Blank => write_text_line(out, "", None, cols)?,
+            HelpBodyLine::Binding(combo, desc) => {
+                write!(out, "\x1b[0m")?;
+                write_status_segments(
+                    out,
+                    &[(*combo, color::sgr::KEY), (*desc, color::sgr::HINT)],
+                    cols,
+                )?;
+                write!(out, "\r\n")?;
+            }
+        }
+    }
+
+    // Pin the hint to the last row when there is a spare row for a gap; otherwise
+    // it follows the body directly. The body never exceeds `rows_count - 1` lines,
+    // so the hint always fits without scrolling.
+    if (body.len() as u16) + 1 < rows_count {
+        write!(out, "\x1b[{rows_count};1H")?;
+    }
     write!(out, "\x1b[0m")?;
     write_status_segments(out, &[(hint, color::sgr::HINT)], cols)?;
     write!(out, "\x1b[?2026l")?;
