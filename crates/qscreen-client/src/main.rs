@@ -1627,7 +1627,7 @@ enum AttachOutcome {
 
 /// After the PREFIX key is pressed, wait this long for a command key. If no key
 /// arrives in time, the pending PREFIX byte is passed through to the terminal.
-const PREFIX_PENDING_TIMEOUT: Duration = Duration::from_millis(500);
+const PREFIX_PENDING_TIMEOUT: Duration = Duration::from_millis(1000);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PrefixState {
