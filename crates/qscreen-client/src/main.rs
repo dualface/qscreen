@@ -1949,6 +1949,7 @@ enum SessionListAction {
     Select,
     Create,
     Rename,
+    Help,
     Cancel,
     Resize(u16, u16),
 }
@@ -2268,8 +2269,13 @@ async fn run_attach_loop(
                         stop_input.store(true, Ordering::Relaxed);
                         let _ = input_handle.await;
 
-                        match run_session_list_mode(&session_id_c, screen.size(), &mut stdout)
-                            .await?
+                        match run_session_list_mode(
+                            &session_id_c,
+                            config.prefix,
+                            screen.size(),
+                            &mut stdout,
+                        )
+                        .await?
                         {
                             SessionListSelection::Switch(next_session_id) => {
                                 break AttachOutcome::SwitchTo(next_session_id);
@@ -2600,17 +2606,19 @@ async fn read_help_key() -> anyhow::Result<HelpKey> {
 
 /// Full-screen help overlay listing the in-session `<prefix>` bindings. Blocks
 /// until the user presses Esc or q, re-rendering on resize so the screen tracks
-/// the terminal.
+/// the terminal. Returns the latest terminal size so callers that keep drawing
+/// (like the session list) stay in sync with resizes that happened while the
+/// help screen was open.
 async fn run_help_mode<W: Write>(
     prefix: PrefixKey,
     term_size: (u16, u16),
     stdout: &mut W,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(u16, u16)> {
     let mut size = term_size;
     render_help_screen(stdout, prefix, size)?;
     loop {
         match read_help_key().await? {
-            HelpKey::Dismiss => return Ok(()),
+            HelpKey::Dismiss => return Ok(size),
             HelpKey::Resize(cols, rows) => {
                 size = (cols, rows);
                 render_help_screen(stdout, prefix, size)?;
@@ -2695,6 +2703,7 @@ fn render_help_screen<W: Write>(
 
 async fn run_session_list_mode<W: Write>(
     current_session_id: &str,
+    prefix: PrefixKey,
     term_size: (u16, u16),
     stdout: &mut W,
 ) -> anyhow::Result<SessionListSelection> {
@@ -2720,6 +2729,12 @@ async fn run_session_list_mode<W: Write>(
                 render_session_list(stdout, &rows, selected, &status, term_size)?;
             }
             SessionListAction::Cancel => return Ok(SessionListSelection::Close),
+            SessionListAction::Help => {
+                // The help overlay owns the screen until dismissed, then the
+                // list repaints so the user comes back where they left off.
+                term_size = run_help_mode(prefix, term_size, stdout).await?;
+                render_session_list(stdout, &rows, selected, &status, term_size)?;
+            }
             SessionListAction::Resize(cols, rows_count) => {
                 term_size = (cols, rows_count);
                 render_session_list(stdout, &rows, selected, &status, term_size)?;
@@ -2810,6 +2825,7 @@ fn map_session_list_key(code: KeyCode) -> Option<SessionListAction> {
         KeyCode::Enter => Some(SessionListAction::Select),
         KeyCode::Char('c') => Some(SessionListAction::Create),
         KeyCode::Char('r') => Some(SessionListAction::Rename),
+        KeyCode::Char('?') => Some(SessionListAction::Help),
         KeyCode::Esc | KeyCode::Char('q') => Some(SessionListAction::Cancel),
         _ => None,
     }
@@ -3070,6 +3086,8 @@ fn write_session_list_hint<W: Write>(out: &mut W, cols: u16) -> std::io::Result<
         (" create, ", false),
         ("r", true),
         (" rename, ", false),
+        ("?", true),
+        (" help, ", false),
         ("Esc/q", true),
         (" cancel", false),
     ];
@@ -3776,7 +3794,7 @@ mod tests {
         assert!(rendered.ends_with("\r\n"));
         let line = rendered.strip_suffix("\r\n").unwrap();
         assert!(
-            line.contains("Up/Down or k/j, Enter switch, c create, r rename, Esc/q cancel"),
+            line.contains("Up/Down or k/j, Enter switch, c create, r rename, ? help, Esc/q cancel"),
             "{line:?}"
         );
         // After stripping any leading SGR reset prefix, the visible content should exactly fill cols columns.
@@ -4191,6 +4209,10 @@ mod tests {
         assert_eq!(
             map_session_list_key(KeyCode::Char('r')),
             Some(SessionListAction::Rename)
+        );
+        assert_eq!(
+            map_session_list_key(KeyCode::Char('?')),
+            Some(SessionListAction::Help)
         );
         assert_eq!(
             map_session_list_key(KeyCode::Esc),
