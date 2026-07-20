@@ -1950,6 +1950,7 @@ enum SessionListAction {
     Create,
     Rename,
     Cancel,
+    Resize(u16, u16),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2697,6 +2698,7 @@ async fn run_session_list_mode<W: Write>(
     term_size: (u16, u16),
     stdout: &mut W,
 ) -> anyhow::Result<SessionListSelection> {
+    let mut term_size = term_size;
     let mut rows = build_session_list_rows(&list_sessions().await?, current_session_id);
     let mut selected = rows
         .iter()
@@ -2718,6 +2720,10 @@ async fn run_session_list_mode<W: Write>(
                 render_session_list(stdout, &rows, selected, &status, term_size)?;
             }
             SessionListAction::Cancel => return Ok(SessionListSelection::Close),
+            SessionListAction::Resize(cols, rows_count) => {
+                term_size = (cols, rows_count);
+                render_session_list(stdout, &rows, selected, &status, term_size)?;
+            }
             SessionListAction::Create => {
                 // Inherit the cwd of the session under the cursor so the new session opens in the same directory;
                 // if that session has no known cwd, fall back to create_session's default behavior (the client's current directory).
@@ -2743,7 +2749,9 @@ async fn run_session_list_mode<W: Write>(
                     render_session_list(stdout, &rows, selected, &status, term_size)?;
                     continue;
                 }
-                match prompt_session_rename(stdout, &rows, selected, term_size, &row.name).await? {
+                match prompt_session_rename(stdout, &rows, selected, &mut term_size, &row.name)
+                    .await?
+                {
                     Some(new_name) => match rename_session(&row.session_id, &new_name).await {
                         Ok(()) => {
                             rows = build_session_list_rows(
@@ -2819,6 +2827,9 @@ async fn read_session_list_action() -> anyhow::Result<SessionListAction> {
                             return Ok(action);
                         }
                     }
+                    Ok(Event::Resize(cols, rows)) => {
+                        return Ok(SessionListAction::Resize(cols, rows));
+                    }
                     Ok(_) => {}
                     Err(e) => return Err(anyhow::Error::new(e)),
                 },
@@ -2836,6 +2847,7 @@ enum NameEditKey {
     Backspace,
     Submit,
     Cancel,
+    Resize(u16, u16),
 }
 
 /// Map a key press to a rename-prompt edit action, or `None` if the key is not
@@ -2862,6 +2874,9 @@ async fn read_name_edit_key() -> anyhow::Result<NameEditKey> {
                             return Ok(action);
                         }
                     }
+                    Ok(Event::Resize(cols, rows)) => {
+                        return Ok(NameEditKey::Resize(cols, rows));
+                    }
                     Ok(_) => {}
                     Err(e) => return Err(anyhow::Error::new(e)),
                 },
@@ -2874,12 +2889,13 @@ async fn read_name_edit_key() -> anyhow::Result<NameEditKey> {
 }
 
 /// Prompt the user for a new name inline in the session list's bottom row.
-/// Returns Some(name) on submit, None on cancel.
+/// Returns Some(name) on submit, None on cancel. `term_size` is updated in
+/// place on resize so the caller keeps rendering at the live terminal size.
 async fn prompt_session_rename<W: Write>(
     stdout: &mut W,
     rows: &[SessionListRow],
     selected: usize,
-    term_size: (u16, u16),
+    term_size: &mut (u16, u16),
     old_name: &str,
 ) -> anyhow::Result<Option<String>> {
     let mut input = String::new();
@@ -2896,7 +2912,7 @@ async fn prompt_session_rename<W: Write>(
             (input_field.as_str(), color::sgr::INPUT),
             ("  (Enter confirm, Esc cancel)", color::sgr::HINT),
         ];
-        render_session_list_with_status(stdout, rows, selected, &segments, term_size)?;
+        render_session_list_with_status(stdout, rows, selected, &segments, *term_size)?;
         match read_name_edit_key().await? {
             NameEditKey::Submit => {
                 let trimmed = input.trim();
@@ -2914,6 +2930,9 @@ async fn prompt_session_rename<W: Write>(
                 if !c.is_control() {
                     input.push(c);
                 }
+            }
+            NameEditKey::Resize(cols, rows_count) => {
+                *term_size = (cols, rows_count);
             }
         }
     }
