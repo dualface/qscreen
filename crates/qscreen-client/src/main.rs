@@ -1355,20 +1355,76 @@ async fn attach_session_loop(
     mut initial_notice: Option<String>,
 ) -> anyhow::Result<()> {
     let mut session_id = initial_session_id.to_string();
+    // Whether the current `session_id` came from an in-session switch rather than
+    // the initial explicit attach. A switch target can race out between listing
+    // and the handshake; when it does we recover to another live session instead
+    // of exiting, while the initial explicit attach still surfaces a
+    // missing/exited target unchanged.
+    let mut reattaching = false;
+    // The session we were attached to just before switching. It keeps running on
+    // the daemon, so it is a known-good fallback if the recovery listing itself
+    // fails or times out.
+    let mut previous_session_id: Option<String> = None;
 
     loop {
         validate_session_id(&session_id)?;
         // `take()` ensures the notice is shown at most once, on the first attach;
         // switching/reattaching within the loop passes None.
-        let outcome = attach_session_once(&session_id, config, initial_notice.take()).await?;
+        let outcome = match attach_session_once(&session_id, config, initial_notice.take()).await {
+            Ok(outcome) => outcome,
+            Err(err) if reattaching && err.downcast_ref::<SessionUnavailable>().is_some() => {
+                // The switch target vanished before the handshake. Recover to
+                // another live session so a switch never kills the client. Bound
+                // the lookup so a stalled daemon cannot wedge us with the old
+                // connection already dropped.
+                match tokio::time::timeout(STATUS_BAR_FETCH_TIMEOUT, list_sessions()).await {
+                    Ok(Ok(sessions)) => {
+                        match highest_remaining_session_id(&sessions, &session_id) {
+                            Some(next_session_id) => {
+                                session_id = next_session_id;
+                                continue;
+                            }
+                            // Listing succeeded and no live session remains: shut
+                            // the daemon down like the normal exit path instead of
+                            // leaking a sessionless daemon.
+                            None => {
+                                cmd_shutdown().await?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                    // Listing failed or timed out: fall back to the previous,
+                    // still-running session if we have one; otherwise surface the
+                    // original error.
+                    Ok(Err(_)) | Err(_) => match previous_session_id.take() {
+                        Some(prev) => {
+                            session_id = prev;
+                            continue;
+                        }
+                        None => return Err(err),
+                    },
+                }
+            }
+            Err(err) => return Err(err),
+        };
         match outcome {
-            AttachOutcome::SwitchTo(next_session_id) => session_id = next_session_id,
+            AttachOutcome::SwitchTo(next_session_id) => {
+                previous_session_id = Some(session_id.clone());
+                session_id = next_session_id;
+                reattaching = true;
+            }
             // Detaching leaves the daemon and all sessions running.
             AttachOutcome::Detached => return Ok(()),
             // The attached session exited: auto-switch to the highest-ID
             // remaining session, or shut the daemon down when none remain.
             AttachOutcome::Ended => match next_session_after_exit(&session_id).await? {
-                Some(next_session_id) => session_id = next_session_id,
+                Some(next_session_id) => {
+                    // The current session exited, so it is no longer a valid
+                    // fallback for a later recovery.
+                    previous_session_id = None;
+                    session_id = next_session_id;
+                    reattaching = true;
+                }
                 None => {
                     cmd_shutdown().await?;
                     return Ok(());
@@ -2148,15 +2204,41 @@ async fn run_attach_loop(
                         }
                     }
                     Some(AttachAction::SwitchSession(direction)) => {
+                        // Stop the input reader before the async lookup so it can
+                        // never race the next attachment's reader over Crossterm
+                        // events (mirrors the session-list flow).
+                        stop_input.store(true, Ordering::Relaxed);
+                        let _ = input_handle.await;
+
                         // Query the daemon for the live session set and switch to
-                        // the neighbor. On a fetch error or when this is the only
-                        // live session, stay attached and keep reading input.
-                        if let Ok(sessions) = list_sessions().await
-                            && let Some(next_session_id) =
-                                adjacent_session_id(&sessions, &session_id_c, direction)
+                        // the neighbor. A bounded timeout keeps a stalled side
+                        // connection from wedging the attachment. On a fetch error,
+                        // timeout, or when this is the only live session, stay put.
+                        let next = match tokio::time::timeout(
+                            STATUS_BAR_FETCH_TIMEOUT,
+                            list_sessions(),
+                        )
+                        .await
                         {
+                            Ok(Ok(sessions)) => {
+                                adjacent_session_id(&sessions, &session_id_c, direction)
+                            }
+                            Ok(Err(_)) | Err(_) => None,
+                        };
+                        if let Some(next_session_id) = next {
                             break AttachOutcome::SwitchTo(next_session_id);
                         }
+
+                        // No switch happened: resume reading input for the current
+                        // session.
+                        stop_input.store(false, Ordering::Relaxed);
+                        input_handle = spawn_attach_input_reader(
+                            action_tx.clone(),
+                            stop_input.clone(),
+                            config.prefix,
+                            input_modes.clone(),
+                            app_rows.clone(),
+                        );
                     }
                 }
             }
@@ -2211,8 +2293,12 @@ fn spawn_attach_input_reader(
                     let modes = *input_modes.lock().unwrap();
                     for action in prefix_state.handle_key(key_event, prefix, modes, Instant::now())
                     {
-                        let should_stop =
-                            matches!(action, AttachAction::Detach | AttachAction::OpenSessionList);
+                        let should_stop = matches!(
+                            action,
+                            AttachAction::Detach
+                                | AttachAction::OpenSessionList
+                                | AttachAction::SwitchSession(_)
+                        );
                         let _ = action_tx.send(action);
                         if should_stop {
                             return;
