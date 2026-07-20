@@ -987,8 +987,11 @@ enum SessionListSelection {
     Close,
     Error(String),
     Switch(String),
-    /// The last session was killed from the list, so qscn should exit and let
-    /// the daemon shut down like the normal no-sessions-remain path.
+    /// Switch to another session after the current, attached session was killed
+    /// from the list. The dead session must not be kept as a reattach fallback.
+    SwitchFresh(String),
+    /// The last session was killed from the list, so qscn should shut the daemon
+    /// down and exit.
     Quit,
 }
 
@@ -1509,8 +1512,22 @@ async fn attach_session_loop(
                 session_id = next_session_id;
                 reattaching = true;
             }
+            // Switch after killing the current session: the session we came from
+            // is dead, so it must not be kept as a reattach fallback.
+            AttachOutcome::SwitchToFresh(next_session_id) => {
+                previous_session_id = None;
+                session_id = next_session_id;
+                reattaching = true;
+            }
             // Detaching leaves the daemon and all sessions running.
             AttachOutcome::Detached => return Ok(()),
+            // The last session was killed from the list: shut the daemon down
+            // and exit without a redundant listing so a session created in the
+            // meantime cannot resurrect the client.
+            AttachOutcome::Shutdown => {
+                cmd_shutdown().await?;
+                return Ok(());
+            }
             // The attached session exited: auto-switch to the highest-ID
             // remaining session, or shut the daemon down when none remain.
             AttachOutcome::Ended => match next_session_after_exit(&session_id).await? {
@@ -1962,7 +1979,12 @@ enum SessionListAction {
 enum AttachOutcome {
     Detached,
     SwitchTo(String),
+    /// Like `SwitchTo`, but the session we came from was just killed from the
+    /// list, so it must not be recorded as a reattach fallback.
+    SwitchToFresh(String),
     Ended,
+    /// The last session was killed from the list: shut the daemon down and exit.
+    Shutdown,
 }
 
 /// After the PREFIX key is pressed, wait this long for a command key. If no key
@@ -2284,9 +2306,12 @@ async fn run_attach_loop(
                             SessionListSelection::Switch(next_session_id) => {
                                 break AttachOutcome::SwitchTo(next_session_id);
                             }
-                            // The last session was killed from the list: end the
-                            // attach loop so the daemon is shut down and qscn exits.
-                            SessionListSelection::Quit => break AttachOutcome::Ended,
+                            SessionListSelection::SwitchFresh(next_session_id) => {
+                                break AttachOutcome::SwitchToFresh(next_session_id);
+                            }
+                            // The last session was killed from the list: shut the
+                            // daemon down and exit qscn.
+                            SessionListSelection::Quit => break AttachOutcome::Shutdown,
                             SessionListSelection::Close | SessionListSelection::Error(_) => {
                                 restore_session_after_overlay(
                                     &mut stdout,
@@ -2823,7 +2848,7 @@ async fn run_session_list_mode<W: Write>(
                             // (nothing live is left to attach to).
                             match highest_remaining_session_id(&sessions, &row.session_id) {
                                 Some(next_session_id) => {
-                                    return Ok(SessionListSelection::Switch(next_session_id));
+                                    return Ok(SessionListSelection::SwitchFresh(next_session_id));
                                 }
                                 None => return Ok(SessionListSelection::Quit),
                             }
@@ -2856,8 +2881,11 @@ async fn run_session_list_mode<W: Write>(
                     SessionListSelection::Switch(name) => {
                         return Ok(SessionListSelection::Switch(name));
                     }
-                    // selection_for_session_row never yields Quit; propagate it
-                    // for completeness so this match stays exhaustive.
+                    // selection_for_session_row only yields Close/Switch/Error;
+                    // propagate the kill-only variants for match exhaustiveness.
+                    SessionListSelection::SwitchFresh(name) => {
+                        return Ok(SessionListSelection::SwitchFresh(name));
+                    }
                     SessionListSelection::Quit => return Ok(SessionListSelection::Quit),
                     SessionListSelection::Error(error) => {
                         status = error.clone();
@@ -3029,14 +3057,54 @@ async fn prompt_session_kill_confirm<W: Write>(
             ("(y confirm, Esc cancel)", color::sgr::HINT),
         ];
         render_session_list_with_status(stdout, rows, selected, &segments, *term_size)?;
-        match read_name_edit_key().await? {
-            NameEditKey::Char('y') | NameEditKey::Char('Y') => return Ok(true),
-            NameEditKey::Resize(cols, rows_count) => {
+        match read_kill_confirm_key().await? {
+            ConfirmKey::Confirm => return Ok(true),
+            ConfirmKey::Cancel => return Ok(false),
+            ConfirmKey::Resize(cols, rows_count) => {
                 *term_size = (cols, rows_count);
             }
-            _ => return Ok(false),
         }
     }
+}
+
+/// A key read at the kill-confirmation prompt.
+enum ConfirmKey {
+    Confirm,
+    Cancel,
+    Resize(u16, u16),
+}
+
+/// Read a key at the kill-confirmation prompt. Only a plain `y`/`Y` (optionally
+/// with Shift) confirms; a Ctrl/Alt-modified key or any other key cancels so the
+/// destructive action fails closed.
+async fn read_kill_confirm_key() -> anyhow::Result<ConfirmKey> {
+    tokio::task::spawn_blocking(|| {
+        loop {
+            match crossterm::event::poll(Duration::from_millis(50)) {
+                Ok(true) => match crossterm::event::read() {
+                    Ok(Event::Key(key_event))
+                        if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                    {
+                        let modified = key_event
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+                        match key_event.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') if !modified => {
+                                return Ok(ConfirmKey::Confirm);
+                            }
+                            _ => return Ok(ConfirmKey::Cancel),
+                        }
+                    }
+                    Ok(Event::Resize(cols, rows)) => return Ok(ConfirmKey::Resize(cols, rows)),
+                    Ok(_) => {}
+                    Err(e) => return Err(anyhow::Error::new(e)),
+                },
+                Ok(false) => {}
+                Err(e) => return Err(anyhow::Error::new(e)),
+            }
+        }
+    })
+    .await?
 }
 
 /// Total visible width of all fixed columns before cwd in a session list row.
