@@ -3397,17 +3397,24 @@ fn write_session_list_hint<W: Write>(out: &mut W, cols: u16, zh: bool) -> std::i
             break;
         }
         let piece = truncate_for_terminal(text, limit - visible);
-        if piece.is_empty() {
-            continue;
+        let piece_width = UnicodeWidthStr::width(piece.as_str());
+        // If a segment does not fit whole (e.g. a two-column CJK glyph with only
+        // one column left), emit what fits and stop rather than skipping ahead to
+        // a later, narrower segment, which would render the keys out of order.
+        let truncated = piece_width < UnicodeWidthStr::width(*text);
+        if piece_width > 0 {
+            visible += piece_width;
+            let sgr = if *is_key {
+                color::sgr::KEY
+            } else {
+                color::sgr::HINT
+            };
+            // color::paint returns text unchanged in a colorless environment, so this branch covers both the colored and colorless cases.
+            content.push_str(&color::paint(&piece, sgr));
         }
-        visible += UnicodeWidthStr::width(piece.as_str());
-        let sgr = if *is_key {
-            color::sgr::KEY
-        } else {
-            color::sgr::HINT
-        };
-        // color::paint returns text unchanged in a colorless environment, so this branch covers both the colored and colorless cases.
-        content.push_str(&color::paint(&piece, sgr));
+        if truncated {
+            break;
+        }
     }
     write_list_line(out, &content, visible, None, cols)
 }
@@ -4134,6 +4141,22 @@ mod tests {
         );
         let visible = line.trim_start_matches("\x1b[0m");
         assert_eq!(UnicodeWidthStr::width(visible), cols as usize);
+    }
+
+    #[test]
+    fn session_list_hint_chinese_truncates_in_order() {
+        // At a width that cuts a two-column glyph, the hint must stop in order and
+        // never pull a later key forward, so the visible text (minus padding) stays
+        // a prefix of the full hint string.
+        const FULL: &str = "Up/Down 或 k/j, Enter 切换, c 新建, r 改名, x 终止, ? 帮助, Esc/q 取消";
+        let cols = 23u16;
+        let mut out = Vec::new();
+        write_session_list_hint(&mut out, cols, true).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        let line = rendered.strip_suffix("\r\n").unwrap();
+        let stripped = line.trim_start_matches("\x1b[0m");
+        assert_eq!(UnicodeWidthStr::width(stripped), cols as usize);
+        assert!(FULL.starts_with(stripped.trim_end()), "{stripped:?}");
     }
 
     #[test]
