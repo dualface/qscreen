@@ -406,8 +406,8 @@ const PREFIX_BINDINGS: &[PrefixBinding] = &[
     },
     PrefixBinding {
         keys: "s",
-        desc_en: "open the session list (Enter switch, c create, r rename, q cancel)",
-        desc_zh: "打开会话列表(Enter 切换,c 新建,r 改名,q 取消)",
+        desc_en: "open the session list (Enter switch, c create, r rename, x kill, q cancel)",
+        desc_zh: "打开会话列表(Enter 切换,c 新建,r 改名,x 终止,q 取消)",
     },
     PrefixBinding {
         keys: "n",
@@ -987,6 +987,9 @@ enum SessionListSelection {
     Close,
     Error(String),
     Switch(String),
+    /// The last session was killed from the list, so qscn should exit and let
+    /// the daemon shut down like the normal no-sessions-remain path.
+    Quit,
 }
 
 fn build_session_list_rows(
@@ -1949,6 +1952,7 @@ enum SessionListAction {
     Select,
     Create,
     Rename,
+    Kill,
     Help,
     Cancel,
     Resize(u16, u16),
@@ -2280,6 +2284,9 @@ async fn run_attach_loop(
                             SessionListSelection::Switch(next_session_id) => {
                                 break AttachOutcome::SwitchTo(next_session_id);
                             }
+                            // The last session was killed from the list: end the
+                            // attach loop so the daemon is shut down and qscn exits.
+                            SessionListSelection::Quit => break AttachOutcome::Ended,
                             SessionListSelection::Close | SessionListSelection::Error(_) => {
                                 restore_session_after_overlay(
                                     &mut stdout,
@@ -2785,6 +2792,49 @@ async fn run_session_list_mode<W: Write>(
                 }
                 render_session_list(stdout, &rows, selected, &status, term_size)?;
             }
+            SessionListAction::Kill => {
+                if rows.is_empty() {
+                    status = "no sessions".to_string();
+                    render_session_list(stdout, &rows, selected, &status, term_size)?;
+                    continue;
+                }
+                selected = selected.min(rows.len() - 1);
+                let row = rows[selected].clone();
+                if !prompt_session_kill_confirm(stdout, &rows, selected, &mut term_size, &row)
+                    .await?
+                {
+                    status = String::new();
+                    render_session_list(stdout, &rows, selected, &status, term_size)?;
+                    continue;
+                }
+                match cmd_kill(&row.session_id).await {
+                    Ok(()) => {
+                        let sessions = list_sessions().await?;
+                        rows = build_session_list_rows(&sessions, current_session_id);
+                        if rows.is_empty() {
+                            // The last session is gone: exit qscn and let the
+                            // daemon shut down like the normal no-sessions path.
+                            return Ok(SessionListSelection::Quit);
+                        }
+                        if row.session_id == current_session_id {
+                            // The attached session was just killed, so we cannot
+                            // return to it. Switch to the highest-ID live
+                            // session, or quit when only exited sessions remain
+                            // (nothing live is left to attach to).
+                            match highest_remaining_session_id(&sessions, &row.session_id) {
+                                Some(next_session_id) => {
+                                    return Ok(SessionListSelection::Switch(next_session_id));
+                                }
+                                None => return Ok(SessionListSelection::Quit),
+                            }
+                        }
+                        selected = selected.min(rows.len() - 1);
+                        status = format!("killed \"{}\"", row.name);
+                    }
+                    Err(e) => status = format!("kill failed: {e}"),
+                }
+                render_session_list(stdout, &rows, selected, &status, term_size)?;
+            }
             SessionListAction::Select => {
                 if rows.is_empty() {
                     status = "no sessions".to_string();
@@ -2806,6 +2856,9 @@ async fn run_session_list_mode<W: Write>(
                     SessionListSelection::Switch(name) => {
                         return Ok(SessionListSelection::Switch(name));
                     }
+                    // selection_for_session_row never yields Quit; propagate it
+                    // for completeness so this match stays exhaustive.
+                    SessionListSelection::Quit => return Ok(SessionListSelection::Quit),
                     SessionListSelection::Error(error) => {
                         status = error.clone();
                         render_session_list(stdout, &rows, selected, &status, term_size)?;
@@ -2825,6 +2878,7 @@ fn map_session_list_key(code: KeyCode) -> Option<SessionListAction> {
         KeyCode::Enter => Some(SessionListAction::Select),
         KeyCode::Char('c') => Some(SessionListAction::Create),
         KeyCode::Char('r') => Some(SessionListAction::Rename),
+        KeyCode::Char('x') => Some(SessionListAction::Kill),
         KeyCode::Char('?') => Some(SessionListAction::Help),
         KeyCode::Esc | KeyCode::Char('q') => Some(SessionListAction::Cancel),
         _ => None,
@@ -2950,6 +3004,37 @@ async fn prompt_session_rename<W: Write>(
             NameEditKey::Resize(cols, rows_count) => {
                 *term_size = (cols, rows_count);
             }
+        }
+    }
+}
+
+/// Ask the user to confirm killing the selected session, inline in the session
+/// list's bottom row. Returns true only on an explicit `y`/`Y`; every other key
+/// (Esc, Enter, `n`, or any stray key) cancels so the destructive action fails
+/// closed. `term_size` is updated in place on resize so the caller keeps
+/// rendering at the live terminal size.
+async fn prompt_session_kill_confirm<W: Write>(
+    stdout: &mut W,
+    rows: &[SessionListRow],
+    selected: usize,
+    term_size: &mut (u16, u16),
+    row: &SessionListRow,
+) -> anyhow::Result<bool> {
+    loop {
+        // The label uses the error color to flag the destructive action; the
+        // key hint stays dim like the rename prompt.
+        let label = format!("kill \"{}\" (session {})? ", row.name, row.session_id);
+        let segments = [
+            (label.as_str(), color::sgr::ERROR),
+            ("(y confirm, Esc cancel)", color::sgr::HINT),
+        ];
+        render_session_list_with_status(stdout, rows, selected, &segments, *term_size)?;
+        match read_name_edit_key().await? {
+            NameEditKey::Char('y') | NameEditKey::Char('Y') => return Ok(true),
+            NameEditKey::Resize(cols, rows_count) => {
+                *term_size = (cols, rows_count);
+            }
+            _ => return Ok(false),
         }
     }
 }
@@ -3126,6 +3211,8 @@ fn write_session_list_hint<W: Write>(out: &mut W, cols: u16) -> std::io::Result<
         (" create, ", false),
         ("r", true),
         (" rename, ", false),
+        ("x", true),
+        (" kill, ", false),
         ("?", true),
         (" help, ", false),
         ("Esc/q", true),
@@ -3834,7 +3921,9 @@ mod tests {
         assert!(rendered.ends_with("\r\n"));
         let line = rendered.strip_suffix("\r\n").unwrap();
         assert!(
-            line.contains("Up/Down or k/j, Enter switch, c create, r rename, ? help, Esc/q cancel"),
+            line.contains(
+                "Up/Down or k/j, Enter switch, c create, r rename, x kill, ? help, Esc/q cancel"
+            ),
             "{line:?}"
         );
         // After stripping any leading SGR reset prefix, the visible content should exactly fill cols columns.
@@ -4307,6 +4396,10 @@ mod tests {
             Some(SessionListAction::Rename)
         );
         assert_eq!(
+            map_session_list_key(KeyCode::Char('x')),
+            Some(SessionListAction::Kill)
+        );
+        assert_eq!(
             map_session_list_key(KeyCode::Char('?')),
             Some(SessionListAction::Help)
         );
@@ -4318,7 +4411,7 @@ mod tests {
             map_session_list_key(KeyCode::Char('q')),
             Some(SessionListAction::Cancel)
         );
-        assert_eq!(map_session_list_key(KeyCode::Char('x')), None);
+        assert_eq!(map_session_list_key(KeyCode::Char('z')), None);
     }
 
     #[test]
