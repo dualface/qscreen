@@ -2304,12 +2304,19 @@ async fn run_attach_loop(
                         stop_input.store(true, Ordering::Relaxed);
                         let _ = input_handle.await;
 
-                        run_help_mode(config.prefix, screen.size(), &mut stdout).await?;
+                        // The overlay tracks resize events and reports the latest
+                        // size, so a resize during help does not leave the session
+                        // stuck at stale dimensions.
+                        let (w, h) = run_help_mode(config.prefix, screen.size(), &mut stdout).await?;
+                        if (w, h) != screen.size() {
+                            screen.resize(h, w);
+                        }
 
                         // The help modal painted over the whole screen; restore the
                         // session view exactly like the session list's close path.
-                        let (w, h) = screen.size();
                         frame_renderer.reset();
+                        let area_h = session_area_height(config, h);
+                        app_rows.store(area_h, Ordering::Relaxed);
                         msg_id += 1;
                         let resize_msg = Message {
                             kind: MessageKind::Request,
@@ -2317,7 +2324,7 @@ async fn run_attach_loop(
                             command: Some(Command::Resize),
                             session_id: session_id_c.clone(),
                             width: w as u32,
-                            height: session_area_height(config, h) as u32,
+                            height: area_h as u32,
                             ..Default::default()
                         };
                         if let Ok(bytes) = resize_msg.to_json_line() {
@@ -2467,21 +2474,38 @@ fn spawn_attach_input_reader(
     })
 }
 
+/// Result of waiting on the help overlay: dismiss it, or a terminal resize.
+enum HelpEvent {
+    Dismiss,
+    Resize(u16, u16),
+}
+
 /// Full-screen help overlay listing the in-session `<prefix>` bindings. Blocks
-/// until the user presses Esc or q, then returns so the caller can repaint the
-/// session view.
+/// until the user presses Esc or q, re-rendering on resize so the screen tracks
+/// the terminal. Returns the latest `(cols, rows)` size so the caller can restore
+/// the session at the correct dimensions even if the terminal was resized while
+/// the overlay was open (Crossterm does not re-emit a resize after it closes).
 async fn run_help_mode<W: Write>(
     prefix: PrefixKey,
     term_size: (u16, u16),
     stdout: &mut W,
-) -> anyhow::Result<()> {
-    render_help_screen(stdout, prefix, term_size)?;
-    read_help_dismiss().await
+) -> anyhow::Result<(u16, u16)> {
+    let mut size = term_size;
+    render_help_screen(stdout, prefix, size)?;
+    loop {
+        match read_help_event().await? {
+            HelpEvent::Dismiss => return Ok(size),
+            HelpEvent::Resize(cols, rows) => {
+                size = (cols, rows);
+                render_help_screen(stdout, prefix, size)?;
+            }
+        }
+    }
 }
 
-/// Wait for the key that dismisses the help screen (Esc or q). Other keys are
-/// ignored so the screen stays put.
-async fn read_help_dismiss() -> anyhow::Result<()> {
+/// Wait for the key that dismisses the help screen (Esc or q) or a terminal
+/// resize. Other keys are ignored so the screen stays put.
+async fn read_help_event() -> anyhow::Result<HelpEvent> {
     tokio::task::spawn_blocking(|| {
         loop {
             match crossterm::event::poll(Duration::from_millis(50)) {
@@ -2490,10 +2514,11 @@ async fn read_help_dismiss() -> anyhow::Result<()> {
                         if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                     {
                         match key_event.code {
-                            KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Esc | KeyCode::Char('q') => return Ok(HelpEvent::Dismiss),
                             _ => {}
                         }
                     }
+                    Ok(Event::Resize(cols, rows)) => return Ok(HelpEvent::Resize(cols, rows)),
                     Ok(_) => {}
                     Err(e) => return Err(anyhow::Error::new(e)),
                 },
