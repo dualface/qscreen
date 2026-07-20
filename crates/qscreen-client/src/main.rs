@@ -2989,29 +2989,69 @@ fn render_session_list_with_status<W: Write>(
 ) -> std::io::Result<()> {
     let (cols, rows_count) = term_size;
     write!(out, "\x1b[?2026h\x1b[0m\x1b[2J\x1b[H")?;
-    write_text_line(out, "qscreen sessions", Some(color::sgr::HEADER), cols)?;
-    write_session_list_hint(out, cols)?;
-    write_text_line(out, "", None, cols)?;
+
+    // Reserve the terminal's bottom row for the status line; the header and
+    // the session rows share the remaining budget so nothing ever scrolls off
+    // a short terminal.
+    let budget = rows_count.saturating_sub(1) as usize;
+    let body_len = rows.len().max(1); // an empty list still renders "no sessions"
+    let header_len = session_list_header_len(budget, body_len);
+    let (start, visible) =
+        session_list_viewport(budget.saturating_sub(header_len), body_len, selected);
+
+    if header_len >= 1 {
+        write_text_line(out, "qscreen sessions", Some(color::sgr::HEADER), cols)?;
+    }
+    if header_len >= 2 {
+        write_session_list_hint(out, cols)?;
+    }
+    if header_len >= 3 {
+        write_text_line(out, "", None, cols)?;
+    }
 
     if rows.is_empty() {
-        write_text_line(out, "  no sessions", Some(color::sgr::HINT), cols)?;
+        if visible > 0 {
+            write_text_line(out, "  no sessions", Some(color::sgr::HINT), cols)?;
+        }
     } else {
-        for (idx, row) in rows.iter().enumerate() {
+        for (idx, row) in rows.iter().enumerate().skip(start).take(visible) {
             write_session_row(out, row, idx == selected, cols)?;
         }
     }
 
-    let used_lines = rows.len() as u16 + 4;
-    if rows_count > used_lines + 1 {
-        write!(out, "\x1b[{};1H", rows_count)?;
-    } else {
-        write_text_line(out, "", None, cols)?;
-    }
-    // The status line is the last line and carries no CRLF (matching the original implementation).
+    // The status line always sits on the bottom row and carries no CRLF. The
+    // header and body never exceed `rows_count - 1` lines, so this never
+    // scrolls.
+    write!(out, "\x1b[{};1H", rows_count.max(1))?;
     write!(out, "\x1b[0m")?;
     write_status_segments(out, status_segments, cols)?;
     write!(out, "\x1b[?2026l")?;
     out.flush()
+}
+
+/// Number of session-list header lines (title, hint, blank separator) that fit
+/// alongside `body_len` body lines in `budget` lines. On short terminals the
+/// decorations drop before any session rows: the blank separator first, then
+/// the hint, then the title.
+fn session_list_header_len(budget: usize, body_len: usize) -> usize {
+    let mut header_len = 3usize;
+    while header_len > 0 && header_len + body_len > budget {
+        header_len -= 1;
+    }
+    header_len
+}
+
+/// Window of session rows to draw as `(start, len)`: `selected` always falls
+/// inside the window and the window never exceeds `budget` lines. When the
+/// list is scrolled, the selected row sticks to the window's bottom edge.
+fn session_list_viewport(budget: usize, len: usize, selected: usize) -> (usize, usize) {
+    let visible = budget.min(len);
+    if visible == 0 {
+        return (0, 0);
+    }
+    let selected = selected.min(len - 1);
+    let start = selected.saturating_sub(visible - 1).min(len - visible);
+    (start, visible)
 }
 
 /// Write the bottom status line as consecutive colored segments, truncating them
@@ -3800,6 +3840,62 @@ mod tests {
         // After stripping any leading SGR reset prefix, the visible content should exactly fill cols columns.
         let visible = line.trim_start_matches("\x1b[0m");
         assert_eq!(UnicodeWidthStr::width(visible), cols as usize);
+    }
+
+    #[test]
+    fn session_list_header_keeps_all_lines_when_they_fit() {
+        assert_eq!(session_list_header_len(20, 5), 3);
+    }
+
+    #[test]
+    fn session_list_header_drops_decorations_before_rows() {
+        // budget 6, body 4: only the cosmetic blank separator is dropped.
+        assert_eq!(session_list_header_len(6, 4), 2);
+        // budget 5, body 4: the hint goes next.
+        assert_eq!(session_list_header_len(5, 4), 1);
+        // budget 3, body 10: everything drops so session rows survive.
+        assert_eq!(session_list_header_len(3, 10), 0);
+        assert_eq!(session_list_header_len(0, 1), 0);
+    }
+
+    #[test]
+    fn session_list_viewport_keeps_selected_visible() {
+        // Everything fits: the window is the whole list.
+        assert_eq!(session_list_viewport(10, 4, 2), (0, 4));
+        // Scrolled: the selected row sticks to the window's bottom edge.
+        assert_eq!(session_list_viewport(3, 10, 0), (0, 3));
+        assert_eq!(session_list_viewport(3, 10, 5), (3, 3));
+        assert_eq!(session_list_viewport(3, 10, 9), (7, 3));
+        // Degenerate budgets and out-of-range selections stay in bounds.
+        assert_eq!(session_list_viewport(0, 10, 5), (0, 0));
+        assert_eq!(session_list_viewport(3, 10, 42), (7, 3));
+    }
+
+    #[test]
+    fn session_list_render_fits_short_terminal_and_shows_selected_row() {
+        let rows: Vec<SessionListRow> = (0..10)
+            .map(|i| SessionListRow {
+                session_id: i.to_string(),
+                name: format!("session{i}"),
+                state: "running".to_string(),
+                size: "80x24".to_string(),
+                cwd: "~".to_string(),
+                cwd_raw: "~".to_string(),
+                is_current: i == 0,
+                exited: false,
+                attached: false,
+            })
+            .collect();
+        let mut out = Vec::new();
+        render_session_list(&mut out, &rows, 7, "", (80, 6)).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        // 6 terminal rows = 5 budget lines at most, so at most 5 CRLFs are
+        // written (the status line carries none) and nothing scrolls.
+        assert!(rendered.matches("\r\n").count() <= 5, "{rendered:?}");
+        // The selected row is inside the viewport.
+        assert!(rendered.contains("session7"), "{rendered:?}");
+        // Rows far above the window are clipped out.
+        assert!(!rendered.contains("session0"), "{rendered:?}");
     }
 
     #[test]
