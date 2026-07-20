@@ -2273,13 +2273,14 @@ async fn run_attach_loop(
                         stop_input.store(true, Ordering::Relaxed);
                         let _ = input_handle.await;
 
-                        // Scope the overlay context so its borrows of msg_rx /
-                        // pending_messages / last_frame end before we repaint.
+                        // Scope the overlay context so its borrows of msg_rx and
+                        // pending_messages end before we repaint.
+                        let mut focus_gained = false;
                         let selection = {
                             let mut ctx = OverlayCtx {
                                 msg_rx: &mut msg_rx,
                                 pending: &mut pending_messages,
-                                last_frame: &mut last_frame,
+                                focus_gained: &mut focus_gained,
                             };
                             run_session_list_mode(
                                 &session_id_c,
@@ -2295,35 +2296,22 @@ async fn run_attach_loop(
                             }
                             SessionListSelection::Ended => break AttachOutcome::Ended,
                             SessionListSelection::Close | SessionListSelection::Error(_) => {
-                                let (w, h) = terminal_size_or(screen.size());
-                                if (w, h) != screen.size() {
-                                    screen.resize(h, w);
-                                }
-                                let area_h = session_area_height(config, h);
-                                app_rows.store(area_h, Ordering::Relaxed);
-                                msg_id += 1;
-                                let resize_msg = Message {
-                                    kind: MessageKind::Request,
-                                    id: msg_id.to_string(),
-                                    command: Some(Command::Resize),
-                                    session_id: session_id_c.clone(),
-                                    width: w as u32,
-                                    height: area_h as u32,
-                                    ..Default::default()
-                                };
-                                if let Ok(bytes) = resize_msg.to_json_line() {
-                                    let _ = writer_c.lock().await.write_all(&bytes).await;
-                                }
-                                repaint_session_after_overlay(
+                                restore_session_after_overlay(
                                     &mut stdout,
+                                    &mut screen,
                                     &mut frame_renderer,
-                                    last_frame.as_ref(),
+                                    &input_modes,
+                                    &last_frame,
                                     &bar_items,
-                                    config,
-                                    (w, h),
                                     &mut bar_cursor_visible,
-                                );
-                                *input_modes.lock().unwrap() = frame_renderer.input_modes();
+                                    config,
+                                    &writer_c,
+                                    &session_id_c,
+                                    &mut msg_id,
+                                    &app_rows,
+                                    focus_gained,
+                                )
+                                .await;
                                 stop_input.store(false, Ordering::Relaxed);
                                 input_handle = spawn_attach_input_reader(
                                     action_tx.clone(),
@@ -2339,11 +2327,12 @@ async fn run_attach_loop(
                         stop_input.store(true, Ordering::Relaxed);
                         let _ = input_handle.await;
 
+                        let mut focus_gained = false;
                         let outcome = {
                             let mut ctx = OverlayCtx {
                                 msg_rx: &mut msg_rx,
                                 pending: &mut pending_messages,
-                                last_frame: &mut last_frame,
+                                focus_gained: &mut focus_gained,
                             };
                             run_help_mode(config.prefix, screen.size(), &mut stdout, &mut ctx)
                                 .await?
@@ -2351,38 +2340,22 @@ async fn run_attach_loop(
                         if matches!(outcome, HelpOutcome::SessionEnded) {
                             break AttachOutcome::Ended;
                         }
-                        // Query the authoritative terminal size after the overlay
-                        // cleared the screen, so a resize while help was open does
-                        // not leave the session at stale dimensions.
-                        let (w, h) = terminal_size_or(screen.size());
-                        if (w, h) != screen.size() {
-                            screen.resize(h, w);
-                        }
-                        let area_h = session_area_height(config, h);
-                        app_rows.store(area_h, Ordering::Relaxed);
-                        msg_id += 1;
-                        let resize_msg = Message {
-                            kind: MessageKind::Request,
-                            id: msg_id.to_string(),
-                            command: Some(Command::Resize),
-                            session_id: session_id_c.clone(),
-                            width: w as u32,
-                            height: area_h as u32,
-                            ..Default::default()
-                        };
-                        if let Ok(bytes) = resize_msg.to_json_line() {
-                            let _ = writer_c.lock().await.write_all(&bytes).await;
-                        }
-                        repaint_session_after_overlay(
+                        restore_session_after_overlay(
                             &mut stdout,
+                            &mut screen,
                             &mut frame_renderer,
-                            last_frame.as_ref(),
+                            &input_modes,
+                            &last_frame,
                             &bar_items,
-                            config,
-                            (w, h),
                             &mut bar_cursor_visible,
-                        );
-                        *input_modes.lock().unwrap() = frame_renderer.input_modes();
+                            config,
+                            &writer_c,
+                            &session_id_c,
+                            &mut msg_id,
+                            &app_rows,
+                            focus_gained,
+                        )
+                        .await;
                         stop_input.store(false, Ordering::Relaxed);
                         input_handle = spawn_attach_input_reader(
                             action_tx.clone(),
@@ -2557,12 +2530,91 @@ fn repaint_session_after_overlay<W: Write>(
     let _ = draw_status_bar(stdout, bar_items, config, size, *bar_cursor_visible);
 }
 
+/// Restore the attachment after a full-screen overlay closes: reassert the
+/// terminal size to the daemon, re-focus if focus was regained while open, and
+/// repaint the session view locally. Shared by the help and session-list close
+/// paths. The caller restarts the input reader afterwards.
+#[allow(clippy::too_many_arguments)]
+async fn restore_session_after_overlay<S, W>(
+    stdout: &mut S,
+    screen: &mut term::TermScreen,
+    frame_renderer: &mut term::FrameRenderer,
+    input_modes: &Arc<std::sync::Mutex<term::InputModeState>>,
+    last_frame: &Option<ScreenFrame>,
+    bar_items: &[StatusBarItem],
+    bar_cursor_visible: &mut bool,
+    config: ClientConfig,
+    writer: &Arc<tokio::sync::Mutex<W>>,
+    session_id: &str,
+    msg_id: &mut u64,
+    app_rows: &Arc<AtomicU16>,
+    focus_gained: bool,
+) where
+    S: Write,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    // Query the authoritative terminal size after the overlay cleared the
+    // screen, so a resize while it was open does not leave the session at stale
+    // dimensions.
+    let (w, h) = terminal_size_or(screen.size());
+    if (w, h) != screen.size() {
+        screen.resize(h, w);
+    }
+    let area_h = session_area_height(config, h);
+    app_rows.store(area_h, Ordering::Relaxed);
+
+    *msg_id += 1;
+    let resize_msg = Message {
+        kind: MessageKind::Request,
+        id: msg_id.to_string(),
+        command: Some(Command::Resize),
+        session_id: session_id.to_string(),
+        width: w as u32,
+        height: area_h as u32,
+        ..Default::default()
+    };
+    if let Ok(bytes) = resize_msg.to_json_line() {
+        let _ = writer.lock().await.write_all(&bytes).await;
+    }
+
+    // If focus was regained while the overlay was open, re-focus this client so
+    // it becomes active and the size just sent is applied even when other
+    // clients are attached.
+    if focus_gained {
+        *msg_id += 1;
+        let focus_msg = Message {
+            kind: MessageKind::Request,
+            id: msg_id.to_string(),
+            command: Some(Command::Focus),
+            session_id: session_id.to_string(),
+            ..Default::default()
+        };
+        if let Ok(bytes) = focus_msg.to_json_line() {
+            let _ = writer.lock().await.write_all(&bytes).await;
+        }
+    }
+
+    repaint_session_after_overlay(
+        stdout,
+        frame_renderer,
+        last_frame.as_ref(),
+        bar_items,
+        config,
+        (w, h),
+        bar_cursor_visible,
+    );
+    *input_modes.lock().unwrap() = frame_renderer.input_modes();
+}
+
 /// Borrowed daemon-stream state shared with an open overlay so it can keep the
 /// connection drained while blocking on terminal input.
 struct OverlayCtx<'a> {
     msg_rx: &'a mut tokio::sync::mpsc::UnboundedReceiver<Message>,
     pending: &'a mut VecDeque<Message>,
-    last_frame: &'a mut Option<ScreenFrame>,
+    /// Set when the terminal regained focus while the overlay was open, so the
+    /// caller can re-`Focus` this client (and thus reassert its PTY size) on
+    /// resume — the input reader that normally forwards focus is stopped.
+    focus_gained: &'a mut bool,
 }
 
 /// A terminal event surfaced to an overlay, plus the out-of-band "session ended"
@@ -2574,28 +2626,33 @@ enum OverlayEvent {
 }
 
 /// Block until the next key-press or resize arrives, draining daemon messages in
-/// the meantime. Frames are coalesced into `ctx.last_frame` (only the newest is
-/// kept, so the channel can't grow unbounded while the overlay is open and the
-/// caller can repaint the session on close); other messages are buffered onto
-/// `ctx.pending` so the main loop processes them after the overlay closes. A
-/// frame is a full-screen snapshot, so any replay `Output` buffered before it is
-/// obsolete and is dropped — otherwise it would be replayed over the repainted
-/// frame after close. An `Exit`/disconnect becomes [`OverlayEvent::SessionEnded`].
+/// the meantime so the channel can't grow unbounded while the overlay is open.
+/// Messages are buffered onto `ctx.pending` in order so the main loop replays
+/// them (scrollback output, then frames) after the overlay closes; consecutive
+/// frames are collapsed to the newest to bound memory without reordering output
+/// against frames. An `Exit`/disconnect becomes [`OverlayEvent::SessionEnded`].
 async fn overlay_next_event(ctx: &mut OverlayCtx<'_>) -> anyhow::Result<OverlayEvent> {
     loop {
         // Drain everything currently queued before blocking on input again.
         loop {
             match ctx.msg_rx.try_recv() {
                 Ok(msg) => match msg.event {
+                    Some(EventType::Exit) => return Ok(OverlayEvent::SessionEnded),
                     Some(EventType::Frame) => {
-                        if msg.frame.is_some() {
-                            *ctx.last_frame = msg.frame;
-                            // Prior buffered output is superseded by this frame;
-                            // dropping it keeps the post-close repaint correct.
-                            ctx.pending.retain(|m| m.event != Some(EventType::Output));
+                        // Collapse runs of frames (replace a trailing buffered
+                        // frame) to bound memory, but keep ordering relative to
+                        // Output so scrollback replay is preserved.
+                        if matches!(
+                            ctx.pending.back().and_then(|m| m.event.as_ref()),
+                            Some(EventType::Frame)
+                        ) {
+                            if let Some(back) = ctx.pending.back_mut() {
+                                *back = msg;
+                            }
+                        } else {
+                            ctx.pending.push_back(msg);
                         }
                     }
-                    Some(EventType::Exit) => return Ok(OverlayEvent::SessionEnded),
                     _ => ctx.pending.push_back(msg),
                 },
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
@@ -2624,6 +2681,7 @@ async fn overlay_next_event(ctx: &mut OverlayCtx<'_>) -> anyhow::Result<OverlayE
                 return Ok(OverlayEvent::Key(key_event));
             }
             Some(Event::Resize(cols, rows)) => return Ok(OverlayEvent::Resize(cols, rows)),
+            Some(Event::FocusGained) => *ctx.focus_gained = true,
             _ => {}
         }
     }
