@@ -496,7 +496,7 @@ Prefix:
   Values: C-a..C-z or Ctrl+A..Ctrl+Z; CLI takes precedence over env
 
 Status bar:
-  while attached, the bottom row lists all sessions (* current, ! exited), refreshed every 2s
+  while attached, the bottom row lists live sessions (* marks current), refreshed every 2s
   --status-bar off             disable the status bar for this command
   QSCREEN_STATUS_BAR=off       disable the status bar for every command
   Values: on|off; CLI takes precedence over env; disabled when the terminal has fewer than 3 rows
@@ -968,14 +968,13 @@ const STATUS_BAR_FETCH_TIMEOUT: Duration = Duration::from_millis(800);
 /// The whole status bar row is reverse video, so it reads as a solid,
 /// theme-adaptive strip: on a dark theme it becomes a light bar, on a light
 /// theme a dark bar, either way contrasting with the terminal content above it.
-/// Because reverse swaps foreground and background, state is conveyed by
-/// plaintext markers (`*` current, `!` exited) plus subdued attributes rather
-/// than foreground colors, which would otherwise turn into background tints.
+/// Because reverse swaps foreground and background, the current session is
+/// conveyed by a plaintext `*` marker plus a subdued attribute rather than a
+/// foreground color, which would otherwise turn into a background tint. Exited
+/// sessions are not listed at all.
 const STATUS_BAR_BASE_SGR: &str = "7";
 /// Header `[qscn]`: reverse video plus bold.
 const STATUS_BAR_HEADER_SGR: &str = "7;1";
-/// Exited sessions: reverse video plus dim, alongside the trailing `!` marker.
-const STATUS_BAR_EXITED_SGR: &str = "7;2";
 /// Current (attached) session: normal video plus bold, so it reads as a bright
 /// cutout standing out from the inverted bar around it. Paired with a leading
 /// `*` marker on the left of the session id.
@@ -1000,22 +999,21 @@ struct StatusBarItem {
     session_id: String,
     name: String,
     is_current: bool,
-    exited: bool,
-    attached: bool,
 }
 
+/// Build the status bar's session list. Exited sessions are omitted: the bar
+/// only shows live sessions the user can switch to.
 fn build_status_bar_items(
     sessions: &[SessionInfo],
     current_session_id: &str,
 ) -> Vec<StatusBarItem> {
     let mut items: Vec<StatusBarItem> = sessions
         .iter()
+        .filter(|session| !session.exited)
         .map(|session| StatusBarItem {
             session_id: session.session_id.clone(),
             name: session.name.clone(),
             is_current: session.session_id == current_session_id,
-            exited: session.exited,
-            attached: session.attached,
         })
         .collect();
     items.sort_by_key(|item| item.session_id.parse::<u64>().unwrap_or(u64::MAX));
@@ -1023,18 +1021,13 @@ fn build_status_bar_items(
 }
 
 /// One session's `(text, sgr)` segment. The current session carries its `*`
-/// marker on the left of the id (`*3:work`); exited sessions carry `!` on the
-/// right (`3:work!`). Markers double as a colorless fallback for the styling.
+/// marker on the left of the id (`*3:work`); the marker doubles as a colorless
+/// fallback for the styling.
 fn status_bar_item_segment(item: &StatusBarItem) -> (String, &'static str) {
     if item.is_current {
         (
             format!("*{}:{}", item.session_id, item.name),
             STATUS_BAR_CURRENT_SGR,
-        )
-    } else if item.exited {
-        (
-            format!("{}:{}!", item.session_id, item.name),
-            STATUS_BAR_EXITED_SGR,
         )
     } else {
         (
@@ -3015,33 +3008,35 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_items_sort_numerically_and_mark_current() {
+    fn status_bar_items_sort_numerically_mark_current_and_drop_exited() {
         let sessions = vec![
             bar_session("10", "ten", false, false),
             bar_session("2", "two", false, true),
             bar_session("1", "one", true, false),
+            bar_session("3", "three", false, false),
         ];
 
         let items = build_status_bar_items(&sessions, "2");
 
+        // Exited session "1" is dropped; the rest sort numerically.
         assert_eq!(
             items
                 .iter()
                 .map(|item| item.session_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["1", "2", "10"]
+            vec!["2", "3", "10"]
         );
-        assert!(items[1].is_current);
-        assert!(!items[0].is_current);
-        assert!(items[0].exited);
+        assert!(items[0].is_current);
+        assert!(!items[1].is_current);
     }
 
     #[test]
-    fn status_bar_segments_carry_plaintext_markers() {
+    fn status_bar_segments_carry_current_marker_and_omit_exited() {
         let items = build_status_bar_items(
             &[
                 bar_session("1", "work", false, true),
-                bar_session("2", "old", true, false),
+                bar_session("2", "next", false, false),
+                bar_session("3", "old", true, false),
             ],
             "1",
         );
@@ -3051,8 +3046,9 @@ mod tests {
             .map(|(text, _)| text.as_str())
             .collect();
 
-        // Current session marks `*` on the left of the id; exited marks `!` right.
-        assert_eq!(text, "[qscn] *1:work 2:old!");
+        // Current session marks `*` on the left of the id; the exited session
+        // "3:old" is not listed at all.
+        assert_eq!(text, "[qscn] *1:work 2:next");
     }
 
     #[test]
