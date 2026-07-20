@@ -2928,7 +2928,15 @@ async fn run_session_list_mode<W: Write>(
                     }
                     SessionListSelection::Quit => return Ok(SessionListSelection::Quit),
                     SessionListSelection::Error(error) => {
-                        status = error.clone();
+                        // `error` is the protocol's English exited-session message
+                        // (equality-matched elsewhere, so it must not change).
+                        // Show a localized message in the overlay instead; both
+                        // wordings are classified as errors by `status_style`.
+                        status = if zh {
+                            format!("会话 {:?} 已退出", rows[selected].session_id)
+                        } else {
+                            error.clone()
+                        };
                         render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
                     }
                 }
@@ -3333,9 +3341,11 @@ fn status_style(status: &str) -> &'static str {
         || lower.contains("cannot")
         || lower.contains("error")
         || lower.contains("no sessions")
+        || lower.contains("has exited")
         || status.contains("失败")
         || status.contains("无法")
-        || status.contains("无会话");
+        || status.contains("无会话")
+        || status.contains("已退出");
     let is_success = lower.starts_with("renamed") || status.starts_with("已重命名");
     if is_error {
         color::sgr::ERROR
@@ -4169,6 +4179,24 @@ mod tests {
         assert_eq!(session_state_label(&detached, true), "未连接");
         // The exit code is preserved inside the translated label.
         assert!(session_state_label(&exited, true).starts_with("已退出("));
+    }
+
+    #[test]
+    fn status_style_classifies_errors_and_success_in_both_languages() {
+        assert_eq!(status_style("create failed: x"), color::sgr::ERROR);
+        assert_eq!(status_style("新建失败: x"), color::sgr::ERROR);
+        assert_eq!(status_style("no sessions"), color::sgr::ERROR);
+        assert_eq!(status_style("无会话"), color::sgr::ERROR);
+        assert_eq!(
+            status_style("session_id \"2\" has exited"),
+            color::sgr::ERROR
+        );
+        assert_eq!(status_style("会话 \"2\" 已退出"), color::sgr::ERROR);
+        assert_eq!(status_style("renamed to \"x\""), color::sgr::SUCCESS);
+        assert_eq!(status_style("已重命名为 \"x\""), color::sgr::SUCCESS);
+        // Neutral confirmations stay a dim hint.
+        assert_eq!(status_style("killed \"x\""), color::sgr::HINT);
+        assert_eq!(status_style("已终止 \"x\""), color::sgr::HINT);
     }
 
     #[test]
