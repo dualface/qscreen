@@ -965,9 +965,21 @@ const STATUS_BAR_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Give up on a status bar poll quickly so a stalled daemon cannot wedge the
 /// attach loop; the side connection is dropped and reopened on the next tick.
 const STATUS_BAR_FETCH_TIMEOUT: Duration = Duration::from_millis(800);
-/// Current session in the status bar: reverse video, standing out from the
-/// state-colored entries around it.
-const STATUS_BAR_CURRENT_SGR: &str = "7";
+/// The whole status bar row is reverse video, so it reads as a solid,
+/// theme-adaptive strip: on a dark theme it becomes a light bar, on a light
+/// theme a dark bar, either way contrasting with the terminal content above it.
+/// Because reverse swaps foreground and background, state is conveyed by
+/// plaintext markers (`*` current, `!` exited) plus subdued attributes rather
+/// than foreground colors, which would otherwise turn into background tints.
+const STATUS_BAR_BASE_SGR: &str = "7";
+/// Header `[qscn]`: reverse video plus bold.
+const STATUS_BAR_HEADER_SGR: &str = "7;1";
+/// Exited sessions: reverse video plus dim, alongside the trailing `!` marker.
+const STATUS_BAR_EXITED_SGR: &str = "7;2";
+/// Current (attached) session: normal video plus bold, so it reads as a bright
+/// cutout standing out from the inverted bar around it. Paired with a leading
+/// `*` marker on the left of the session id.
+const STATUS_BAR_CURRENT_SGR: &str = "1";
 
 fn status_bar_active(config: ClientConfig, term_height: u16) -> bool {
     config.status_bar && term_height >= STATUS_BAR_MIN_HEIGHT
@@ -1010,30 +1022,128 @@ fn build_status_bar_items(
     items
 }
 
-/// Status bar content as (text, sgr) segments; concatenated they form the whole
-/// bar, so the renderer can truncate by visible width (same pattern as the
-/// session list hint line). Markers double as a colorless fallback:
-/// `*` = current session, `!` = exited.
-fn status_bar_segments(items: &[StatusBarItem]) -> Vec<(String, &'static str)> {
-    let mut segments = vec![("[qscn]".to_string(), color::sgr::HEADER)];
-    for item in items {
-        segments.push((" ".to_string(), ""));
-        let marker = if item.is_current {
-            "*"
-        } else if item.exited {
-            "!"
-        } else {
-            ""
-        };
-        let text = format!("{}:{}{}", item.session_id, item.name, marker);
-        let sgr = if item.is_current {
-            STATUS_BAR_CURRENT_SGR
-        } else {
-            color::state_sgr(item.exited, item.attached)
-        };
-        segments.push((text, sgr));
+/// One session's `(text, sgr)` segment. The current session carries its `*`
+/// marker on the left of the id (`*3:work`); exited sessions carry `!` on the
+/// right (`3:work!`). Markers double as a colorless fallback for the styling.
+fn status_bar_item_segment(item: &StatusBarItem) -> (String, &'static str) {
+    if item.is_current {
+        (
+            format!("*{}:{}", item.session_id, item.name),
+            STATUS_BAR_CURRENT_SGR,
+        )
+    } else if item.exited {
+        (
+            format!("{}:{}!", item.session_id, item.name),
+            STATUS_BAR_EXITED_SGR,
+        )
+    } else {
+        (
+            format!("{}:{}", item.session_id, item.name),
+            STATUS_BAR_BASE_SGR,
+        )
     }
+}
+
+/// The pinned `[qscn]` header plus the scrollable items region. `segs`
+/// interleaves a single-space separator (reverse video, so the bar stays
+/// continuous) before each session segment. `total` is the items region's full
+/// width in columns; `current_span`, when present, is the `[start, end)` column
+/// range of the current session's text within that region (separator excluded),
+/// used to keep that session fully visible while scrolling.
+struct StatusBarLayout {
+    header: (String, &'static str),
+    segs: Vec<(String, &'static str)>,
+    total: usize,
+    current_span: Option<(usize, usize)>,
+}
+
+fn build_status_bar_layout(items: &[StatusBarItem]) -> StatusBarLayout {
+    let mut segs: Vec<(String, &'static str)> = Vec::with_capacity(items.len() * 2);
+    let mut col = 0usize;
+    let mut current_span = None;
+    for item in items {
+        segs.push((" ".to_string(), STATUS_BAR_BASE_SGR));
+        col += 1;
+        let (text, sgr) = status_bar_item_segment(item);
+        let width = UnicodeWidthStr::width(text.as_str());
+        if item.is_current {
+            current_span = Some((col, col + width));
+        }
+        col += width;
+        segs.push((text, sgr));
+    }
+    StatusBarLayout {
+        header: ("[qscn]".to_string(), STATUS_BAR_HEADER_SGR),
+        segs,
+        total: col,
+        current_span,
+    }
+}
+
+/// Flattened header + items segments, whose concatenated text is the full bar
+/// content. Rendering uses [`build_status_bar_layout`] directly so it can pin
+/// the header and scroll the items region; this helper exists for tests that
+/// reason about the plaintext form.
+#[cfg(test)]
+fn status_bar_segments(items: &[StatusBarItem]) -> Vec<(String, &'static str)> {
+    let layout = build_status_bar_layout(items);
+    let mut segments = vec![layout.header];
+    segments.extend(layout.segs);
     segments
+}
+
+/// Horizontal scroll offset (in columns) into the items region so the current
+/// session stays fully visible. Zero when everything fits. When the current
+/// session is itself wider than the region, aligns to its start so at least the
+/// id and the beginning of the name show.
+fn status_bar_scroll_offset(
+    total: usize,
+    region: usize,
+    current_span: Option<(usize, usize)>,
+) -> usize {
+    if region == 0 || total <= region {
+        return 0;
+    }
+    let Some((start, end)) = current_span else {
+        return 0;
+    };
+    if end - start >= region {
+        return start;
+    }
+    let mut offset = 0;
+    if end > region {
+        offset = end - region;
+    }
+    if start < offset {
+        offset = start;
+    }
+    offset.min(total - region)
+}
+
+/// Slice `text` to the column window `[skip, skip + take)`, dropping any wide
+/// grapheme that would straddle either edge. Session ids and names are ASCII, so
+/// in practice every cell is exactly one column wide.
+fn slice_columns(text: &str, skip: usize, take: usize) -> String {
+    let mut col = 0usize;
+    let mut out = String::new();
+    for ch in text.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if col + w <= skip {
+            col += w;
+            continue;
+        }
+        if col < skip {
+            // Wide char straddling the left edge: drop it rather than render a half.
+            col += w;
+            continue;
+        }
+        if (col - skip) + w > take {
+            break;
+        }
+        out.push(ch);
+        col += w;
+    }
+    out
 }
 
 /// Draw the status bar when active; a no-op while the item cache is still
@@ -1061,33 +1171,69 @@ fn render_status_bar<W: Write>(
     cursor_visible: bool,
 ) -> std::io::Result<()> {
     let (cols, rows) = term_size;
+    let cols = cols as usize;
     write!(out, "\x1b[?2026h\x1b7\x1b[?25l\x1b[0m\x1b[{};1H", rows)?;
-    let limit = cols as usize;
-    let mut visible = 0usize;
-    for (text, sgr) in status_bar_segments(items) {
-        if visible >= limit {
+
+    let layout = build_status_bar_layout(items);
+    let mut written = 0usize;
+
+    // Pinned header, truncated only on a very narrow terminal.
+    written += emit_bar_segment(out, &layout.header.0, layout.header.1, cols)?;
+
+    // Scrollable items region: scroll so the current session stays fully visible.
+    let region = cols - written; // cols >= written always
+    let offset = status_bar_scroll_offset(layout.total, region, layout.current_span);
+    let mut pos = 0usize; // column position within the items region
+    for (text, sgr) in &layout.segs {
+        if written >= cols {
             break;
         }
-        let piece = truncate_for_terminal(&text, limit - visible);
-        if piece.is_empty() {
+        let width = UnicodeWidthStr::width(text.as_str());
+        let seg_end = pos + width;
+        // Skip segments scrolled entirely off the left edge.
+        if seg_end <= offset {
+            pos = seg_end;
             continue;
         }
-        visible += UnicodeWidthStr::width(piece.as_str());
-        if sgr.is_empty() {
-            out.write_all(piece.as_bytes())?;
-        } else {
-            out.write_all(color::paint(&piece, sgr).as_bytes())?;
-        }
+        let left_skip = offset.saturating_sub(pos);
+        let take = (cols - written).min(width - left_skip);
+        let piece = slice_columns(text, left_skip, take);
+        written += emit_bar_segment(out, &piece, sgr, cols - written)?;
+        pos = seg_end;
     }
-    for _ in visible.min(limit)..limit {
-        out.write_all(b" ")?;
+
+    // Fill the rest of the row so the reversed bar spans the full width.
+    if written < cols {
+        let pad = " ".repeat(cols - written);
+        emit_bar_segment(out, &pad, STATUS_BAR_BASE_SGR, cols - written)?;
     }
+
     write!(out, "\x1b[0m\x1b8")?;
     if cursor_visible {
         out.write_all(b"\x1b[?25h")?;
     }
     out.write_all(b"\x1b[?2026l")?;
     out.flush()
+}
+
+/// Write one bar segment, truncated to `max_width` visible columns, and return
+/// how many columns it consumed. Empty (or zero-width) content writes nothing.
+fn emit_bar_segment<W: Write>(
+    out: &mut W,
+    text: &str,
+    sgr: &str,
+    max_width: usize,
+) -> std::io::Result<usize> {
+    if max_width == 0 {
+        return Ok(0);
+    }
+    let piece = truncate_for_terminal(text, max_width);
+    if piece.is_empty() {
+        return Ok(0);
+    }
+    let width = UnicodeWidthStr::width(piece.as_str());
+    out.write_all(color::paint(&piece, sgr).as_bytes())?;
+    Ok(width)
 }
 
 /// Fetch the session list over a persistent side connection, separate from the
@@ -2905,7 +3051,8 @@ mod tests {
             .map(|(text, _)| text.as_str())
             .collect();
 
-        assert_eq!(text, "[qscn] 1:work* 2:old!");
+        // Current session marks `*` on the left of the id; exited marks `!` right.
+        assert_eq!(text, "[qscn] *1:work 2:old!");
     }
 
     #[test]
@@ -2929,7 +3076,7 @@ mod tests {
         let end = text.find("\x1b[0m\x1b8").unwrap();
         let content = &text[start..end];
         assert_eq!(content.len(), cols as usize, "{content:?}");
-        assert!(content.starts_with("[qscn] 1:work*"), "{content:?}");
+        assert!(content.starts_with("[qscn] *1:work"), "{content:?}");
     }
 
     #[test]
@@ -2961,7 +3108,62 @@ mod tests {
         let start = text.find("\x1b[5;1H").unwrap() + "\x1b[5;1H".len();
         let end = text.find("\x1b[0m\x1b8").unwrap();
         let content = &text[start..end];
-        assert_eq!(content, "[qscn] 1:a");
+        // Too narrow for all sessions: the items region scrolls to keep the
+        // current session (`*1:alpha`) anchored, so its start shows right after
+        // the pinned header even though the separator is scrolled off.
+        assert_eq!(content, "[qscn]*1:a");
+    }
+
+    #[test]
+    fn status_bar_scroll_offset_zero_when_everything_fits() {
+        assert_eq!(status_bar_scroll_offset(10, 20, Some((3, 7))), 0);
+        assert_eq!(status_bar_scroll_offset(20, 20, Some((3, 7))), 0);
+    }
+
+    #[test]
+    fn status_bar_scroll_offset_keeps_current_tail_visible() {
+        // total 30, region 10, current occupies [24, 29): scroll so end <= offset+region.
+        let offset = status_bar_scroll_offset(30, 10, Some((24, 29)));
+        assert_eq!(offset, 19); // end(29) - region(10)
+        assert!(24 >= offset && 29 <= offset + 10, "offset={offset}");
+    }
+
+    #[test]
+    fn status_bar_scroll_offset_aligns_start_when_current_wider_than_region() {
+        // current is 12 columns wide but the region is only 8: show from its start.
+        assert_eq!(status_bar_scroll_offset(40, 8, Some((5, 17))), 5);
+    }
+
+    #[test]
+    fn render_status_bar_scrolls_to_keep_current_name_visible() {
+        let mut sessions = Vec::new();
+        for i in 1..=6 {
+            sessions.push(bar_session(
+                &i.to_string(),
+                &format!("session{i}"),
+                false,
+                false,
+            ));
+        }
+        // Current session is the last one, so without scrolling it would fall off
+        // the right edge of a narrow bar.
+        let items = build_status_bar_items(&sessions, "6");
+        let cols = 24u16;
+        let mut out = Vec::new();
+
+        render_status_bar(&mut out, &items, (cols, 5), true).unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        let start = text.find("\x1b[5;1H").unwrap() + "\x1b[5;1H".len();
+        let end = text.find("\x1b[0m\x1b8").unwrap();
+        let content = &text[start..end];
+        assert_eq!(
+            UnicodeWidthStr::width(content),
+            cols as usize,
+            "{content:?}"
+        );
+        assert!(content.starts_with("[qscn]"), "{content:?}");
+        assert!(content.contains("*6:session6"), "{content:?}");
     }
 
     #[test]
