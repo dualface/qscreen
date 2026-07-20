@@ -67,6 +67,10 @@ pub mod sgr {
     pub const CURRENT: &str = "32";
     /// Success status: green.
     pub const SUCCESS: &str = "32";
+    /// Rename prompt label (e.g. `rename "old" ->`): bold yellow, prominent against the dim hint.
+    pub const PROMPT: &str = "1;33";
+    /// Rename user input text: bold cyan, prominent and clearly distinct from the yellow prompt label. Both are standard ANSI colors, so the terminal maps them to readable shades under light/dark themes.
+    pub const INPUT: &str = "1;36";
 }
 
 /// Pick a color by session state: exited=red, attached=green, detached=blue.

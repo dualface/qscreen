@@ -2510,8 +2510,19 @@ async fn prompt_session_rename<W: Write>(
 ) -> anyhow::Result<Option<String>> {
     let mut input = String::new();
     loop {
-        let status = format!("rename \"{old_name}\" -> {input}_  (Enter confirm, Esc cancel)");
-        render_session_list(stdout, rows, selected, &status, term_size)?;
+        // Split the prompt into three color segments so the instruction, the
+        // user's input, and the trailing hint each stand out and are visually
+        // distinct: the label is prominent (yellow), the typed input uses a
+        // separate prominent color (cyan) with a `_` caret, and the key hint
+        // stays dim. Concatenated their text matches the original single line.
+        let label = format!("rename \"{old_name}\" -> ");
+        let input_field = format!("{input}_");
+        let segments = [
+            (label.as_str(), color::sgr::PROMPT),
+            (input_field.as_str(), color::sgr::INPUT),
+            ("  (Enter confirm, Esc cancel)", color::sgr::HINT),
+        ];
+        render_session_list_with_status(stdout, rows, selected, &segments, term_size)?;
         match read_name_edit_key().await? {
             NameEditKey::Submit => {
                 let trimmed = input.trim();
@@ -2546,6 +2557,27 @@ fn render_session_list<W: Write>(
     status: &str,
     term_size: (u16, u16),
 ) -> std::io::Result<()> {
+    // The whole status line shares one content-derived color; the empty status
+    // falls back to the dim "* marks current session" hint.
+    let (text, sgr) = if status.is_empty() {
+        ("* marks current session", color::sgr::HINT)
+    } else {
+        (status, status_style(status))
+    };
+    render_session_list_with_status(out, rows, selected, &[(text, sgr)], term_size)
+}
+
+/// Same as [`render_session_list`], but the bottom status line is a sequence of
+/// independently colored `(text, sgr)` segments. Segments are laid out left to
+/// right and truncated together by visible width, so callers can highlight parts
+/// of the line differently (e.g. the rename prompt label vs. the user's input).
+fn render_session_list_with_status<W: Write>(
+    out: &mut W,
+    rows: &[SessionListRow],
+    selected: usize,
+    status_segments: &[(&str, &str)],
+    term_size: (u16, u16),
+) -> std::io::Result<()> {
     let (cols, rows_count) = term_size;
     write!(out, "\x1b[?2026h\x1b[0m\x1b[2J\x1b[H")?;
     write_text_line(out, "qscreen sessions", Some(color::sgr::HEADER), cols)?;
@@ -2566,28 +2598,52 @@ fn render_session_list<W: Write>(
     } else {
         write_text_line(out, "", None, cols)?;
     }
-    let (status_text, status_sgr) = if status.is_empty() {
-        ("* marks current session".to_string(), color::sgr::HINT)
-    } else {
-        (status.to_string(), status_style(status))
-    };
-    let status_text = truncate_for_terminal(&status_text, cols as usize);
-    let visible = UnicodeWidthStr::width(status_text.as_str());
     // The status line is the last line and carries no CRLF (matching the original implementation).
     write!(out, "\x1b[0m")?;
-    let colored = color::supported();
-    if colored {
-        write!(out, "\x1b[{status_sgr}m")?;
-    }
-    write!(out, "{status_text}")?;
-    if colored {
-        write!(out, "\x1b[0m")?;
-    }
-    for _ in visible.min(cols as usize)..cols as usize {
-        out.write_all(b" ")?;
-    }
+    write_status_segments(out, status_segments, cols)?;
     write!(out, "\x1b[?2026l")?;
     out.flush()
+}
+
+/// Write the bottom status line as consecutive colored segments, truncating them
+/// together to `cols` visible columns and right-padding the remainder with
+/// spaces. Colors are only emitted when the terminal supports them; otherwise
+/// the visible width (and thus the layout) is identical.
+fn write_status_segments<W: Write>(
+    out: &mut W,
+    segments: &[(&str, &str)],
+    cols: u16,
+) -> std::io::Result<()> {
+    let limit = cols as usize;
+    let colored = color::supported();
+    let mut used = 0usize;
+    for (text, sgr) in segments {
+        if used >= limit {
+            break;
+        }
+        let piece = truncate_for_terminal(text, limit - used);
+        let width = UnicodeWidthStr::width(piece.as_str());
+        // The segment was truncated (its full width did not fit). Emit what fits,
+        // then stop: continuing into later segments could render text past the
+        // cut point — and if a wide glyph was dropped at the boundary, leak a
+        // later segment into the leftover column, breaking the visible prefix.
+        let truncated = width < UnicodeWidthStr::width(*text);
+        if width > 0 {
+            if colored {
+                write!(out, "\x1b[{sgr}m{piece}\x1b[0m")?;
+            } else {
+                write!(out, "{piece}")?;
+            }
+            used += width;
+        }
+        if truncated {
+            break;
+        }
+    }
+    for _ in used..limit {
+        out.write_all(b" ")?;
+    }
+    Ok(())
 }
 
 /// Pick the status line color by content: errors=red, successful rename=green, everything else=dim hint.
@@ -4062,6 +4118,45 @@ mod tests {
         assert!(text.starts_with("\x1b[?2026h\x1b[0m\x1b[2J"));
         assert!(text.contains("\x1b[0mqscreen sessions    \r\n"));
         assert!(text.contains("\x1b[0m> * 1    main"));
+    }
+
+    #[test]
+    fn render_session_list_with_status_concatenates_segments() {
+        // A three-segment status (rename label / input / hint) should render as
+        // its concatenated text, matching the original single-line prompt.
+        let rows = build_session_list_rows(&[session("1", "main", true, false, 80, 24)], "1");
+        let mut out = Vec::new();
+
+        let segments = [
+            ("rename \"main\" -> ", color::sgr::PROMPT),
+            ("work_", color::sgr::INPUT),
+            ("  (Enter confirm, Esc cancel)", color::sgr::HINT),
+        ];
+        render_session_list_with_status(&mut out, &rows, 0, &segments, (80, 24)).unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("rename \"main\" -> work_  (Enter confirm, Esc cancel)"));
+    }
+
+    #[test]
+    fn write_status_segments_truncates_across_segments_and_pads() {
+        // Segments together exceed the width: truncation spans segment
+        // boundaries and the final line is padded to exactly `cols` columns.
+        let mut out = Vec::new();
+        let segments = [("abcdef", color::sgr::PROMPT), ("ghij", color::sgr::INPUT)];
+        write_status_segments(&mut out, &segments, 8).unwrap();
+
+        // Colorless test env: plain text truncated to 8 columns, no padding needed.
+        assert_eq!(String::from_utf8(out).unwrap(), "abcdefgh");
+    }
+
+    #[test]
+    fn write_status_segments_pads_short_line_to_width() {
+        let mut out = Vec::new();
+        let segments = [("hi", color::sgr::PROMPT)];
+        write_status_segments(&mut out, &segments, 6).unwrap();
+
+        assert_eq!(String::from_utf8(out).unwrap(), "hi    ");
     }
 
     fn session_info_with_id(session_id: &str, exited: bool) -> SessionInfo {
