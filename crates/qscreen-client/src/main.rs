@@ -2541,10 +2541,16 @@ async fn restore_session_after_overlay<S, W>(
         let _ = writer.lock().await.write_all(&bytes).await;
     }
 
+    // Only repaint the retained frame when it still matches the session area; a
+    // frame captured before a resize would render at the wrong geometry, so in
+    // that case clear and wait for the resized frame instead.
+    let frame = last_frame
+        .as_ref()
+        .filter(|f| f.cols == w && f.rows == area_h);
     repaint_session_after_overlay(
         stdout,
         frame_renderer,
-        last_frame.as_ref(),
+        frame,
         bar_items,
         config,
         (w, h),
