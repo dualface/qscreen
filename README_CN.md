@@ -59,30 +59,32 @@ qscn shutdown                # 停止 daemon 并关闭所有会话
 自定义前缀键：
 
 ```sh
-qscn --prefix C-b attach 1    # 使用 Ctrl+B 作为会话前缀进入会话
-qscn --prefix C-b new --name work
-qscn --prefix C-b             # 使用 Ctrl+B 作为会话前缀智能启动
+qscn --prefix C-a attach 1    # 使用 Ctrl+A 作为会话前缀进入会话
+qscn --prefix C-a new --name work
+qscn --prefix C-a             # 使用 Ctrl+A 作为会话前缀智能启动
 ```
 
 前缀值支持 `C-a` 到 `C-z`，也支持 `Ctrl+A` 到 `Ctrl+Z`。
 `QSCREEN_PREFIX` 可为所有命令设置备用前缀：
 
 ```sh
-QSCREEN_PREFIX=C-b qscn attach 1
+QSCREEN_PREFIX=C-a qscn attach 1
 ```
 
 同时设置时，`--prefix` 优先于 `QSCREEN_PREFIX`。两者都未设置时，
-`qscn` 使用默认前缀 `Ctrl+A`。
+`qscn` 使用默认前缀 `Ctrl+B`。
 
 会话内热键：
 
+- `<prefix> ?`：显示快捷键帮助屏（按 Esc 或 q 关闭）。
 - `<prefix> d`：detach，会话继续后台运行。
 - `<prefix> <prefix>`：向 shell 发送字面前缀键。
 - `<prefix> s`：打开会话列表；选择会话后切换 attach。
+- `<prefix> n` / `<prefix> p`：切换到下一个 / 上一个会话。
 
-默认前缀下，这些热键是 `Ctrl+A d`、`Ctrl+A Ctrl+A` 和 `Ctrl+A s`。
-使用 `qscn --prefix C-b ...` 时，它们是 `Ctrl+B d`、`Ctrl+B Ctrl+B`
-和 `Ctrl+B s`。
+默认前缀下，这些热键是 `Ctrl+B ?`、`Ctrl+B d`、`Ctrl+B Ctrl+B` 和 `Ctrl+B s`。
+使用 `qscn --prefix C-a ...` 时，它们是 `Ctrl+A ?`、`Ctrl+A d`、
+`Ctrl+A Ctrl+A` 和 `Ctrl+A s`。
 
 `qscn ls` 输出格式：
 

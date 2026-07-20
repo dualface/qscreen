@@ -2701,13 +2701,12 @@ fn render_help_screen<W: Write>(
         write!(out, "\r\n")?;
     }
 
-    // Pin the dismiss hint to the last row when there is room; otherwise let it
-    // follow the bindings directly.
+    // Pin the dismiss hint to the last row when there is a spare row for a gap;
+    // otherwise write it directly after the bindings. Emitting a blank line when
+    // there is no room would scroll the bindings off the top of a short screen.
     let used_lines = rows.len() as u16 + 2;
     if rows_count > used_lines + 1 {
         write!(out, "\x1b[{rows_count};1H")?;
-    } else {
-        write_text_line(out, "", None, cols)?;
     }
     let hint = if zh {
         "按 Esc 或 q 关闭"
