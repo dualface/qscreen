@@ -39,6 +39,19 @@ The key-binding help screen:
 - Localized CLI and interactive UI in English, Simplified Chinese, Traditional Chinese, Japanese, Spanish, German, and French, selected from the system locale.
 - Windows, Linux, and macOS support.
 
+## Remote Access with QuickTUI
+
+qscreen powers persistent Windows terminal sessions in
+[QuickTUI](https://quicktui.ai/), a self-hosted remote terminal for accessing
+shells and AI coding agents from iPhone, iPad, and browsers. QuickTUI's Windows
+installer installs `qscn` automatically and uses it as the default session
+backend.
+
+The companion app, **QuickTUI: AI Agent Terminal**, is available for iPhone and
+iPad:
+
+[![Download QuickTUI: AI Agent Terminal on the App Store](images/download-on-the-app-store.svg)](https://apps.apple.com/us/app/quicktui-ai-agent-terminal/id6761338192)
+
 ## Platform Notes
 
 - Windows uses named pipes and starts `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe` by default. Use `qscn new --shell cmd --name work` to start `C:\Windows\System32\cmd.exe` for a single session, or set the daemon environment variable `QSCREEN_WINDOWS_SHELL=cmd` or `QSCREEN_WINDOWS_SHELL=cmd.exe` to make cmd the daemon default. Explicit `powershell` and `powershell.exe` values keep the default PowerShell behavior. Any other value is treated as a shell executable: a full path (e.g. `C:\Program Files\PowerShell\7\pwsh.exe`) is validated to exist, while a bare command name (e.g. `pwsh`) is resolved via `PATH`. A path that does not exist returns an error and prevents session creation.

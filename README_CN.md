@@ -29,6 +29,16 @@
 - CLI 和交互界面支持英文、简体中文、繁体中文、日文、西班牙文、德文和法文，并根据系统 locale 自动选择。
 - 支持 Windows、Linux、macOS。
 
+## 通过 QuickTUI 远程访问
+
+qscreen 为 [QuickTUI](https://quicktui.ai/) 提供 Windows 持久终端会话能力.
+QuickTUI 是一个自托管远程终端, 可从 iPhone, iPad 和浏览器访问 shell 与 AI 编码代理.
+QuickTUI 的 Windows 安装器会自动安装 `qscn`, 并将其作为默认会话后端.
+
+配套应用 **QuickTUI: AI Agent Terminal** 支持 iPhone 和 iPad:
+
+[![在 App Store 下载 QuickTUI: AI Agent Terminal](images/download-on-the-app-store.svg)](https://apps.apple.com/us/app/quicktui-ai-agent-terminal/id6761338192)
+
 ## 平台说明
 
 - Windows 使用 named pipe，默认启动 `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`。使用 `qscn new --shell cmd --name work` 可为单个会话启动 `C:\Windows\System32\cmd.exe`；也可以在 daemon 环境中设置 `QSCREEN_WINDOWS_SHELL=cmd` 或 `QSCREEN_WINDOWS_SHELL=cmd.exe`，把 cmd 设为 daemon 默认。显式设置 `powershell` 或 `powershell.exe` 会保持默认 PowerShell 行为。其他取值一律按 shell 可执行文件处理：完整路径（如 `C:\Program Files\PowerShell\7\pwsh.exe`）会校验文件是否存在，裸命令名（如 `pwsh`）则通过 `PATH` 解析。路径不存在会返回错误并阻止创建会话。
