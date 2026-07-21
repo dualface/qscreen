@@ -39,6 +39,23 @@ The key-binding help screen:
 - Localized CLI and interactive UI in English, Simplified Chinese, Traditional Chinese, Japanese, Spanish, German, and French, selected from the system locale.
 - Windows, Linux, and macOS support.
 
+## Scope and Comparison
+
+qscreen deliberately focuses on persistent shell sessions rather than terminal
+layout:
+
+- Each qscreen session owns one shell and PTY. qscreen does not create panes,
+  tiled layouts, or terminal windows; use `tmux`, GNU `screen`, or another full
+  terminal multiplexer when you need those features.
+- On Windows, qscreen runs native PowerShell, cmd, or pwsh sessions through
+  ConPTY. It does not require WSL, Cygwin, or MSYS2. The same `qscn` CLI also
+  runs on Linux and macOS.
+- Sessions survive client detach, client disconnection, and terminal windows
+  closing. Sessions and scrollback are held by the daemon and do not survive
+  daemon shutdown, daemon termination, or a machine restart.
+- `qscreen` is the project name. `qscn` is its single user-facing executable;
+  it contains both the client and the on-demand daemon launcher.
+
 ## Remote Access with QuickTUI
 
 qscreen powers persistent Windows terminal sessions in
@@ -60,6 +77,49 @@ iPad:
 - Sessions are addressed by daemon-assigned numeric `session_id` values. The
   session name is only a display name, and custom names must match
   `[A-Za-z0-9._-]` and be at most 64 characters.
+
+## 60-Second Quick Start
+
+1. Open the [latest release](https://github.com/dualface/qscreen/releases/latest)
+   and download the archive for your machine:
+
+   | Platform | Release asset |
+   | --- | --- |
+   | Windows x86_64 (most PCs) | `qscreen-<tag>-windows-x86_64.zip` |
+   | Windows arm64 | `qscreen-<tag>-windows-arm64.zip` |
+   | Linux x86_64 | `qscreen-<tag>-linux-x86_64.tar.gz` |
+   | Linux arm64 | `qscreen-<tag>-linux-arm64.tar.gz` |
+   | macOS Apple silicon | `qscreen-<tag>-macos-arm64.tar.gz` |
+
+2. Extract the archive, open a terminal in that directory, and create a demo
+   session:
+
+   ```powershell
+   # Windows PowerShell
+   .\qscn.exe new --name demo
+   ```
+
+   ```sh
+   # Linux/macOS
+   ./qscn new --name demo
+   ```
+
+3. Inside the session, press `Ctrl+B`, release the keys, then press `d`. The
+   client exits while the shell keeps running in the daemon.
+
+4. Close the terminal window if you want. Open a new terminal in the extracted
+   directory and run `qscn` again. Because there is one live session, the smart
+   command reattaches it automatically:
+
+   ```powershell
+   # Windows PowerShell
+   .\qscn.exe
+   ```
+
+   ```sh
+   # Linux/macOS
+   ./qscn
+   ```
 
 ## Installation
 
