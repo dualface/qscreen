@@ -373,9 +373,9 @@ fn detect_language() -> Lang {
     };
     if !is_c_locale
         && let Ok(list) = std::env::var("LANGUAGE")
-        && !list.is_empty()
+        && let Some(lang) = language_from_list(&list)
     {
-        return parse_locale(&list);
+        return lang;
     }
     if let Some(b) = base {
         return parse_locale(&b);
@@ -388,37 +388,51 @@ fn detect_language() -> Lang {
     Lang::En
 }
 
-/// Map a POSIX/BCP-47 locale string (e.g. `zh_TW.UTF-8`, `ja-JP`, `de:en`) to a
-/// [`Lang`]. Only the first locale of a `:`-separated `LANGUAGE` list is used,
-/// and matching is done on whole subtags: an explicit `Hans`/`Hant` script wins,
-/// and the region is consulted only when no script is present.
-fn parse_locale(raw: &str) -> Lang {
+/// The first supported language in a GNU `LANGUAGE` priority list (colon
+/// separated), skipping unsupported entries. `None` when none is supported, so
+/// the caller falls back to the message locale.
+fn language_from_list(list: &str) -> Option<Lang> {
+    list.split(':')
+        .filter(|s| !s.is_empty())
+        .find_map(lang_from_locale)
+}
+
+/// Map a single POSIX/BCP-47 locale string (e.g. `zh_TW.UTF-8`, `ja-JP`) to a
+/// supported [`Lang`], or `None` if the language is not supported. Matching is
+/// done on whole subtags: an explicit `Hans`/`Hant` script wins over the region.
+fn lang_from_locale(raw: &str) -> Option<Lang> {
     let lower = raw.to_ascii_lowercase();
-    // `LANGUAGE` may hold a priority list like "de:en"; honor the first entry.
-    let first = lower.split(':').next().unwrap_or(&lower);
-    let mut subtags = first.split(['_', '-', '.', '@']).filter(|s| !s.is_empty());
+    let mut subtags = lower.split(['_', '-', '.', '@']).filter(|s| !s.is_empty());
     let primary = subtags.next().unwrap_or("");
     match primary {
+        "en" => Some(Lang::En),
         "zh" => {
             let rest: Vec<&str> = subtags.collect();
             if rest.contains(&"hant") {
-                Lang::ZhHant
+                Some(Lang::ZhHant)
             } else if rest.contains(&"hans") {
-                Lang::ZhHans
+                Some(Lang::ZhHans)
             } else if rest.iter().any(|t| matches!(*t, "tw" | "hk" | "mo")) {
                 // Traditional-script regions when the script is not explicit.
-                Lang::ZhHant
+                Some(Lang::ZhHant)
             } else {
                 // Simplified for zh-CN, zh-SG, bare zh, and anything else.
-                Lang::ZhHans
+                Some(Lang::ZhHans)
             }
         }
-        "ja" => Lang::Ja,
-        "es" => Lang::Es,
-        "de" => Lang::De,
-        "fr" => Lang::Fr,
-        _ => Lang::En,
+        "ja" => Some(Lang::Ja),
+        "es" => Some(Lang::Es),
+        "de" => Some(Lang::De),
+        "fr" => Some(Lang::Fr),
+        _ => None,
     }
+}
+
+/// Map a single locale value to a [`Lang`], falling back to English for
+/// unsupported languages. Honors the first entry of a `:`-separated value.
+fn parse_locale(raw: &str) -> Lang {
+    let first = raw.split(':').next().unwrap_or(raw);
+    lang_from_locale(first).unwrap_or(Lang::En)
 }
 
 #[cfg(windows)]
@@ -963,7 +977,7 @@ fn help_text_zh_hans() -> &'static str {
   支持 C-a..C-z 或 Ctrl+A..Ctrl+Z；CLI 参数优先于环境变量
 
 状态栏:
-  attach 时底部一行列出所有会话（* 当前，! 已退出），每 2 秒刷新
+  attach 时底部一行列出活动会话（* 表示当前），每 2 秒刷新
   --status-bar off             本次命令关闭状态栏
   QSCREEN_STATUS_BAR=off       为所有命令关闭状态栏
   取值 on|off；CLI 参数优先于环境变量；终端高度不足 3 行时自动停用
@@ -1083,7 +1097,7 @@ fn help_text_zh_hant() -> &'static str {
   支援 C-a..C-z 或 Ctrl+A..Ctrl+Z；CLI 參數優先於環境變數
 
 狀態列:
-  attach 時底部一行列出所有工作階段（* 目前，! 已結束），每 2 秒重新整理
+  attach 時底部一行列出使用中的工作階段（* 表示目前），每 2 秒重新整理
   --status-bar off             本次指令關閉狀態列
   QSCREEN_STATUS_BAR=off       為所有指令關閉狀態列
   取值 on|off；CLI 參數優先於環境變數；終端高度不足 3 行時自動停用
@@ -1143,7 +1157,7 @@ fn help_text_ja() -> &'static str {
   値: C-a..C-z または Ctrl+A..Ctrl+Z；CLI が環境変数より優先
 
 ステータスバー:
-  attach 中は最下行に全セッションを表示（* が現在、! は終了）、2 秒ごとに更新
+  attach 中は最下行に稼働中のセッションを表示（* が現在）、2 秒ごとに更新
   --status-bar off             このコマンドでステータスバーを無効化
   QSCREEN_STATUS_BAR=off       全コマンドでステータスバーを無効化
   値: on|off；CLI が環境変数より優先；端末が 3 行未満のとき無効
@@ -4913,6 +4927,21 @@ mod tests {
         assert_eq!(parse_locale("de:en"), Lang::De);
         // Unknown languages fall back to English.
         assert_eq!(parse_locale("ru_RU"), Lang::En);
+    }
+
+    #[test]
+    fn language_list_falls_through_unsupported_entries() {
+        // Unsupported first entries are skipped for the first supported one.
+        assert_eq!(language_from_list("ru:de"), Some(Lang::De));
+        assert_eq!(language_from_list("ru:xx:ja_JP"), Some(Lang::Ja));
+        // Explicit English is a supported choice and stops the search.
+        assert_eq!(language_from_list("en:de"), Some(Lang::En));
+        // No supported entry means fall back to the message locale.
+        assert_eq!(language_from_list("ru:xx"), None);
+        assert_eq!(language_from_list(""), None);
+        // Unsupported single tokens are None (not English).
+        assert_eq!(lang_from_locale("ru_RU"), None);
+        assert_eq!(lang_from_locale("en_US"), Some(Lang::En));
     }
 
     #[test]
