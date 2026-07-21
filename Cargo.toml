@@ -15,7 +15,7 @@ license = "MIT"
 description = "Lightweight terminal session manager with detachable qscn sessions"
 repository = "https://github.com/dualface/qscreen"
 readme = "README.md"
-keywords = ["terminal", "session", "qscn"]
+keywords = ["terminal", "tmux", "screen", "session-manager", "multiplexer"]
 categories = ["command-line-utilities"]
 
 [workspace.dependencies]

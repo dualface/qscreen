@@ -1,6 +1,16 @@
 # qscreen
 
-`qscreen` is a lightweight terminal session manager. It keeps shell sessions alive in a background daemon, lets you detach and reattach, and provides a small `tmux`-style command set through the `qscn` executable.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/dualface/qscreen)](https://github.com/dualface/qscreen/releases/latest)
+[![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-informational)](https://github.com/dualface/qscreen/releases/latest)
+
+`qscreen` is a lightweight, cross-platform terminal session manager — a simple
+`tmux` / GNU `screen` style alternative for Windows, Linux, and macOS. It keeps
+shell sessions alive in a background daemon, lets you detach and reattach at any
+time (persistent sessions survive closing the terminal window), and provides a
+small `tmux`-style command set through the `qscn` executable. On Windows it uses
+ConPTY and named pipes, so PowerShell and cmd sessions keep running after you
+disconnect.
 
 ## Features
 
@@ -23,6 +33,15 @@
 - Sessions are addressed by daemon-assigned numeric `session_id` values. The
   session name is only a display name, and custom names must match
   `[A-Za-z0-9._-]` and be at most 64 characters.
+
+## Installation
+
+Download a prebuilt `qscn` binary for Windows (x86_64/arm64), Linux
+(x86_64/arm64), or macOS (arm64) from the
+[GitHub Releases page](https://github.com/dualface/qscreen/releases/latest),
+unpack the archive, and put `qscn` (or `qscn.exe`) somewhere on your `PATH`.
+
+Alternatively, build from source as described below.
 
 ## Build
 
@@ -162,3 +181,11 @@ For Windows cross-checks:
 ```sh
 cargo check --workspace --target x86_64-pc-windows-gnu
 ```
+
+## License
+
+`qscreen` is distributed under the [MIT License](LICENSE).
+
+The vendored `crates/vt100-psmux` crate is derived from the
+[`vt100`](https://crates.io/crates/vt100) crate and keeps its original MIT
+license; see `crates/vt100-psmux/LICENSE`.
