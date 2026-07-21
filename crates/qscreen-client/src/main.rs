@@ -358,12 +358,27 @@ fn language() -> Lang {
 }
 
 fn detect_language() -> Lang {
-    for var in ["LANG", "LANGUAGE", "LC_ALL", "LC_MESSAGES"] {
-        if let Ok(val) = std::env::var(var)
-            && !val.is_empty()
-        {
-            return parse_locale(&val);
+    // POSIX category resolution: LC_ALL overrides LC_MESSAGES, which overrides
+    // LANG. The GNU `LANGUAGE` priority list then overrides the resolved message
+    // locale, except when that locale is the C/POSIX default.
+    let base = ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .find_map(|var| std::env::var(var).ok().filter(|v| !v.is_empty()));
+    let is_c_locale = match base.as_deref() {
+        None => true,
+        Some(b) => {
+            let l = b.to_ascii_lowercase();
+            l == "c" || l == "posix" || l.starts_with("c.") || l.starts_with("posix.")
         }
+    };
+    if !is_c_locale
+        && let Ok(list) = std::env::var("LANGUAGE")
+        && !list.is_empty()
+    {
+        return parse_locale(&list);
+    }
+    if let Some(b) = base {
+        return parse_locale(&b);
     }
     #[cfg(windows)]
     {
@@ -375,24 +390,26 @@ fn detect_language() -> Lang {
 
 /// Map a POSIX/BCP-47 locale string (e.g. `zh_TW.UTF-8`, `ja-JP`, `de:en`) to a
 /// [`Lang`]. Only the first locale of a `:`-separated `LANGUAGE` list is used,
-/// and only the primary subtag plus any script/region hints matter.
+/// and matching is done on whole subtags: an explicit `Hans`/`Hant` script wins,
+/// and the region is consulted only when no script is present.
 fn parse_locale(raw: &str) -> Lang {
     let lower = raw.to_ascii_lowercase();
     // `LANGUAGE` may hold a priority list like "de:en"; honor the first entry.
     let first = lower.split(':').next().unwrap_or(&lower);
-    // Primary language subtag is everything before the region/encoding separators.
-    let primary = first.split(['_', '-', '.', '@']).next().unwrap_or(first);
+    let mut subtags = first.split(['_', '-', '.', '@']).filter(|s| !s.is_empty());
+    let primary = subtags.next().unwrap_or("");
     match primary {
         "zh" => {
-            // Traditional Chinese for the Hant script or the TW/HK/MO regions;
-            // Simplified otherwise (zh-CN, zh-SG, bare zh, ...).
-            if first.contains("hant")
-                || first.contains("tw")
-                || first.contains("hk")
-                || first.contains("mo")
-            {
+            let rest: Vec<&str> = subtags.collect();
+            if rest.contains(&"hant") {
+                Lang::ZhHant
+            } else if rest.contains(&"hans") {
+                Lang::ZhHans
+            } else if rest.iter().any(|t| matches!(*t, "tw" | "hk" | "mo")) {
+                // Traditional-script regions when the script is not explicit.
                 Lang::ZhHant
             } else {
+                // Simplified for zh-CN, zh-SG, bare zh, and anything else.
                 Lang::ZhHans
             }
         }
@@ -654,11 +671,11 @@ const MSG_UNKNOWN_COMMAND: L7 = L7 {
 
 const MSG_NO_ATTACHABLE: L7 = L7 {
     en: "no attachable session",
-    zh_hans: "没有可用的 session",
+    zh_hans: "没有可用的会话",
     zh_hant: "沒有可用的工作階段",
     ja: "接続できるセッションがありません",
     es: "no hay ninguna sesión disponible",
-    de: "keine anfügbare Sitzung",
+    de: "keine verfügbare Sitzung",
     fr: "aucune session disponible",
 };
 
@@ -4883,6 +4900,11 @@ mod tests {
         assert_eq!(parse_locale("zh_TW.UTF-8"), Lang::ZhHant);
         assert_eq!(parse_locale("zh-Hant-HK"), Lang::ZhHant);
         assert_eq!(parse_locale("zh_HK"), Lang::ZhHant);
+        // An explicit script wins over the region.
+        assert_eq!(parse_locale("zh-Hans-TW"), Lang::ZhHans);
+        assert_eq!(parse_locale("zh-Hant-CN"), Lang::ZhHant);
+        // A modifier that merely contains region letters is not a region.
+        assert_eq!(parse_locale("zh@modern"), Lang::ZhHans);
         assert_eq!(parse_locale("ja_JP.UTF-8"), Lang::Ja);
         assert_eq!(parse_locale("es_ES"), Lang::Es);
         assert_eq!(parse_locale("de_DE.UTF-8"), Lang::De);
