@@ -21,7 +21,7 @@ Tests are currently inline in crate source files with `#[cfg(test)] mod tests`. 
 - `cargo clippy --workspace --all-targets`: run lint checks before larger changes.
 - `make clean`: remove Cargo build artifacts.
 
-The pinned toolchain is stable Rust with the `x86_64-pc-windows-gnu` target in `rust-toolchain.toml`. Daemon runtime support is Windows-only because it uses ConPTY and Windows named pipes.
+The pinned toolchain is stable Rust with the `x86_64-pc-windows-gnu` target in `rust-toolchain.toml`. The daemon runs on Windows (ConPTY and named pipes) and on Linux/macOS (Unix PTYs and Unix domain sockets).
 
 ## Release Process
 
@@ -43,7 +43,7 @@ Build optimized binaries with `--locked --bin qscn`. On macOS hosts, use `cargo 
 - `cargo zigbuild --release --locked --bin qscn --target x86_64-pc-windows-gnu`
 - `cargo zigbuild --release --locked --bin qscn --target aarch64-pc-windows-gnullvm`
 
-Package each archive with a single executable at the archive root: `qscn` for Unix archives and `qscn.exe` for Windows archives. Use these asset names:
+Package each archive with the executable plus license notices at the archive root: `qscn` for Unix archives, `qscn.exe` for Windows archives, `LICENSE` (root MIT license), and `LICENSE-vt100-psmux` (a copy of `crates/vt100-psmux/LICENSE`). Use these asset names:
 
 - `qscreen-<tag>-linux-x86_64.tar.gz`
 - `qscreen-<tag>-linux-arm64.tar.gz`
@@ -57,7 +57,7 @@ Additionally run `scripts/package-windows-gz.sh <tag>` to produce the per-asset 
 - `qscn-windows-amd64.exe.gz` + `qscn-windows-amd64.exe.gz.sha256` + `qscn-windows-amd64.exe.sha256`
 - `qscn-windows-arm64.exe.gz` + `qscn-windows-arm64.exe.gz.sha256` + `qscn-windows-arm64.exe.sha256`
 
-These names carry no tag (release download URLs are tag-scoped) and use amd64/arm64 to match QuickTUI asset naming. Include them in `SHA256SUMS` as well.
+These names carry no tag (release download URLs are tag-scoped) and use amd64/arm64 to match QuickTUI asset naming. Include them in `SHA256SUMS` as well. The gz artifacts are single-file by design; their license notices ship in the corresponding release archives and in the repository (`LICENSE`, `crates/vt100-psmux/LICENSE`).
 
 Create the GitHub Release as a formal latest release, not a draft or prerelease:
 
