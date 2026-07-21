@@ -2,6 +2,20 @@
 
 `qscreen` 是一个轻量终端会话管理器。它把 shell 会话放在后台 daemon 中运行，支持 detach、reattach，并通过 `qscn` 执行文件提供一组简洁的 `tmux` 风格命令。
 
+## 截图
+
+带状态栏、列出运行中会话的实时会话界面：
+
+![qscreen 会话与状态栏](images/qscreen-screenshot-01-fs8.png)
+
+用于切换、新建、重命名和终止会话的内置会话列表：
+
+![qscreen 会话列表](images/qscreen-screenshot-02-fs8.png)
+
+快捷键帮助屏：
+
+![qscreen 快捷键](images/qscreen-screenshot-03-fs8.png)
+
 ## 功能
 
 - 创建、列出、进入、脱离、终止终端会话。

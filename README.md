@@ -12,6 +12,20 @@ small `tmux`-style command set through the `qscn` executable. On Windows it uses
 ConPTY and named pipes, so PowerShell and cmd sessions keep running after you
 disconnect.
 
+## Screenshots
+
+A live session with the status bar listing running sessions:
+
+![qscreen session with status bar](images/qscreen-screenshot-01-fs8.png)
+
+The built-in session list for switching, creating, renaming, and killing sessions:
+
+![qscreen session list](images/qscreen-screenshot-02-fs8.png)
+
+The key-binding help screen:
+
+![qscreen key bindings](images/qscreen-screenshot-03-fs8.png)
+
 ## Features
 
 - Create, list, attach, detach, and kill terminal sessions.
