@@ -249,11 +249,7 @@ fn run_client(args: Vec<String>) -> anyhow::Result<()> {
             [cmd, session_id] if cmd == "kill" => cmd_kill(session_id).await,
             [cmd, session_id, name] if cmd == "rename" => cmd_rename(session_id, name).await,
             _ => {
-                if is_chinese() {
-                    anyhow::bail!("未知命令。运行 `qscn --help` 查看帮助")
-                } else {
-                    anyhow::bail!("unknown command. Run `qscn --help` for usage")
-                }
+                anyhow::bail!("{}", MSG_UNKNOWN_COMMAND.get(language()))
             }
         }
     })
@@ -341,41 +337,402 @@ fn missing_option_value(option: &str) -> String {
 
 // ── Language detection ───────────────────────────────────────────────────────
 
-static IS_CHINESE: OnceLock<bool> = OnceLock::new();
-
-fn is_chinese() -> bool {
-    *IS_CHINESE.get_or_init(detect_chinese)
+/// UI languages qscn can render. Everything not recognized falls back to
+/// `En`. Simplified vs Traditional Chinese are distinguished by script/region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lang {
+    En,
+    ZhHans,
+    ZhHant,
+    Ja,
+    Es,
+    De,
+    Fr,
 }
 
-fn detect_chinese() -> bool {
+static LANGUAGE: OnceLock<Lang> = OnceLock::new();
+
+/// The process UI language, detected once from the environment/OS locale.
+fn language() -> Lang {
+    *LANGUAGE.get_or_init(detect_language)
+}
+
+fn detect_language() -> Lang {
     for var in ["LANG", "LANGUAGE", "LC_ALL", "LC_MESSAGES"] {
         if let Ok(val) = std::env::var(var)
             && !val.is_empty()
         {
-            return val.to_lowercase().contains("zh");
+            return parse_locale(&val);
         }
     }
     #[cfg(windows)]
     {
-        windows_locale_is_chinese()
+        parse_locale(&windows_locale_name())
     }
     #[cfg(not(windows))]
-    false
+    Lang::En
+}
+
+/// Map a POSIX/BCP-47 locale string (e.g. `zh_TW.UTF-8`, `ja-JP`, `de:en`) to a
+/// [`Lang`]. Only the first locale of a `:`-separated `LANGUAGE` list is used,
+/// and only the primary subtag plus any script/region hints matter.
+fn parse_locale(raw: &str) -> Lang {
+    let lower = raw.to_ascii_lowercase();
+    // `LANGUAGE` may hold a priority list like "de:en"; honor the first entry.
+    let first = lower.split(':').next().unwrap_or(&lower);
+    // Primary language subtag is everything before the region/encoding separators.
+    let primary = first.split(['_', '-', '.', '@']).next().unwrap_or(first);
+    match primary {
+        "zh" => {
+            // Traditional Chinese for the Hant script or the TW/HK/MO regions;
+            // Simplified otherwise (zh-CN, zh-SG, bare zh, ...).
+            if first.contains("hant")
+                || first.contains("tw")
+                || first.contains("hk")
+                || first.contains("mo")
+            {
+                Lang::ZhHant
+            } else {
+                Lang::ZhHans
+            }
+        }
+        "ja" => Lang::Ja,
+        "es" => Lang::Es,
+        "de" => Lang::De,
+        "fr" => Lang::Fr,
+        _ => Lang::En,
+    }
 }
 
 #[cfg(windows)]
-fn windows_locale_is_chinese() -> bool {
+fn windows_locale_name() -> String {
     unsafe extern "system" {
         fn GetUserDefaultLocaleName(lp_locale_name: *mut u16, cch_locale_name: i32) -> i32;
     }
     let mut buf = [0u16; 85];
     let len = unsafe { GetUserDefaultLocaleName(buf.as_mut_ptr(), buf.len() as i32) };
     if len > 1 {
-        let name = String::from_utf16_lossy(&buf[..len as usize - 1]);
-        return name.to_lowercase().starts_with("zh");
+        String::from_utf16_lossy(&buf[..len as usize - 1])
+    } else {
+        String::new()
     }
-    false
 }
+
+// ── Translation catalog ──────────────────────────────────────────────────────
+
+/// A translated string with one variant per [`Lang`]. Formatted messages embed
+/// `{name}`/`{id}` placeholders that callers resolve with `str::replace`.
+struct L7 {
+    en: &'static str,
+    zh_hans: &'static str,
+    zh_hant: &'static str,
+    ja: &'static str,
+    es: &'static str,
+    de: &'static str,
+    fr: &'static str,
+}
+
+impl L7 {
+    fn get(&self, lang: Lang) -> &'static str {
+        match lang {
+            Lang::En => self.en,
+            Lang::ZhHans => self.zh_hans,
+            Lang::ZhHant => self.zh_hant,
+            Lang::Ja => self.ja,
+            Lang::Es => self.es,
+            Lang::De => self.de,
+            Lang::Fr => self.fr,
+        }
+    }
+}
+
+// ── Translated UI strings ────────────────────────────────────────────────────
+// Short user-facing strings for the session-list overlay, in-session help, and
+// CLI errors. Formatted messages carry `{name}`/`{id}`/`{err}` placeholders that
+// callers resolve with `str::replace`. The full `--help` block lives in
+// `help_text` further below.
+
+const MSG_LIST_TITLE: L7 = L7 {
+    en: "qscreen sessions",
+    zh_hans: "qscreen 会话列表",
+    zh_hant: "qscreen 工作階段",
+    ja: "qscreen セッション",
+    es: "sesiones de qscreen",
+    de: "qscreen-Sitzungen",
+    fr: "sessions qscreen",
+};
+
+const MSG_MARKS_CURRENT: L7 = L7 {
+    en: "* marks current session",
+    zh_hans: "* 表示当前会话",
+    zh_hant: "* 表示目前工作階段",
+    ja: "* は現在のセッション",
+    es: "* indica la sesión actual",
+    de: "* markiert die aktuelle Sitzung",
+    fr: "* indique la session actuelle",
+};
+
+const MSG_NO_SESSIONS: L7 = L7 {
+    en: "no sessions",
+    zh_hans: "无会话",
+    zh_hant: "無工作階段",
+    ja: "セッションなし",
+    es: "sin sesiones",
+    de: "keine Sitzungen",
+    fr: "aucune session",
+};
+
+const MSG_STATE_ATTACHED: L7 = L7 {
+    en: "attached",
+    zh_hans: "已连接",
+    zh_hant: "已連線",
+    ja: "接続中",
+    es: "conectada",
+    de: "verbunden",
+    fr: "attachée",
+};
+
+const MSG_STATE_DETACHED: L7 = L7 {
+    en: "detached",
+    zh_hans: "未连接",
+    zh_hant: "未連線",
+    ja: "切断",
+    es: "desconectada",
+    de: "getrennt",
+    fr: "détachée",
+};
+
+const MSG_STATE_EXITED: L7 = L7 {
+    en: "exited({code})",
+    zh_hans: "已退出({code})",
+    zh_hant: "已結束({code})",
+    ja: "終了({code})",
+    es: "finalizada({code})",
+    de: "beendet({code})",
+    fr: "terminée({code})",
+};
+
+const MSG_CREATE_FAILED: L7 = L7 {
+    en: "create failed: {err}",
+    zh_hans: "新建失败: {err}",
+    zh_hant: "建立失敗: {err}",
+    ja: "作成に失敗しました: {err}",
+    es: "error al crear: {err}",
+    de: "Erstellen fehlgeschlagen: {err}",
+    fr: "échec de la création : {err}",
+};
+
+const MSG_RENAME_FAILED: L7 = L7 {
+    en: "rename failed: {err}",
+    zh_hans: "重命名失败: {err}",
+    zh_hant: "重新命名失敗: {err}",
+    ja: "名前の変更に失敗しました: {err}",
+    es: "error al renombrar: {err}",
+    de: "Umbenennen fehlgeschlagen: {err}",
+    fr: "échec du renommage : {err}",
+};
+
+const MSG_KILL_FAILED: L7 = L7 {
+    en: "kill failed: {err}",
+    zh_hans: "终止失败: {err}",
+    zh_hant: "終止失敗: {err}",
+    ja: "終了に失敗しました: {err}",
+    es: "error al terminar: {err}",
+    de: "Beenden fehlgeschlagen: {err}",
+    fr: "échec de l'arrêt : {err}",
+};
+
+const MSG_RENAMED: L7 = L7 {
+    en: "renamed to \"{name}\"",
+    zh_hans: "已重命名为 \"{name}\"",
+    zh_hant: "已重新命名為 \"{name}\"",
+    ja: "\"{name}\" に名前を変更しました",
+    es: "renombrada a \"{name}\"",
+    de: "umbenannt in \"{name}\"",
+    fr: "renommée en \"{name}\"",
+};
+
+const MSG_KILLED: L7 = L7 {
+    en: "killed \"{name}\"",
+    zh_hans: "已终止 \"{name}\"",
+    zh_hant: "已終止 \"{name}\"",
+    ja: "\"{name}\" を終了しました",
+    es: "terminada \"{name}\"",
+    de: "\"{name}\" beendet",
+    fr: "\"{name}\" arrêtée",
+};
+
+const MSG_CANNOT_RENAME_EXITED: L7 = L7 {
+    en: "cannot rename an exited session",
+    zh_hans: "无法重命名已退出的会话",
+    zh_hant: "無法重新命名已結束的工作階段",
+    ja: "終了したセッションの名前は変更できません",
+    es: "no se puede renombrar una sesión finalizada",
+    de: "beendete Sitzung kann nicht umbenannt werden",
+    fr: "impossible de renommer une session terminée",
+};
+
+const MSG_SESSION_EXITED: L7 = L7 {
+    en: "session {id} has exited",
+    zh_hans: "会话 {id} 已退出",
+    zh_hant: "工作階段 {id} 已結束",
+    ja: "セッション {id} は終了しました",
+    es: "la sesión {id} ha finalizado",
+    de: "Sitzung {id} wurde beendet",
+    fr: "la session {id} est terminée",
+};
+
+const MSG_RENAME_LABEL: L7 = L7 {
+    en: "rename \"{old}\" -> ",
+    zh_hans: "重命名 \"{old}\" -> ",
+    zh_hant: "重新命名 \"{old}\" -> ",
+    ja: "\"{old}\" の名前を変更 -> ",
+    es: "renombrar \"{old}\" -> ",
+    de: "\"{old}\" umbenennen -> ",
+    fr: "renommer \"{old}\" -> ",
+};
+
+const MSG_RENAME_HINT: L7 = L7 {
+    en: "  (Enter confirm, Esc cancel)",
+    zh_hans: "  (Enter 确认, Esc 取消)",
+    zh_hant: "  (Enter 確認, Esc 取消)",
+    ja: "  (Enter 確定, Esc キャンセル)",
+    es: "  (Enter confirmar, Esc cancelar)",
+    de: "  (Enter bestätigen, Esc abbrechen)",
+    fr: "  (Enter confirmer, Esc annuler)",
+};
+
+const MSG_KILL_LABEL: L7 = L7 {
+    en: "kill \"{name}\" (session {id})? ",
+    zh_hans: "终止 \"{name}\" (会话 {id})? ",
+    zh_hant: "終止 \"{name}\" (工作階段 {id})? ",
+    ja: "\"{name}\" を終了しますか (セッション {id})? ",
+    es: "¿terminar \"{name}\" (sesión {id})? ",
+    de: "\"{name}\" beenden (Sitzung {id})? ",
+    fr: "arrêter \"{name}\" (session {id}) ? ",
+};
+
+const MSG_KILL_HINT: L7 = L7 {
+    en: "(y confirm, Esc cancel)",
+    zh_hans: "(y 确认, Esc 取消)",
+    zh_hant: "(y 確認, Esc 取消)",
+    ja: "(y 確定, Esc キャンセル)",
+    es: "(y confirmar, Esc cancelar)",
+    de: "(y bestätigen, Esc abbrechen)",
+    fr: "(y confirmer, Esc annuler)",
+};
+
+const MSG_HELP_TITLE: L7 = L7 {
+    en: "qscreen key bindings",
+    zh_hans: "qscreen 快捷键",
+    zh_hant: "qscreen 快速鍵",
+    ja: "qscreen キーバインド",
+    es: "atajos de qscreen",
+    de: "qscreen-Tastenkürzel",
+    fr: "raccourcis qscreen",
+};
+
+const MSG_HELP_HINT: L7 = L7 {
+    en: "press Esc or q to close",
+    zh_hans: "按 Esc 或 q 关闭",
+    zh_hant: "按 Esc 或 q 關閉",
+    ja: "Esc または q で閉じる",
+    es: "pulsa Esc o q para cerrar",
+    de: "Esc oder q zum Schließen",
+    fr: "Esc ou q pour fermer",
+};
+
+const MSG_UNKNOWN_COMMAND: L7 = L7 {
+    en: "unknown command. Run `qscn --help` for usage",
+    zh_hans: "未知命令。运行 `qscn --help` 查看帮助",
+    zh_hant: "未知指令。執行 `qscn --help` 查看說明",
+    ja: "不明なコマンドです。使い方は `qscn --help` を実行してください",
+    es: "comando desconocido. Ejecuta `qscn --help` para ver el uso",
+    de: "unbekannter Befehl. Führe `qscn --help` für die Nutzung aus",
+    fr: "commande inconnue. Lancez `qscn --help` pour l'usage",
+};
+
+const MSG_NO_ATTACHABLE: L7 = L7 {
+    en: "no attachable session",
+    zh_hans: "没有可用的 session",
+    zh_hant: "沒有可用的工作階段",
+    ja: "接続できるセッションがありません",
+    es: "no hay ninguna sesión disponible",
+    de: "keine anfügbare Sitzung",
+    fr: "aucune session disponible",
+};
+
+// Session-list hint description fragments (the shortcut keys themselves are the
+// same in every language and stay in `write_session_list_hint`).
+const HINT_OR: L7 = L7 {
+    en: " or ",
+    zh_hans: " 或 ",
+    zh_hant: " 或 ",
+    ja: " または ",
+    es: " o ",
+    de: " oder ",
+    fr: " ou ",
+};
+
+const HINT_SWITCH: L7 = L7 {
+    en: " switch, ",
+    zh_hans: " 切换, ",
+    zh_hant: " 切換, ",
+    ja: " 切替, ",
+    es: " cambiar, ",
+    de: " wechseln, ",
+    fr: " changer, ",
+};
+
+const HINT_CREATE: L7 = L7 {
+    en: " create, ",
+    zh_hans: " 新建, ",
+    zh_hant: " 新增, ",
+    ja: " 新規, ",
+    es: " crear, ",
+    de: " neu, ",
+    fr: " créer, ",
+};
+
+const HINT_RENAME: L7 = L7 {
+    en: " rename, ",
+    zh_hans: " 改名, ",
+    zh_hant: " 更名, ",
+    ja: " 改名, ",
+    es: " renombrar, ",
+    de: " umbenennen, ",
+    fr: " renommer, ",
+};
+
+const HINT_KILL: L7 = L7 {
+    en: " kill, ",
+    zh_hans: " 终止, ",
+    zh_hant: " 終止, ",
+    ja: " 終了, ",
+    es: " terminar, ",
+    de: " beenden, ",
+    fr: " arrêter, ",
+};
+
+const HINT_HELP: L7 = L7 {
+    en: " help, ",
+    zh_hans: " 帮助, ",
+    zh_hant: " 說明, ",
+    ja: " ヘルプ, ",
+    es: " ayuda, ",
+    de: " Hilfe, ",
+    fr: " aide, ",
+};
+
+const HINT_CANCEL: L7 = L7 {
+    en: " cancel",
+    zh_hans: " 取消",
+    zh_hant: " 取消",
+    ja: " キャンセル",
+    es: " cancelar",
+    de: " abbrechen",
+    fr: " annuler",
+};
 
 // ── Help text ────────────────────────────────────────────────────────────────
 
@@ -387,8 +744,7 @@ fn print_version() {
 /// prefix; the literal `<prefix>` token is expanded to the active prefix label.
 struct PrefixBinding {
     keys: &'static str,
-    desc_en: &'static str,
-    desc_zh: &'static str,
+    desc: L7,
 }
 
 /// Single source of truth for the `<prefix>`-driven in-session commands, shared
@@ -396,33 +752,75 @@ struct PrefixBinding {
 const PREFIX_BINDINGS: &[PrefixBinding] = &[
     PrefixBinding {
         keys: "?",
-        desc_en: "show this key-binding help (Esc or q to close)",
-        desc_zh: "显示此快捷键帮助(按 Esc 或 q 关闭)",
+        desc: L7 {
+            en: "show this key-binding help (Esc or q to close)",
+            zh_hans: "显示此快捷键帮助(按 Esc 或 q 关闭)",
+            zh_hant: "顯示此快速鍵說明(按 Esc 或 q 關閉)",
+            ja: "このキーバインドのヘルプを表示(Esc または q で閉じる)",
+            es: "muestra esta ayuda de atajos (Esc o q para cerrar)",
+            de: "zeigt diese Tastenkürzel-Hilfe (Esc oder q zum Schließen)",
+            fr: "affiche cette aide des raccourcis (Esc ou q pour fermer)",
+        },
     },
     PrefixBinding {
         keys: "d",
-        desc_en: "detach from the session (it keeps running in the background)",
-        desc_zh: "从当前会话 detach(会话继续在后台运行)",
+        desc: L7 {
+            en: "detach from the session (it keeps running in the background)",
+            zh_hans: "从当前会话 detach(会话继续在后台运行)",
+            zh_hant: "從目前工作階段卸離(工作階段繼續在背景執行)",
+            ja: "セッションからデタッチ(バックグラウンドで実行を継続)",
+            es: "se desconecta de la sesión (sigue en segundo plano)",
+            de: "trennt von der Sitzung (läuft im Hintergrund weiter)",
+            fr: "se détache de la session (elle continue en arrière-plan)",
+        },
     },
     PrefixBinding {
         keys: "s",
-        desc_en: "open the session list (Enter switch, c create, r rename, x kill, q cancel)",
-        desc_zh: "打开会话列表(Enter 切换,c 新建,r 改名,x 终止,q 取消)",
+        desc: L7 {
+            en: "open the session list (Enter switch, c create, r rename, x kill, q cancel)",
+            zh_hans: "打开会话列表(Enter 切换,c 新建,r 改名,x 终止,q 取消)",
+            zh_hant: "開啟工作階段清單(Enter 切換,c 新增,r 更名,x 終止,q 取消)",
+            ja: "セッション一覧を開く(Enter 切替, c 新規, r 改名, x 終了, q キャンセル)",
+            es: "abre la lista de sesiones (Enter cambiar, c crear, r renombrar, x terminar, q cancelar)",
+            de: "öffnet die Sitzungsliste (Enter wechseln, c neu, r umbenennen, x beenden, q abbrechen)",
+            fr: "ouvre la liste des sessions (Enter changer, c créer, r renommer, x arrêter, q annuler)",
+        },
     },
     PrefixBinding {
         keys: "n",
-        desc_en: "switch to the next session (by ID, wraps around)",
-        desc_zh: "切换到下一个会话(按 ID 顺序,末尾回到开头)",
+        desc: L7 {
+            en: "switch to the next session (by ID, wraps around)",
+            zh_hans: "切换到下一个会话(按 ID 顺序,末尾回到开头)",
+            zh_hant: "切換到下一個工作階段(依 ID 順序,末尾回到開頭)",
+            ja: "次のセッションへ切替(ID 順、末尾で先頭に戻る)",
+            es: "cambia a la siguiente sesión (por ID, con retorno cíclico)",
+            de: "wechselt zur nächsten Sitzung (nach ID, umlaufend)",
+            fr: "passe à la session suivante (par ID, avec bouclage)",
+        },
     },
     PrefixBinding {
         keys: "p",
-        desc_en: "switch to the previous session (by ID, wraps around)",
-        desc_zh: "切换到上一个会话(按 ID 顺序,开头回到末尾)",
+        desc: L7 {
+            en: "switch to the previous session (by ID, wraps around)",
+            zh_hans: "切换到上一个会话(按 ID 顺序,开头回到末尾)",
+            zh_hant: "切換到上一個工作階段(依 ID 順序,開頭回到末尾)",
+            ja: "前のセッションへ切替(ID 順、先頭で末尾に戻る)",
+            es: "cambia a la sesión anterior (por ID, con retorno cíclico)",
+            de: "wechselt zur vorherigen Sitzung (nach ID, umlaufend)",
+            fr: "passe à la session précédente (par ID, avec bouclage)",
+        },
     },
     PrefixBinding {
         keys: "<prefix>",
-        desc_en: "send a literal prefix key to the terminal",
-        desc_zh: "向终端发送字面前缀字符",
+        desc: L7 {
+            en: "send a literal prefix key to the terminal",
+            zh_hans: "向终端发送字面前缀字符",
+            zh_hant: "向終端傳送字面前綴字元",
+            ja: "プレフィックスキーそのものを端末へ送信",
+            es: "envía la tecla de prefijo literal al terminal",
+            de: "sendet die Präfixtaste wörtlich an das Terminal",
+            fr: "envoie la touche de préfixe littérale au terminal",
+        },
     },
 ];
 
@@ -441,17 +839,16 @@ const PREFIX_COMBO_WIDTH: usize = 28;
 /// width-padded `Ctrl+X key` column meant to be rendered in the KEY color and the
 /// description in the HINT color. Shared by both `--help` and the in-session help
 /// screen so they never drift and highlight the keys identically.
-fn prefix_help_rows(prefix: PrefixKey, zh: bool) -> Vec<(String, String)> {
+fn prefix_help_rows(prefix: PrefixKey, lang: Lang) -> Vec<(String, String)> {
     let label = prefix_label(prefix);
     PREFIX_BINDINGS
         .iter()
         .map(|b| {
             let keys = b.keys.replace("<prefix>", &label);
             let combo = format!("{label} {keys}");
-            let desc = if zh { b.desc_zh } else { b.desc_en };
             (
                 format!("  {combo:<width$}", width = PREFIX_COMBO_WIDTH),
-                desc.to_string(),
+                b.desc.get(lang).to_string(),
             )
         })
         .collect()
@@ -459,8 +856,8 @@ fn prefix_help_rows(prefix: PrefixKey, zh: bool) -> Vec<(String, String)> {
 
 /// The `--help` key-binding block: combos highlighted in KEY (bold yellow),
 /// descriptions in HINT (dim). Degrades to plain aligned text without color.
-fn prefix_help_block(prefix: PrefixKey, zh: bool) -> String {
-    prefix_help_rows(prefix, zh)
+fn prefix_help_block(prefix: PrefixKey, lang: Lang) -> String {
+    prefix_help_rows(prefix, lang)
         .iter()
         .map(|(combo, desc)| {
             format!(
@@ -474,9 +871,9 @@ fn prefix_help_block(prefix: PrefixKey, zh: bool) -> String {
 }
 
 fn print_help(prefix: PrefixKey) {
-    let zh = is_chinese();
-    let raw = if zh { help_text_zh() } else { help_text_en() };
-    let raw = raw.replace("%PREFIX_BINDINGS%", &prefix_help_block(prefix, zh));
+    let lang = language();
+    let raw = help_text(lang);
+    let raw = raw.replace("%PREFIX_BINDINGS%", &prefix_help_block(prefix, lang));
     print!("{}", colorize_help(&raw));
 }
 
@@ -501,7 +898,21 @@ fn colorize_help(raw: &str) -> String {
     out
 }
 
-fn help_text_zh() -> &'static str {
+/// The full `--help` text for the given language (before `%PREFIX_BINDINGS%`
+/// substitution). Unknown languages fall back to English via [`Lang`].
+fn help_text(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => help_text_en(),
+        Lang::ZhHans => help_text_zh_hans(),
+        Lang::ZhHant => help_text_zh_hant(),
+        Lang::Ja => help_text_ja(),
+        Lang::Es => help_text_es(),
+        Lang::De => help_text_de(),
+        Lang::Fr => help_text_fr(),
+    }
+}
+
+fn help_text_zh_hans() -> &'static str {
     r#"qscreen — 轻量终端会话管理器
 
 用法:
@@ -618,6 +1029,306 @@ Examples:
   qscn rename 1 work           # change the display name for session_id=1
   qscn ls                      # show all session states
   qscn kill 1                  # terminate session_id=1
+"#
+}
+
+fn help_text_zh_hant() -> &'static str {
+    r#"qscreen — 輕量終端工作階段管理器
+
+用法:
+  qscn [--prefix C-b]          智慧啟動：無工作階段時新建並進入，單一工作階段時直接 attach，
+                            多個工作階段時列出全部
+  qscn [--prefix C-b] new
+                               新建自動命名的工作階段並進入
+  qscn [--prefix C-b] new --name <name>
+                               以參數指定顯示名稱
+  qscn [--prefix C-b] new --shell <shell>
+                               指定啟動 shell（Windows: cmd、powershell 或執行檔路徑；Unix: shell 路徑）
+  qscn [--prefix C-b] new --cwd <path>
+                               指定工作階段的啟動工作目錄
+  qscn [--prefix C-b] attach [session_id]
+                               進入既有工作階段；省略 session_id 時進入 ID 最大的可用工作階段（別名 att）
+  qscn [--prefix C-b] -r [session_id]
+                               同 attach，相容 tmux 風格
+  qscn ls                      列出所有工作階段（同 list）
+  qscn list                    列出所有工作階段
+  qscn kill <session_id>       強制終止指定工作階段
+  qscn rename <session_id> <name>
+                               修改工作階段顯示名稱
+  qscn shutdown                停止背景 daemon（所有工作階段將被關閉）
+  qscn -h, --help              顯示此說明
+  qscn -V, --version           顯示版本號
+
+前綴:
+  預設前綴為 Ctrl+B（C-b）
+  --prefix C-a                 使用 Ctrl+A 作為目前指令的工作階段前綴
+  QSCREEN_PREFIX=C-a           為所有指令設定備用前綴
+  支援 C-a..C-z 或 Ctrl+A..Ctrl+Z；CLI 參數優先於環境變數
+
+狀態列:
+  attach 時底部一行列出所有工作階段（* 目前，! 已結束），每 2 秒重新整理
+  --status-bar off             本次指令關閉狀態列
+  QSCREEN_STATUS_BAR=off       為所有指令關閉狀態列
+  取值 on|off；CLI 參數優先於環境變數；終端高度不足 3 行時自動停用
+
+工作階段內熱鍵（預設前綴 Ctrl+B，按下前綴後再按對應鍵）:
+%PREFIX_BINDINGS%
+
+ls 輸出格式:
+  <session_id>  <name>  <狀態>  <建立時間>  <終端尺寸>
+  狀態: attached | detached | exited(<結束碼>)
+
+範例:
+  qscn                         # 自動進入唯一工作階段，或新建自動命名的工作階段
+  qscn new                     # 新建自動分配 session_id 的工作階段
+  qscn new --name work         # 新建顯示名稱為 work 的工作階段
+  qscn new --shell cmd --name work
+  qscn new --cwd C:\work --name work
+  qscn --prefix C-a attach 1   # 使用 Ctrl+A 作為前綴進入 session_id=1
+  qscn attach 1                # 重新進入 session_id=1
+  qscn rename 1 work           # 修改 session_id=1 的顯示名稱
+  qscn ls                      # 查看所有工作階段狀態
+  qscn kill 1                  # 終止 session_id=1
+"#
+}
+
+fn help_text_ja() -> &'static str {
+    r#"qscreen — 軽量ターミナルセッションマネージャー
+
+使い方:
+  qscn [--prefix C-b]          スマート起動：セッションが無ければ作成して入り、1 つなら attach、
+                            複数なら一覧を表示
+  qscn [--prefix C-b] new
+                               自動命名のセッションを作成して入る
+  qscn [--prefix C-b] new --name <name>
+                               表示名をオプションで指定
+  qscn [--prefix C-b] new --shell <shell>
+                               起動シェルを指定（Windows: cmd、powershell、または実行ファイルのパス；Unix: shell のパス）
+  qscn [--prefix C-b] new --cwd <path>
+                               セッションの作業ディレクトリを指定
+  qscn [--prefix C-b] attach [session_id]
+                               既存のセッションに接続；session_id 省略時は ID 最大の利用可能なセッション（別名 att）
+  qscn [--prefix C-b] -r [session_id]
+                               attach と同じ（tmux 風の短縮形）
+  qscn ls                      全セッションを一覧（別名 list）
+  qscn list                    全セッションを一覧
+  qscn kill <session_id>       指定セッションを強制終了
+  qscn rename <session_id> <name>
+                               セッションの表示名を変更
+  qscn shutdown                バックグラウンド daemon を停止（全セッションを閉じる）
+  qscn -h, --help              このヘルプを表示
+  qscn -V, --version           バージョンを表示
+
+プレフィックス:
+  既定のプレフィックスは Ctrl+B（C-b）
+  --prefix C-a                 このコマンドのセッションプレフィックスに Ctrl+A を使う
+  QSCREEN_PREFIX=C-a           全コマンド用の代替プレフィックスを設定
+  値: C-a..C-z または Ctrl+A..Ctrl+Z；CLI が環境変数より優先
+
+ステータスバー:
+  attach 中は最下行に全セッションを表示（* が現在、! は終了）、2 秒ごとに更新
+  --status-bar off             このコマンドでステータスバーを無効化
+  QSCREEN_STATUS_BAR=off       全コマンドでステータスバーを無効化
+  値: on|off；CLI が環境変数より優先；端末が 3 行未満のとき無効
+
+キーバインド（既定プレフィックス Ctrl+B、プレフィックスを押してからキー）:
+%PREFIX_BINDINGS%
+
+ls の出力形式:
+  <session_id>  <name>  <状態>  <作成日時>  <端末サイズ>
+  状態: attached | detached | exited(<終了コード>)
+
+例:
+  qscn                         # 唯一のセッションに自動接続、または自動命名で作成
+  qscn new                     # session_id 自動割り当てのセッションを作成
+  qscn new --name work         # 表示名 'work' のセッションを作成
+  qscn new --shell cmd --name work
+  qscn new --cwd C:\work --name work
+  qscn --prefix C-a attach 1   # Ctrl+A をプレフィックスに session_id=1 へ接続
+  qscn attach 1                # session_id=1 に再接続
+  qscn rename 1 work           # session_id=1 の表示名を変更
+  qscn ls                      # 全セッションの状態を表示
+  qscn kill 1                  # session_id=1 を終了
+"#
+}
+
+fn help_text_es() -> &'static str {
+    r#"qscreen — gestor ligero de sesiones de terminal
+
+Uso:
+  qscn [--prefix C-b]          inicio inteligente: crea y entra si no hay sesiones,
+                            se conecta si hay una, las lista todas si hay varias
+  qscn [--prefix C-b] new
+                               crea una sesión con nombre automático y se conecta
+  qscn [--prefix C-b] new --name <name>
+                               especifica el nombre visible como opción
+  qscn [--prefix C-b] new --shell <shell>
+                               especifica el shell de inicio (Windows: cmd, powershell o ruta de ejecutable; Unix: ruta del shell)
+  qscn [--prefix C-b] new --cwd <path>
+                               especifica el directorio de trabajo de la sesión
+  qscn [--prefix C-b] attach [session_id]
+                               se conecta a una sesión existente; sin session_id, a la de mayor ID disponible (alias: att)
+  qscn [--prefix C-b] -r [session_id]
+                               igual que attach (forma breve estilo tmux)
+  qscn ls                      lista todas las sesiones (alias: list)
+  qscn list                    lista todas las sesiones
+  qscn kill <session_id>       termina una sesión de forma forzada
+  qscn rename <session_id> <name>
+                               cambia el nombre visible de una sesión
+  qscn shutdown                detiene el daemon en segundo plano (cierra todas las sesiones)
+  qscn -h, --help              muestra esta ayuda
+  qscn -V, --version           muestra la versión
+
+Prefijo:
+  el prefijo por defecto es Ctrl+B (C-b)
+  --prefix C-a                 usa Ctrl+A como prefijo de sesión para esta orden
+  QSCREEN_PREFIX=C-a           define un prefijo alternativo para todas las órdenes
+  Valores: C-a..C-z o Ctrl+A..Ctrl+Z; la CLI tiene prioridad sobre el entorno
+
+Barra de estado:
+  al estar conectado, la fila inferior lista las sesiones (* marca la actual), se actualiza cada 2s
+  --status-bar off             desactiva la barra de estado para esta orden
+  QSCREEN_STATUS_BAR=off       desactiva la barra de estado para todas las órdenes
+  Valores: on|off; la CLI tiene prioridad sobre el entorno; se desactiva con menos de 3 filas
+
+Atajos (prefijo por defecto Ctrl+B; pulsa el prefijo y luego la tecla):
+%PREFIX_BINDINGS%
+
+Formato de salida de ls:
+  <session_id>  <name>  <estado>  <creación>  <tamaño-terminal>
+  estados: attached | detached | exited(<código>)
+
+Ejemplos:
+  qscn                         # conecta automáticamente o crea una sesión con nombre automático
+  qscn new                     # crea una sesión con session_id asignado automáticamente
+  qscn new --name work         # crea una sesión con nombre visible 'work'
+  qscn new --shell cmd --name work
+  qscn new --cwd C:\work --name work
+  qscn --prefix C-a attach 1   # se conecta a session_id=1 usando Ctrl+A como prefijo
+  qscn attach 1                # se reconecta a session_id=1
+  qscn rename 1 work           # cambia el nombre visible de session_id=1
+  qscn ls                      # muestra el estado de todas las sesiones
+  qscn kill 1                  # termina session_id=1
+"#
+}
+
+fn help_text_de() -> &'static str {
+    r#"qscreen — schlanker Terminal-Sitzungsmanager
+
+Verwendung:
+  qscn [--prefix C-b]          Smart-Start: ohne Sitzung neu erstellen und betreten,
+                            bei einer verbinden, bei mehreren alle auflisten
+  qscn [--prefix C-b] new
+                               erstellt eine automatisch benannte Sitzung und verbindet
+  qscn [--prefix C-b] new --name <name>
+                               legt den Anzeigenamen als Option fest
+  qscn [--prefix C-b] new --shell <shell>
+                               legt die Start-Shell fest (Windows: cmd, powershell oder Pfad zur EXE; Unix: Shell-Pfad)
+  qscn [--prefix C-b] new --cwd <path>
+                               legt das Arbeitsverzeichnis der Sitzung fest
+  qscn [--prefix C-b] attach [session_id]
+                               verbindet mit einer Sitzung; ohne session_id mit der verfügbaren mit höchster ID (Alias: att)
+  qscn [--prefix C-b] -r [session_id]
+                               wie attach (tmux-artige Kurzform)
+  qscn ls                      listet alle Sitzungen (Alias: list)
+  qscn list                    listet alle Sitzungen
+  qscn kill <session_id>       beendet eine Sitzung erzwungen
+  qscn rename <session_id> <name>
+                               ändert den Anzeigenamen einer Sitzung
+  qscn shutdown                stoppt den Hintergrund-Daemon (schließt alle Sitzungen)
+  qscn -h, --help              zeigt diese Hilfe
+  qscn -V, --version           zeigt die Version
+
+Präfix:
+  Standardpräfix ist Ctrl+B (C-b)
+  --prefix C-a                 verwendet Ctrl+A als Sitzungspräfix für diesen Befehl
+  QSCREEN_PREFIX=C-a           legt ein Ersatzpräfix für alle Befehle fest
+  Werte: C-a..C-z oder Ctrl+A..Ctrl+Z; CLI hat Vorrang vor der Umgebung
+
+Statusleiste:
+  im verbundenen Zustand listet die unterste Zeile die Sitzungen (* markiert die aktuelle), Aktualisierung alle 2s
+  --status-bar off             deaktiviert die Statusleiste für diesen Befehl
+  QSCREEN_STATUS_BAR=off       deaktiviert die Statusleiste für alle Befehle
+  Werte: on|off; CLI hat Vorrang vor der Umgebung; deaktiviert bei weniger als 3 Zeilen
+
+Tastenkürzel (Standardpräfix Ctrl+B; Präfix drücken, dann die Taste):
+%PREFIX_BINDINGS%
+
+ls-Ausgabeformat:
+  <session_id>  <name>  <Status>  <Erstellt-am>  <Terminalgröße>
+  Status: attached | detached | exited(<Code>)
+
+Beispiele:
+  qscn                         # automatisch verbinden oder automatisch benannte Sitzung erstellen
+  qscn new                     # Sitzung mit automatisch vergebener session_id erstellen
+  qscn new --name work         # Sitzung mit Anzeigenamen 'work' erstellen
+  qscn new --shell cmd --name work
+  qscn new --cwd C:\work --name work
+  qscn --prefix C-a attach 1   # mit Ctrl+A als Präfix zu session_id=1 verbinden
+  qscn attach 1                # erneut zu session_id=1 verbinden
+  qscn rename 1 work           # Anzeigenamen von session_id=1 ändern
+  qscn ls                      # Status aller Sitzungen anzeigen
+  qscn kill 1                  # session_id=1 beenden
+"#
+}
+
+fn help_text_fr() -> &'static str {
+    r#"qscreen — gestionnaire léger de sessions de terminal
+
+Utilisation:
+  qscn [--prefix C-b]          lancement intelligent : crée et entre si aucune session,
+                            attache s'il y en a une, liste tout s'il y en a plusieurs
+  qscn [--prefix C-b] new
+                               crée une session nommée automatiquement et l'attache
+  qscn [--prefix C-b] new --name <name>
+                               définit le nom affiché en option
+  qscn [--prefix C-b] new --shell <shell>
+                               définit le shell de démarrage (Windows : cmd, powershell ou chemin d'exécutable ; Unix : chemin du shell)
+  qscn [--prefix C-b] new --cwd <path>
+                               définit le répertoire de travail de la session
+  qscn [--prefix C-b] attach [session_id]
+                               attache une session existante ; sans session_id, celle de plus grand ID disponible (alias : att)
+  qscn [--prefix C-b] -r [session_id]
+                               identique à attach (forme courte style tmux)
+  qscn ls                      liste toutes les sessions (alias : list)
+  qscn list                    liste toutes les sessions
+  qscn kill <session_id>       arrête une session de force
+  qscn rename <session_id> <name>
+                               change le nom affiché d'une session
+  qscn shutdown                arrête le daemon en arrière-plan (ferme toutes les sessions)
+  qscn -h, --help              affiche cette aide
+  qscn -V, --version           affiche la version
+
+Préfixe:
+  le préfixe par défaut est Ctrl+B (C-b)
+  --prefix C-a                 utilise Ctrl+A comme préfixe de session pour cette commande
+  QSCREEN_PREFIX=C-a           définit un préfixe de secours pour toutes les commandes
+  Valeurs : C-a..C-z ou Ctrl+A..Ctrl+Z ; la CLI est prioritaire sur l'environnement
+
+Barre d'état:
+  une fois attaché, la ligne du bas liste les sessions (* indique l'actuelle), rafraîchie toutes les 2s
+  --status-bar off             désactive la barre d'état pour cette commande
+  QSCREEN_STATUS_BAR=off       désactive la barre d'état pour toutes les commandes
+  Valeurs : on|off ; la CLI est prioritaire sur l'environnement ; désactivée en dessous de 3 lignes
+
+Raccourcis (préfixe par défaut Ctrl+B ; appuyez sur le préfixe, puis la touche):
+%PREFIX_BINDINGS%
+
+Format de sortie de ls:
+  <session_id>  <name>  <état>  <créée-le>  <taille-terminal>
+  états : attached | detached | exited(<code>)
+
+Exemples:
+  qscn                         # attache automatiquement ou crée une session nommée automatiquement
+  qscn new                     # crée une session avec un session_id attribué automatiquement
+  qscn new --name work         # crée une session avec le nom affiché 'work'
+  qscn new --shell cmd --name work
+  qscn new --cwd C:\work --name work
+  qscn --prefix C-a attach 1   # attache session_id=1 en utilisant Ctrl+A comme préfixe
+  qscn attach 1                # rattache session_id=1
+  qscn rename 1 work           # change le nom affiché de session_id=1
+  qscn ls                      # affiche l'état de toutes les sessions
+  qscn kill 1                  # arrête session_id=1
 "#
 }
 
@@ -783,11 +1494,7 @@ async fn cmd_attach_default(config: ClientConfig) -> anyhow::Result<()> {
     loop {
         let sessions = list_sessions().await?;
         let Some(session_id) = highest_live_session_id_excluding(&sessions, &skip) else {
-            if is_chinese() {
-                anyhow::bail!("没有可用的 session")
-            } else {
-                anyhow::bail!("no attachable session")
-            }
+            anyhow::bail!("{}", MSG_NO_ATTACHABLE.get(language()))
         };
         match attach_session_loop(&session_id, config, None).await {
             Ok(()) => return Ok(()),
@@ -927,7 +1634,7 @@ fn format_session_line(s: &SessionInfo) -> String {
         s.name,
         // The `qscn list` textual output stays English so it remains a stable,
         // script-parseable format regardless of locale.
-        session_state_label(s, false),
+        session_state_label(s, Lang::En),
         session_created_label(s),
         session_size_label(s),
         session_cwd_label(s)
@@ -941,7 +1648,7 @@ fn colored_session_line(s: &SessionInfo) -> String {
         color::paint(&s.session_id, color::sgr::ID),
         color::paint(&s.name, color::sgr::NAME),
         color::paint(
-            &session_state_label(s, false),
+            &session_state_label(s, Lang::En),
             color::state_sgr(s.exited, s.attached)
         ),
         color::paint(&session_created_label(s), color::sgr::CREATED),
@@ -1000,14 +1707,14 @@ enum SessionListSelection {
 fn build_session_list_rows(
     sessions: &[SessionInfo],
     current_session_id: &str,
-    zh: bool,
+    lang: Lang,
 ) -> Vec<SessionListRow> {
     let mut rows: Vec<SessionListRow> = sessions
         .iter()
         .map(|session| SessionListRow {
             session_id: session.session_id.clone(),
             name: session.name.clone(),
-            state: session_state_label(session, zh),
+            state: session_state_label(session, lang),
             size: session_size_label(session),
             cwd: session_cwd_label(session),
             cwd_raw: session.cwd.clone(),
@@ -1020,19 +1727,15 @@ fn build_session_list_rows(
     rows
 }
 
-fn session_state_label(session: &SessionInfo, zh: bool) -> String {
+fn session_state_label(session: &SessionInfo, lang: Lang) -> String {
     if session.exited {
-        if zh {
-            format!("已退出({})", session.exit_code)
-        } else {
-            format!("exited({})", session.exit_code)
-        }
+        MSG_STATE_EXITED
+            .get(lang)
+            .replace("{code}", &session.exit_code.to_string())
     } else if session.attached {
-        if zh { "已连接" } else { "attached" }.to_string()
-    } else if zh {
-        "未连接".to_string()
+        MSG_STATE_ATTACHED.get(lang).to_string()
     } else {
-        "detached".to_string()
+        MSG_STATE_DETACHED.get(lang).to_string()
     }
 }
 
@@ -1426,19 +2129,44 @@ fn no_flicker_enabled_in(settings: &serde_json::Value) -> bool {
 
 /// Build the colored multi-line hint. Uses `\r\n` line endings so it lays out
 /// correctly under raw mode, where a bare `\n` does not return the carriage.
+const NOTICE_TITLE: L7 = L7 {
+    en: "⚠  Claude Code has not enabled CLAUDE_CODE_NO_FLICKER",
+    zh_hans: "⚠  Claude Code 未启用 CLAUDE_CODE_NO_FLICKER",
+    zh_hant: "⚠  Claude Code 未啟用 CLAUDE_CODE_NO_FLICKER",
+    ja: "⚠  Claude Code で CLAUDE_CODE_NO_FLICKER が有効になっていません",
+    es: "⚠  Claude Code no tiene habilitado CLAUDE_CODE_NO_FLICKER",
+    de: "⚠  Claude Code hat CLAUDE_CODE_NO_FLICKER nicht aktiviert",
+    fr: "⚠  Claude Code n'a pas activé CLAUDE_CODE_NO_FLICKER",
+};
+
+// Two lines joined by CRLF; the JSON snippet is inserted after them.
+const NOTICE_BODY: L7 = L7 {
+    en: "In a qscn session, Claude Code keys such as PageUp/PageDown need this setting to work.\r\nStrongly recommend adding this under \"env\" in ~/.claude/settings.json:",
+    zh_hans: "在 qscn 会话中,Claude Code 的 PageUp/PageDown 等按键需要该设置才能正常工作。\r\n强烈建议在 ~/.claude/settings.json 的 \"env\" 中加入:",
+    zh_hant: "在 qscn 工作階段中,Claude Code 的 PageUp/PageDown 等按鍵需要此設定才能正常運作。\r\n強烈建議在 ~/.claude/settings.json 的 \"env\" 中加入:",
+    ja: "qscn セッションでは、Claude Code の PageUp/PageDown などのキーはこの設定がないと動作しません。\r\n~/.claude/settings.json の \"env\" に次を追加することを強く推奨します:",
+    es: "En una sesión de qscn, teclas de Claude Code como PageUp/PageDown necesitan este ajuste para funcionar.\r\nSe recomienda añadir esto bajo \"env\" en ~/.claude/settings.json:",
+    de: "In einer qscn-Sitzung benötigen Claude-Code-Tasten wie PageUp/PageDown diese Einstellung.\r\nDringend empfohlen, dies unter \"env\" in ~/.claude/settings.json hinzuzufügen:",
+    fr: "Dans une session qscn, des touches de Claude Code comme PageUp/PageDown nécessitent ce réglage.\r\nAjout fortement recommandé sous \"env\" dans ~/.claude/settings.json :",
+};
+
+const NOTICE_CONTINUE: L7 = L7 {
+    en: "press any key to enter the session . . .",
+    zh_hans: "按任意键进入会话 . . .",
+    zh_hant: "按任意鍵進入工作階段 . . .",
+    ja: "任意のキーでセッションに入ります . . .",
+    es: "pulsa cualquier tecla para entrar en la sesión . . .",
+    de: "beliebige Taste zum Betreten der Sitzung . . .",
+    fr: "appuyez sur une touche pour entrer dans la session . . .",
+};
+
 fn build_no_flicker_notice() -> String {
-    let title = color::paint(
-        "⚠  Claude Code 未启用 CLAUDE_CODE_NO_FLICKER",
-        color::sgr::ERROR,
-    );
+    let lang = language();
+    let title = color::paint(NOTICE_TITLE.get(lang), color::sgr::ERROR);
+    let body = NOTICE_BODY.get(lang);
     let snippet = color::paint("\"CLAUDE_CODE_NO_FLICKER\": \"1\"", color::sgr::KEY);
-    let cont = color::paint("按任意键进入会话 . . .", color::sgr::HINT);
-    format!(
-        "{title}\r\n\r\n\
-         在 qscn 会话中,Claude Code 的 PageUp/PageDown 等按键需要该设置才能正常工作。\r\n\
-         强烈建议在 ~/.claude/settings.json 的 \"env\" 中加入:\r\n\r\n    \
-         {snippet}\r\n\r\n{cont}"
-    )
+    let cont = color::paint(NOTICE_CONTINUE.get(lang), color::sgr::HINT);
+    format!("{title}\r\n\r\n{body}\r\n\r\n    {snippet}\r\n\r\n{cont}")
 }
 
 /// Print the hint to the alternate screen and block until any key is pressed.
@@ -2681,20 +3409,12 @@ fn render_help_screen<W: Write>(
     term_size: (u16, u16),
 ) -> std::io::Result<()> {
     let (cols, rows_count) = term_size;
-    let zh = is_chinese();
+    let lang = language();
     write!(out, "\x1b[?2026h\x1b[0m\x1b[2J\x1b[H")?;
 
-    let title = if zh {
-        "qscreen 快捷键"
-    } else {
-        "qscreen key bindings"
-    };
-    let hint = if zh {
-        "按 Esc 或 q 关闭"
-    } else {
-        "press Esc or q to close"
-    };
-    let rows = prefix_help_rows(prefix, zh);
+    let title = MSG_HELP_TITLE.get(lang);
+    let hint = MSG_HELP_HINT.get(lang);
+    let rows = prefix_help_rows(prefix, lang);
 
     // Assemble the body (title, blank separator, bindings), then trim it to fit
     // above the pinned hint row so nothing scrolls off a short terminal.
@@ -2749,37 +3469,37 @@ async fn run_session_list_mode<W: Write>(
     stdout: &mut W,
 ) -> anyhow::Result<SessionListSelection> {
     let mut term_size = term_size;
-    let zh = is_chinese();
-    let mut rows = build_session_list_rows(&list_sessions().await?, current_session_id, zh);
+    let lang = language();
+    let mut rows = build_session_list_rows(&list_sessions().await?, current_session_id, lang);
     let mut selected = rows
         .iter()
         .position(|row| row.is_current)
         .unwrap_or_default();
-    let mut status = String::new();
+    let mut status = StatusLine::empty();
 
-    render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
+    render_session_list(stdout, &rows, selected, &status, term_size, lang)?;
 
     loop {
         let action = read_session_list_action().await?;
         match action {
             SessionListAction::MoveUp => {
                 selected = move_session_list_selection(selected, rows.len(), -1);
-                render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
+                render_session_list(stdout, &rows, selected, &status, term_size, lang)?;
             }
             SessionListAction::MoveDown => {
                 selected = move_session_list_selection(selected, rows.len(), 1);
-                render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
+                render_session_list(stdout, &rows, selected, &status, term_size, lang)?;
             }
             SessionListAction::Cancel => return Ok(SessionListSelection::Close),
             SessionListAction::Help => {
                 // The help overlay owns the screen until dismissed, then the
                 // list repaints so the user comes back where they left off.
                 term_size = run_help_mode(prefix, term_size, stdout).await?;
-                render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
+                render_session_list(stdout, &rows, selected, &status, term_size, lang)?;
             }
             SessionListAction::Resize(cols, rows_count) => {
                 term_size = (cols, rows_count);
-                render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
+                render_session_list(stdout, &rows, selected, &status, term_size, lang)?;
             }
             SessionListAction::Create => {
                 // Inherit the cwd of the session under the cursor so the new session opens in the same directory;
@@ -2788,84 +3508,80 @@ async fn run_session_list_mode<W: Write>(
                 match create_session_in(inherit_cwd.as_deref()).await {
                     Ok(new_session_id) => return Ok(SessionListSelection::Switch(new_session_id)),
                     Err(e) => {
-                        status = if zh {
-                            format!("新建失败: {e}")
-                        } else {
-                            format!("create failed: {e}")
-                        };
-                        render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
+                        status = StatusLine::error(
+                            MSG_CREATE_FAILED.get(lang).replace("{err}", &e.to_string()),
+                        );
+                        render_session_list(stdout, &rows, selected, &status, term_size, lang)?;
                     }
                 }
             }
             SessionListAction::Rename => {
                 if rows.is_empty() {
-                    status = if zh { "无会话" } else { "no sessions" }.to_string();
-                    render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
+                    status = StatusLine::error(MSG_NO_SESSIONS.get(lang).to_string());
+                    render_session_list(stdout, &rows, selected, &status, term_size, lang)?;
                     continue;
                 }
                 selected = selected.min(rows.len() - 1);
                 let row = rows[selected].clone();
                 if row.exited {
-                    status = if zh {
-                        "无法重命名已退出的会话"
-                    } else {
-                        "cannot rename an exited session"
-                    }
-                    .to_string();
-                    render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
+                    status = StatusLine::error(MSG_CANNOT_RENAME_EXITED.get(lang).to_string());
+                    render_session_list(stdout, &rows, selected, &status, term_size, lang)?;
                     continue;
                 }
-                match prompt_session_rename(stdout, &rows, selected, &mut term_size, &row.name, zh)
-                    .await?
+                match prompt_session_rename(
+                    stdout,
+                    &rows,
+                    selected,
+                    &mut term_size,
+                    &row.name,
+                    lang,
+                )
+                .await?
                 {
                     Some(new_name) => match rename_session(&row.session_id, &new_name).await {
                         Ok(()) => {
                             rows = build_session_list_rows(
                                 &list_sessions().await?,
                                 current_session_id,
-                                zh,
+                                lang,
                             );
                             selected = rows
                                 .iter()
                                 .position(|r| r.session_id == row.session_id)
                                 .unwrap_or_else(|| selected.min(rows.len().saturating_sub(1)));
-                            status = if zh {
-                                format!("已重命名为 \"{new_name}\"")
-                            } else {
-                                format!("renamed to \"{new_name}\"")
-                            };
+                            status = StatusLine::success(
+                                MSG_RENAMED.get(lang).replace("{name}", &new_name),
+                            );
                         }
                         Err(e) => {
-                            status = if zh {
-                                format!("重命名失败: {e}")
-                            } else {
-                                format!("rename failed: {e}")
-                            }
+                            status = StatusLine::error(
+                                MSG_RENAME_FAILED.get(lang).replace("{err}", &e.to_string()),
+                            );
                         }
                     },
-                    None => status = String::new(),
+                    None => status = StatusLine::empty(),
                 }
-                render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
+                render_session_list(stdout, &rows, selected, &status, term_size, lang)?;
             }
             SessionListAction::Kill => {
                 if rows.is_empty() {
-                    status = if zh { "无会话" } else { "no sessions" }.to_string();
-                    render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
+                    status = StatusLine::error(MSG_NO_SESSIONS.get(lang).to_string());
+                    render_session_list(stdout, &rows, selected, &status, term_size, lang)?;
                     continue;
                 }
                 selected = selected.min(rows.len() - 1);
                 let row = rows[selected].clone();
-                if !prompt_session_kill_confirm(stdout, &rows, selected, &mut term_size, &row, zh)
+                if !prompt_session_kill_confirm(stdout, &rows, selected, &mut term_size, &row, lang)
                     .await?
                 {
-                    status = String::new();
-                    render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
+                    status = StatusLine::empty();
+                    render_session_list(stdout, &rows, selected, &status, term_size, lang)?;
                     continue;
                 }
                 match cmd_kill(&row.session_id).await {
                     Ok(()) => {
                         let sessions = list_sessions().await?;
-                        rows = build_session_list_rows(&sessions, current_session_id, zh);
+                        rows = build_session_list_rows(&sessions, current_session_id, lang);
                         if rows.is_empty() {
                             // The last session is gone: exit qscn and let the
                             // daemon shut down like the normal no-sessions path.
@@ -2884,34 +3600,29 @@ async fn run_session_list_mode<W: Write>(
                             }
                         }
                         selected = selected.min(rows.len() - 1);
-                        status = if zh {
-                            format!("已终止 \"{}\"", row.name)
-                        } else {
-                            format!("killed \"{}\"", row.name)
-                        };
+                        status =
+                            StatusLine::hint(MSG_KILLED.get(lang).replace("{name}", &row.name));
                     }
                     Err(e) => {
-                        status = if zh {
-                            format!("终止失败: {e}")
-                        } else {
-                            format!("kill failed: {e}")
-                        }
+                        status = StatusLine::error(
+                            MSG_KILL_FAILED.get(lang).replace("{err}", &e.to_string()),
+                        );
                     }
                 }
-                render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
+                render_session_list(stdout, &rows, selected, &status, term_size, lang)?;
             }
             SessionListAction::Select => {
                 if rows.is_empty() {
-                    status = if zh { "无会话" } else { "no sessions" }.to_string();
-                    render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
+                    status = StatusLine::error(MSG_NO_SESSIONS.get(lang).to_string());
+                    render_session_list(stdout, &rows, selected, &status, term_size, lang)?;
                     continue;
                 }
 
-                rows = build_session_list_rows(&list_sessions().await?, current_session_id, zh);
+                rows = build_session_list_rows(&list_sessions().await?, current_session_id, lang);
                 if rows.is_empty() {
                     selected = 0;
-                    status = if zh { "无会话" } else { "no sessions" }.to_string();
-                    render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
+                    status = StatusLine::error(MSG_NO_SESSIONS.get(lang).to_string());
+                    render_session_list(stdout, &rows, selected, &status, term_size, lang)?;
                     continue;
                 }
                 selected = selected.min(rows.len().saturating_sub(1));
@@ -2927,17 +3638,16 @@ async fn run_session_list_mode<W: Write>(
                         return Ok(SessionListSelection::SwitchFresh(name));
                     }
                     SessionListSelection::Quit => return Ok(SessionListSelection::Quit),
-                    SessionListSelection::Error(error) => {
-                        // `error` is the protocol's English exited-session message
-                        // (equality-matched elsewhere, so it must not change).
-                        // Show a localized message in the overlay instead; both
-                        // wordings are classified as errors by `status_style`.
-                        status = if zh {
-                            format!("会话 {:?} 已退出", rows[selected].session_id)
-                        } else {
-                            error.clone()
-                        };
-                        render_session_list(stdout, &rows, selected, &status, term_size, zh)?;
+                    SessionListSelection::Error(_) => {
+                        // The protocol's exited-session message is equality-matched
+                        // elsewhere and stays English; show a localized, error-colored
+                        // message in the overlay instead.
+                        status = StatusLine::error(
+                            MSG_SESSION_EXITED
+                                .get(lang)
+                                .replace("{id}", &rows[selected].session_id),
+                        );
+                        render_session_list(stdout, &rows, selected, &status, term_size, lang)?;
                     }
                 }
             }
@@ -3043,7 +3753,7 @@ async fn prompt_session_rename<W: Write>(
     selected: usize,
     term_size: &mut (u16, u16),
     old_name: &str,
-    zh: bool,
+    lang: Lang,
 ) -> anyhow::Result<Option<String>> {
     let mut input = String::new();
     loop {
@@ -3052,23 +3762,15 @@ async fn prompt_session_rename<W: Write>(
         // distinct: the label is prominent (yellow), the typed input uses a
         // separate prominent color (cyan) with a `_` caret, and the key hint
         // stays dim. Concatenated their text matches the original single line.
-        let label = if zh {
-            format!("重命名 \"{old_name}\" -> ")
-        } else {
-            format!("rename \"{old_name}\" -> ")
-        };
-        let hint = if zh {
-            "  (Enter 确认, Esc 取消)"
-        } else {
-            "  (Enter confirm, Esc cancel)"
-        };
+        let label = MSG_RENAME_LABEL.get(lang).replace("{old}", old_name);
+        let hint = MSG_RENAME_HINT.get(lang);
         let input_field = format!("{input}_");
         let segments = [
             (label.as_str(), color::sgr::PROMPT),
             (input_field.as_str(), color::sgr::INPUT),
             (hint, color::sgr::HINT),
         ];
-        render_session_list_with_status(stdout, rows, selected, &segments, *term_size, zh)?;
+        render_session_list_with_status(stdout, rows, selected, &segments, *term_size, lang)?;
         match read_name_edit_key().await? {
             NameEditKey::Submit => {
                 let trimmed = input.trim();
@@ -3105,26 +3807,21 @@ async fn prompt_session_kill_confirm<W: Write>(
     selected: usize,
     term_size: &mut (u16, u16),
     row: &SessionListRow,
-    zh: bool,
+    lang: Lang,
 ) -> anyhow::Result<bool> {
     loop {
         // The label uses the error color to flag the destructive action; the
         // key hint stays dim like the rename prompt.
-        let label = if zh {
-            format!("终止 \"{}\" (会话 {})? ", row.name, row.session_id)
-        } else {
-            format!("kill \"{}\" (session {})? ", row.name, row.session_id)
-        };
-        let hint = if zh {
-            "(y 确认, Esc 取消)"
-        } else {
-            "(y confirm, Esc cancel)"
-        };
+        let label = MSG_KILL_LABEL
+            .get(lang)
+            .replace("{name}", &row.name)
+            .replace("{id}", &row.session_id);
+        let hint = MSG_KILL_HINT.get(lang);
         let segments = [
             (label.as_str(), color::sgr::ERROR),
             (hint, color::sgr::HINT),
         ];
-        render_session_list_with_status(stdout, rows, selected, &segments, *term_size, zh)?;
+        render_session_list_with_status(stdout, rows, selected, &segments, *term_size, lang)?;
         match read_kill_confirm_key().await? {
             ConfirmKey::Confirm => return Ok(true),
             ConfirmKey::Cancel => return Ok(false),
@@ -3178,6 +3875,45 @@ async fn read_kill_confirm_key() -> anyhow::Result<ConfirmKey> {
     .await?
 }
 
+/// A bottom status line for the session list: its text plus the SGR color for
+/// its kind. The color is chosen at the call site (error/success/neutral)
+/// instead of guessed from the wording, so it is language-independent.
+#[derive(Clone)]
+struct StatusLine {
+    text: String,
+    sgr: &'static str,
+}
+
+impl StatusLine {
+    fn empty() -> Self {
+        Self {
+            text: String::new(),
+            sgr: color::sgr::HINT,
+        }
+    }
+    fn hint(text: String) -> Self {
+        Self {
+            text,
+            sgr: color::sgr::HINT,
+        }
+    }
+    fn error(text: String) -> Self {
+        Self {
+            text,
+            sgr: color::sgr::ERROR,
+        }
+    }
+    fn success(text: String) -> Self {
+        Self {
+            text,
+            sgr: color::sgr::SUCCESS,
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+}
+
 /// Total visible width of all fixed columns before cwd in a session list row.
 /// Layout: `{sel:1} {cur:1} {id:<4} {name:<24} {state:<14} {size:>8}  {cwd}`
 /// = 1+1 +1+1 +4+1 +24+1 +14+1 +8+2 = 59.
@@ -3187,23 +3923,17 @@ fn render_session_list<W: Write>(
     out: &mut W,
     rows: &[SessionListRow],
     selected: usize,
-    status: &str,
+    status: &StatusLine,
     term_size: (u16, u16),
-    zh: bool,
+    lang: Lang,
 ) -> std::io::Result<()> {
-    // The whole status line shares one content-derived color; the empty status
-    // falls back to the dim "* marks current session" hint.
+    // An empty status falls back to the dim "current session" marker hint.
     let (text, sgr) = if status.is_empty() {
-        let marker = if zh {
-            "* 表示当前会话"
-        } else {
-            "* marks current session"
-        };
-        (marker, color::sgr::HINT)
+        (MSG_MARKS_CURRENT.get(lang), color::sgr::HINT)
     } else {
-        (status, status_style(status))
+        (status.text.as_str(), status.sgr)
     };
-    render_session_list_with_status(out, rows, selected, &[(text, sgr)], term_size, zh)
+    render_session_list_with_status(out, rows, selected, &[(text, sgr)], term_size, lang)
 }
 
 /// Same as [`render_session_list`], but the bottom status line is a sequence of
@@ -3216,7 +3946,7 @@ fn render_session_list_with_status<W: Write>(
     selected: usize,
     status_segments: &[(&str, &str)],
     term_size: (u16, u16),
-    zh: bool,
+    lang: Lang,
 ) -> std::io::Result<()> {
     let (cols, rows_count) = term_size;
     write!(out, "\x1b[?2026h\x1b[0m\x1b[2J\x1b[H")?;
@@ -3231,15 +3961,15 @@ fn render_session_list_with_status<W: Write>(
         session_list_viewport(budget.saturating_sub(header_len), body_len, selected);
 
     if header_len >= 1 {
-        let title = if zh {
-            "qscreen 会话列表"
-        } else {
-            "qscreen sessions"
-        };
-        write_text_line(out, title, Some(color::sgr::HEADER), cols)?;
+        write_text_line(
+            out,
+            MSG_LIST_TITLE.get(lang),
+            Some(color::sgr::HEADER),
+            cols,
+        )?;
     }
     if header_len >= 2 {
-        write_session_list_hint(out, cols, zh)?;
+        write_session_list_hint(out, cols, lang)?;
     }
     if header_len >= 3 {
         write_text_line(out, "", None, cols)?;
@@ -3247,8 +3977,8 @@ fn render_session_list_with_status<W: Write>(
 
     if rows.is_empty() {
         if visible > 0 {
-            let empty = if zh { "  无会话" } else { "  no sessions" };
-            write_text_line(out, empty, Some(color::sgr::HINT), cols)?;
+            let empty = format!("  {}", MSG_NO_SESSIONS.get(lang));
+            write_text_line(out, &empty, Some(color::sgr::HINT), cols)?;
         }
     } else {
         for (idx, row) in rows.iter().enumerate().skip(start).take(visible) {
@@ -3332,77 +4062,34 @@ fn write_status_segments<W: Write>(
     Ok(())
 }
 
-/// Pick the status line color by content: errors=red, successful rename=green,
-/// everything else=dim hint. Matches both the English and Chinese status
-/// messages produced by the session list.
-fn status_style(status: &str) -> &'static str {
-    let lower = status.to_ascii_lowercase();
-    let is_error = lower.contains("fail")
-        || lower.contains("cannot")
-        || lower.contains("error")
-        || lower.contains("no sessions")
-        || lower.contains("has exited")
-        || status.contains("失败")
-        || status.contains("无法")
-        || status.contains("无会话")
-        || status.contains("已退出");
-    let is_success = lower.starts_with("renamed") || status.starts_with("已重命名");
-    if is_error {
-        color::sgr::ERROR
-    } else if is_success {
-        color::sgr::SUCCESS
-    } else {
-        color::sgr::HINT
-    }
-}
-
 /// The session list's action hint line: highlight shortcut fragments (bold yellow) while keeping description text dim.
 /// In a colorless environment it degrades to plain text with the same visible width, so the layout is unaffected.
-fn write_session_list_hint<W: Write>(out: &mut W, cols: u16, zh: bool) -> std::io::Result<()> {
+fn write_session_list_hint<W: Write>(out: &mut W, cols: u16, lang: Lang) -> std::io::Result<()> {
     // (fragment text, whether it is a shortcut key). Concatenated they form the
     // hint string, so it can be truncated by visible width. The shortcut keys
     // stay identical across languages; only the descriptions are translated.
-    const SEGMENTS_EN: &[(&str, bool)] = &[
+    let segments: [(&str, bool); 16] = [
         ("Up/Down", true),
-        (" or ", false),
+        (HINT_OR.get(lang), false),
         ("k/j", true),
         (", ", false),
         ("Enter", true),
-        (" switch, ", false),
+        (HINT_SWITCH.get(lang), false),
         ("c", true),
-        (" create, ", false),
+        (HINT_CREATE.get(lang), false),
         ("r", true),
-        (" rename, ", false),
+        (HINT_RENAME.get(lang), false),
         ("x", true),
-        (" kill, ", false),
+        (HINT_KILL.get(lang), false),
         ("?", true),
-        (" help, ", false),
+        (HINT_HELP.get(lang), false),
         ("Esc/q", true),
-        (" cancel", false),
+        (HINT_CANCEL.get(lang), false),
     ];
-    const SEGMENTS_ZH: &[(&str, bool)] = &[
-        ("Up/Down", true),
-        (" 或 ", false),
-        ("k/j", true),
-        (", ", false),
-        ("Enter", true),
-        (" 切换, ", false),
-        ("c", true),
-        (" 新建, ", false),
-        ("r", true),
-        (" 改名, ", false),
-        ("x", true),
-        (" 终止, ", false),
-        ("?", true),
-        (" 帮助, ", false),
-        ("Esc/q", true),
-        (" 取消", false),
-    ];
-    let segments = if zh { SEGMENTS_ZH } else { SEGMENTS_EN };
     let limit = cols as usize;
     let mut content = String::new();
     let mut visible = 0usize;
-    for (text, is_key) in segments {
+    for (text, is_key) in &segments {
         if visible >= limit {
             break;
         }
@@ -4121,7 +4808,7 @@ mod tests {
         // In a colorless environment (the test default), the hint line should be plain text, right-padded with spaces to fill the whole line.
         let cols = 80u16;
         let mut out = Vec::new();
-        write_session_list_hint(&mut out, cols, false).unwrap();
+        write_session_list_hint(&mut out, cols, Lang::En).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(rendered.ends_with("\r\n"));
         let line = rendered.strip_suffix("\r\n").unwrap();
@@ -4142,7 +4829,7 @@ mod tests {
         // and still pads to the full terminal width.
         let cols = 80u16;
         let mut out = Vec::new();
-        write_session_list_hint(&mut out, cols, true).unwrap();
+        write_session_list_hint(&mut out, cols, Lang::ZhHans).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         let line = rendered.strip_suffix("\r\n").unwrap();
         assert!(
@@ -4161,7 +4848,7 @@ mod tests {
         const FULL: &str = "Up/Down 或 k/j, Enter 切换, c 新建, r 改名, x 终止, ? 帮助, Esc/q 取消";
         let cols = 23u16;
         let mut out = Vec::new();
-        write_session_list_hint(&mut out, cols, true).unwrap();
+        write_session_list_hint(&mut out, cols, Lang::ZhHans).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         let line = rendered.strip_suffix("\r\n").unwrap();
         let stripped = line.trim_start_matches("\x1b[0m");
@@ -4170,33 +4857,49 @@ mod tests {
     }
 
     #[test]
-    fn session_state_label_translates_when_chinese() {
+    fn session_state_label_translates_per_language() {
         let attached = session("1", "a", true, false, 80, 24);
         let detached = session("2", "b", false, false, 80, 24);
         let exited = session("3", "c", false, true, 80, 24);
-        assert_eq!(session_state_label(&attached, false), "attached");
-        assert_eq!(session_state_label(&attached, true), "已连接");
-        assert_eq!(session_state_label(&detached, true), "未连接");
+        assert_eq!(session_state_label(&attached, Lang::En), "attached");
+        assert_eq!(session_state_label(&attached, Lang::ZhHans), "已连接");
+        assert_eq!(session_state_label(&attached, Lang::ZhHant), "已連線");
+        assert_eq!(session_state_label(&attached, Lang::Ja), "接続中");
+        assert_eq!(session_state_label(&detached, Lang::De), "getrennt");
+        assert_eq!(session_state_label(&detached, Lang::Fr), "détachée");
         // The exit code is preserved inside the translated label.
-        assert!(session_state_label(&exited, true).starts_with("已退出("));
+        assert!(session_state_label(&exited, Lang::Es).starts_with("finalizada("));
+        assert!(session_state_label(&exited, Lang::ZhHans).starts_with("已退出("));
     }
 
     #[test]
-    fn status_style_classifies_errors_and_success_in_both_languages() {
-        assert_eq!(status_style("create failed: x"), color::sgr::ERROR);
-        assert_eq!(status_style("新建失败: x"), color::sgr::ERROR);
-        assert_eq!(status_style("no sessions"), color::sgr::ERROR);
-        assert_eq!(status_style("无会话"), color::sgr::ERROR);
-        assert_eq!(
-            status_style("session_id \"2\" has exited"),
-            color::sgr::ERROR
-        );
-        assert_eq!(status_style("会话 \"2\" 已退出"), color::sgr::ERROR);
-        assert_eq!(status_style("renamed to \"x\""), color::sgr::SUCCESS);
-        assert_eq!(status_style("已重命名为 \"x\""), color::sgr::SUCCESS);
-        // Neutral confirmations stay a dim hint.
-        assert_eq!(status_style("killed \"x\""), color::sgr::HINT);
-        assert_eq!(status_style("已终止 \"x\""), color::sgr::HINT);
+    fn parse_locale_detects_supported_languages() {
+        assert_eq!(parse_locale("en_US.UTF-8"), Lang::En);
+        assert_eq!(parse_locale(""), Lang::En);
+        assert_eq!(parse_locale("C"), Lang::En);
+        assert_eq!(parse_locale("zh_CN.UTF-8"), Lang::ZhHans);
+        assert_eq!(parse_locale("zh-Hans"), Lang::ZhHans);
+        assert_eq!(parse_locale("zh_SG"), Lang::ZhHans);
+        assert_eq!(parse_locale("zh_TW.UTF-8"), Lang::ZhHant);
+        assert_eq!(parse_locale("zh-Hant-HK"), Lang::ZhHant);
+        assert_eq!(parse_locale("zh_HK"), Lang::ZhHant);
+        assert_eq!(parse_locale("ja_JP.UTF-8"), Lang::Ja);
+        assert_eq!(parse_locale("es_ES"), Lang::Es);
+        assert_eq!(parse_locale("de_DE.UTF-8"), Lang::De);
+        assert_eq!(parse_locale("fr_FR"), Lang::Fr);
+        // A `LANGUAGE` priority list honors the first entry.
+        assert_eq!(parse_locale("de:en"), Lang::De);
+        // Unknown languages fall back to English.
+        assert_eq!(parse_locale("ru_RU"), Lang::En);
+    }
+
+    #[test]
+    fn status_line_carries_kind_color() {
+        assert_eq!(StatusLine::empty().sgr, color::sgr::HINT);
+        assert!(StatusLine::empty().is_empty());
+        assert_eq!(StatusLine::error("x".into()).sgr, color::sgr::ERROR);
+        assert_eq!(StatusLine::success("x".into()).sgr, color::sgr::SUCCESS);
+        assert_eq!(StatusLine::hint("x".into()).sgr, color::sgr::HINT);
     }
 
     #[test]
@@ -4278,7 +4981,7 @@ mod tests {
             })
             .collect();
         let mut out = Vec::new();
-        render_session_list(&mut out, &rows, 7, "", (80, 6), false).unwrap();
+        render_session_list(&mut out, &rows, 7, &StatusLine::empty(), (80, 6), Lang::En).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         // 6 terminal rows = 5 budget lines at most, so at most 5 CRLFs are
         // written (the status line carries none) and nothing scrolls.
@@ -4294,7 +4997,7 @@ mod tests {
         // On a very narrow terminal, truncate by visible width without panicking or exceeding the width.
         let cols = 5u16;
         let mut out = Vec::new();
-        write_session_list_hint(&mut out, cols, false).unwrap();
+        write_session_list_hint(&mut out, cols, Lang::En).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         let line = rendered.strip_suffix("\r\n").unwrap();
         let visible = line.trim_start_matches("\x1b[0m");
@@ -4733,7 +5436,7 @@ mod tests {
 
     #[test]
     fn prefix_help_rows_use_active_prefix_label() {
-        let rows = prefix_help_rows(DEFAULT_PREFIX, false);
+        let rows = prefix_help_rows(DEFAULT_PREFIX, Lang::En);
         // Every binding combo carries the active prefix label.
         assert!(rows.iter().all(|(combo, _)| combo.contains("Ctrl+B")));
         // The literal-prefix binding expands `<prefix>` to the label on both sides.
@@ -4744,7 +5447,7 @@ mod tests {
         // The help binding is present.
         assert!(rows.iter().any(|(combo, _)| combo.contains("Ctrl+B ?")));
         // A custom prefix relabels every combo.
-        let rows_a = prefix_help_rows(PrefixKey::parse("C-a").unwrap(), false);
+        let rows_a = prefix_help_rows(PrefixKey::parse("C-a").unwrap(), Lang::En);
         assert!(rows_a.iter().all(|(combo, _)| combo.contains("Ctrl+A")));
     }
 
@@ -4964,7 +5667,7 @@ mod tests {
             session("1", "alpha", true, false, 80, 24),
             session("2", "mid", false, true, 120, 30),
         ];
-        let rows = build_session_list_rows(&sessions, "1", false);
+        let rows = build_session_list_rows(&sessions, "1", Lang::En);
 
         assert_eq!(
             rows.iter()
@@ -4984,7 +5687,7 @@ mod tests {
     fn session_list_rows_prefer_protocol_size_label() {
         let mut info = session("1", "work", false, false, 80, 24);
         info.size = "132x43".to_string();
-        let rows = build_session_list_rows(&[info], "2", false);
+        let rows = build_session_list_rows(&[info], "2", Lang::En);
 
         assert_eq!(rows[0].size, "132x43");
     }
@@ -4999,7 +5702,7 @@ mod tests {
                 session("4", "next", false, false, 80, 24),
             ],
             "1",
-            false,
+            Lang::En,
         );
 
         assert_eq!(
@@ -5086,11 +5789,19 @@ mod tests {
                 session("2", "work", false, false, 100, 30),
             ],
             "1",
-            false,
+            Lang::En,
         );
         let mut out = Vec::new();
 
-        render_session_list(&mut out, &rows, 1, "ready", (80, 24), false).unwrap();
+        render_session_list(
+            &mut out,
+            &rows,
+            1,
+            &StatusLine::hint("ready".to_string()),
+            (80, 24),
+            Lang::En,
+        )
+        .unwrap();
 
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("qscreen sessions"));
@@ -5102,10 +5813,10 @@ mod tests {
     #[test]
     fn render_session_list_uses_crlf_in_raw_mode() {
         let rows =
-            build_session_list_rows(&[session("1", "main", true, false, 80, 24)], "1", false);
+            build_session_list_rows(&[session("1", "main", true, false, 80, 24)], "1", Lang::En);
         let mut out = Vec::new();
 
-        render_session_list(&mut out, &rows, 0, "", (80, 24), false).unwrap();
+        render_session_list(&mut out, &rows, 0, &StatusLine::empty(), (80, 24), Lang::En).unwrap();
 
         for (idx, byte) in out.iter().enumerate() {
             if *byte == b'\n' {
@@ -5118,10 +5829,10 @@ mod tests {
     #[test]
     fn render_session_list_resets_style_and_pads_lines() {
         let rows =
-            build_session_list_rows(&[session("1", "main", true, false, 80, 24)], "1", false);
+            build_session_list_rows(&[session("1", "main", true, false, 80, 24)], "1", Lang::En);
         let mut out = Vec::new();
 
-        render_session_list(&mut out, &rows, 0, "", (20, 8), false).unwrap();
+        render_session_list(&mut out, &rows, 0, &StatusLine::empty(), (20, 8), Lang::En).unwrap();
 
         let text = String::from_utf8(out).unwrap();
         assert!(text.starts_with("\x1b[?2026h\x1b[0m\x1b[2J"));
@@ -5134,7 +5845,7 @@ mod tests {
         // A three-segment status (rename label / input / hint) should render as
         // its concatenated text, matching the original single-line prompt.
         let rows =
-            build_session_list_rows(&[session("1", "main", true, false, 80, 24)], "1", false);
+            build_session_list_rows(&[session("1", "main", true, false, 80, 24)], "1", Lang::En);
         let mut out = Vec::new();
 
         let segments = [
@@ -5142,7 +5853,7 @@ mod tests {
             ("work_", color::sgr::INPUT),
             ("  (Enter confirm, Esc cancel)", color::sgr::HINT),
         ];
-        render_session_list_with_status(&mut out, &rows, 0, &segments, (80, 24), false).unwrap();
+        render_session_list_with_status(&mut out, &rows, 0, &segments, (80, 24), Lang::En).unwrap();
 
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("rename \"main\" -> work_  (Enter confirm, Esc cancel)"));
